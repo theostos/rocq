@@ -168,6 +168,15 @@ module Tbl = struct
 
 end
 
+module PhysicalTbl = Hashtbl.Make (struct
+  type t = constr * int Range.t
+
+  let equal (term1, rels1) (term2, rels2) =
+    term1 == term2 && rels1 == rels2
+
+  let hash key = Hashtbl.hash_param 4 16 key
+end)
+
 type henv = {
   (* only used for globals, rel context is not correct *)
   globals : Environ.env;
@@ -184,6 +193,7 @@ type henv = {
   assum_uids : int Tbl.t;
   (* the surrounding table is for the body, the inner table for the type *)
   letin_uids : int Tbl.t Tbl.t;
+  physical : t PhysicalTbl.t;
 }
 
 let empty_env env = {
@@ -195,6 +205,7 @@ let empty_env env = {
   unknown_cnt = ref 0;
   assum_uids = Tbl.create ();
   letin_uids = Tbl.create ();
+  physical = PhysicalTbl.create 251;
 }
 
 (* still used in fixpoint *)
@@ -343,27 +354,38 @@ let nonrel_leaf tbl c = match kind c with
 
 let rec of_constr henv c =
   incr henv.steps;
-  match nonrel_leaf henv.tbl c with
-  | Some v -> v
+  let physical_key = (c, henv.rels) in
+  match PhysicalTbl.find_opt henv.physical physical_key with
+  | Some c' ->
+    c'.refcount <- c'.refcount + 1;
+    c'
   | None ->
-    let kind = of_constr_aux henv c in
-    let hash = hash_kind kind in
-    let isRel, hash = match kind with
-      | Rel n ->
-        let uid = Range.get henv.rels (n-1) in
-        assert (uid <> 0);
-        uid, Hashset.Combine.combine uid hash
-      | _ -> 0, hash
+    let c' =
+      match nonrel_leaf henv.tbl c with
+      | Some v -> v
+      | None ->
+        let kind = of_constr_aux henv c in
+        let hash = hash_kind kind in
+        let isRel, hash = match kind with
+          | Rel n ->
+            let uid = Range.get henv.rels (n-1) in
+            assert (uid <> 0);
+            uid, Hashset.Combine.combine uid hash
+          | _ -> 0, hash
+        in
+        match Tbl.raw_find henv.tbl hash (fun c' -> raw_equal c' ~isRel ~kind) with
+        | Some c' -> c'.refcount <- c'.refcount + 1; c'
+        | None ->
+          let c =
+            let self = kind_to_constr kind in
+            let self = if hasheq_kind (Constr.kind self) (Constr.kind c) then c else self in
+            { self; kind; hash; isRel; refcount = 1 }
+          in
+          Tbl.add henv.tbl c c;
+          c
     in
-    match Tbl.raw_find henv.tbl hash (fun c' -> raw_equal c' ~isRel ~kind) with
-    | Some c' -> c'.refcount <- c'.refcount + 1; c'
-    | None ->
-      let c =
-        let self = kind_to_constr kind in
-        let self = if hasheq_kind (Constr.kind self) (Constr.kind c) then c else self in
-        { self; kind; hash; isRel; refcount = 1 }
-      in
-    Tbl.add henv.tbl c c; c
+    PhysicalTbl.add henv.physical physical_key c';
+    c'
 
 and of_constr_aux henv c =
   match kind c with

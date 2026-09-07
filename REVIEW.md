@@ -1,8 +1,8 @@
-# Bound dependency-query storage
+# Preserve DAG sharing during kernel term traversals
 
-Base: `f756383de2e66f63c95815c73838596d7d97c1c2`. Compare against this base, not upstream.
+Base: `review/dependency-cache`. Compare against this base, not upstream.
 
-Cache direct definition edges and bounded reachability answers instead of transitive closures. Scan shared bodies once per physical node. This addresses dependency-cache growth during the cslib import; optional scalar diagnostics remain with the cache.
+Memoize hash-consing and universe traversals by physical term and, where needed, binder context. Large imported proof DAGs otherwise repeat the same traversal. These are traversal changes, not additional conversion equations.
 
 ## Validation
 
