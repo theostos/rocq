@@ -42,7 +42,8 @@ let vo_magic =
     | Rc _ -> 0
     | Release i -> i
   in
-  major * 10_000 + minor * 100 + patch
+  (* The experimental typing flag changes the serialized declaration layout. *)
+  1_000_000 + major * 10_000 + minor * 100 + patch
 
 (* NB: not the same as checking patch = Release,
    because post release commits still get patch = Release *)

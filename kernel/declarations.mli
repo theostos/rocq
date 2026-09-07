@@ -89,6 +89,9 @@ type typing_flags = {
   unfold_dep_heuristic : bool;
   (** If [true], use dependency heuristic when unfolding constants during conversion *)
 
+  binary_peano : bool;
+  (** Evaluate registered Peano arithmetic using binary values. Default: [false]. *)
+
   enable_VM : bool;
   (** If [false], all VM conversions fall back to interpreted ones *)
 

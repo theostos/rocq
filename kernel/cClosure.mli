@@ -22,6 +22,10 @@ type fconstr
 (** [fconstr] can be accessed by using the function [fterm_of] and by
    matching on type [fterm] *)
 
+(** Stable hash of a frozen term, independent of its mutable reduction state.
+    Collisions are possible, so this must be paired with physical equality. *)
+val fconstr_hash : fconstr -> int
+
 type finvert
 
 type evar_repack
@@ -29,7 +33,24 @@ type evar_repack
 type subs_content
 type usubs = subs_content subs UVars.puniverses
 
+(** Whether two relative variables are both instantiated by the same compact
+    Peano value.  Returns [false] for every other kind of substitution. *)
+val equal_binary_peano_rel : usubs -> int -> usubs -> int -> bool
+
 type table_key = Constant.t UVars.puniverses tableKey
+
+module PeanoNatValue : sig
+  type t
+  val equal : t -> t -> bool
+end
+
+type binary_peano = {
+  peano_ind : inductive;
+  peano_zero : constructor;
+  peano_succ : constructor;
+  peano_double : Constant.t;
+  peano_value : PeanoNatValue.t;
+}
 
 (** Relevances (eg in binder_annot or case_info) have NOT been substituted
     when there is a usubs field *)
@@ -53,10 +74,13 @@ type fterm =
   | FFloat of Float64.t
   | FString of Pstring.t
   | FArray of UVars.Instance.t * fconstr Parray.t * fconstr
+  | FPeanoNat of binary_peano
   | FLIFT of int * fconstr
   | FCLOS of constr * usubs
   | FIrrelevant
   | FLOCKED
+
+val peano_constructor_view : binary_peano -> fconstr
 
 (***********************************************************************
   s A [stack] is a context of arguments, arguments are pushed by
@@ -94,6 +118,12 @@ val inductive_subst : Declarations.mutual_inductive_body
 val usubs_lift : usubs -> usubs
 val usubs_liftn : int -> usubs -> usubs
 val usubs_cons : fconstr -> usubs -> usubs
+
+(** Read a substituted relative variable without applying its lift, reducing,
+    or copying the closure. Only for inspections invariant under lifting
+    (e.g. closedness or constant names), not for evaluating the variable.
+    Unsubstituted and unapplied higher-order variables return [None]. *)
+val inspect_substituted_rel : usubs -> int -> fconstr option
 
 (** identity if the first instance is empty *)
 val usubst_instance : 'a UVars.puniverses -> UVars.Instance.t -> UVars.Instance.t

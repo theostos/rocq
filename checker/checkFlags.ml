@@ -24,6 +24,7 @@ let set_local_flags flags env =
     unfold_dep_heuristic = flags.unfold_dep_heuristic;
     allow_uip = flags.allow_uip;
     (* These flags may not *)
+    binary_peano = envflags.binary_peano;
     enable_VM = envflags.enable_VM;
     enable_native_compiler = envflags.enable_native_compiler;
     indices_matter = envflags.indices_matter;
