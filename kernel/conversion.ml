@@ -1424,7 +1424,9 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
                 decr remaining
               in
               let inspect_constant constant =
-                if not (Constant.UserOrd.equal constant target) &&
+                (* A direct occurrence is already a dependency witness. The
+                   environment query only follows the constant's body. *)
+                if Constant.UserOrd.equal constant target ||
                    Environ.constant_depends_on
                      (CClosure.info_env infos.cnv_inf) constant target
                 then raise Found_dependency
