@@ -187,6 +187,7 @@ let rec infer_fterm cv_pb infos variances hd stk =
   | FEvar _ -> assert false
   | FRel _ -> infer_stack infos variances stk
   | FInt _ -> infer_stack infos variances stk
+  | FPeanoNat _ -> infer_stack infos variances stk
   | FFloat _ -> infer_stack infos variances stk
   | FString _ -> infer_stack infos variances stk
   | FFlex Names.(RelKey _ | VarKey _ as fl) ->
