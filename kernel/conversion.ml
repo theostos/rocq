@@ -1362,7 +1362,10 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
               application would traverse a large recursion certificate.
 
               Reify the probe into fresh closures so it cannot mutate the
-              sharing updates of the main conversion.  Both the peeled
+              sharing updates of the main conversion.  Apply each side's
+              lift and retain the current binder depth: [inject] would turn
+              locally bound variables into references to the outer environment.
+              Both the peeled
               argument and the prefixes are checked normally; on failure, use
               the standard delta-reduction path below. *)
           let common_application_congruence () =
@@ -1379,24 +1382,31 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
               if Int.equal argument_count 0 then None
               else
                 let prefix_length = argument_count - 1 in
-                let fresh_argument argument =
-                  inject (CClosure.term_of_fconstr argument)
+                let subst =
+                  subs_id (Range.length (info_relevances infos.cnv_inf)),
+                  UVars.Instance.empty
                 in
-                let fresh_prefix head args =
+                let fresh_term lift term =
+                  mk_clos subst (Vars.exliftn lift term)
+                in
+                let fresh_argument lift argument =
+                  fresh_term lift (CClosure.term_of_fconstr argument)
+                in
+                let fresh_prefix lift head args =
                   let stack =
                     if Int.equal prefix_length 0 then []
                     else [Zapp (Array.sub args 0 prefix_length)]
                   in
-                  inject (CClosure.term_of_process head stack)
+                  fresh_term lift (CClosure.term_of_process head stack)
                 in
                 (try
                    let cuniv =
-                     ccnv CONV l2r infos lft1 lft2
-                       (fresh_argument args1.(prefix_length))
-                       (fresh_argument args2.(prefix_length)) cuniv
+                     ccnv CONV l2r infos el_id el_id
+                       (fresh_argument lft1 args1.(prefix_length))
+                       (fresh_argument lft2 args2.(prefix_length)) cuniv
                    in
-                   Some (ccnv cv_pb l2r infos lft1 lft2
-                     (fresh_prefix hd1 args1) (fresh_prefix hd2 args2) cuniv)
+                   Some (ccnv cv_pb l2r infos el_id el_id
+                     (fresh_prefix lft1 hd1 args1) (fresh_prefix lft2 hd2 args2) cuniv)
                  with NotConvertible | NotConvertibleTrace _ -> None)
             | _ -> None
           in
