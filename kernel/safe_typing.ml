@@ -1922,6 +1922,975 @@ let register_inductive ind prim senv =
   let action = Retroknowledge.Register_ind(prim,ind) in
   add_retroknowledge action senv
 
+let check_register_peano_nat ind (mb, ob as spec) =
+  let fail message = CErrors.user_err Pp.(str message) in
+  let ind_term = match mb.mind_universes with
+    | Polymorphic a when UVars.AbstractContext.size a = (0, 0) ->
+      Constr.mkIndU (ind, UVars.Instance.empty)
+    | Polymorphic _ -> fail "A universe monomorphic inductive type is expected"
+    | Monomorphic -> Constr.UnsafeMonomorphic.mkInd ind
+  in
+  if not (Int.equal (Array.length mb.mind_packets) 1) then
+    fail "A non-mutual inductive type is expected";
+  if Inductive.is_private spec then
+    fail "A non-private inductive type is expected";
+  if not (Int.equal mb.mind_nparams 0) then
+    fail "A Peano type must have no parameters";
+  if not (Int.equal (Array.length ob.mind_user_lc) 2) then
+    fail "A Peano type must have two constructors";
+  if not (Constr.equal ob.mind_user_lc.(0) ind_term) then
+    fail "The zero constructor must be nullary";
+  match Constr.kind ob.mind_user_lc.(1) with
+  | Constr.Prod (annot, dom, codom)
+    when Sorts.is_relevant annot.binder_relevance &&
+         Constr.equal dom ind_term && Constr.equal codom ind_term -> ()
+  | _ -> fail "The successor constructor must have type D -> D"
+
+let register_peano_nat ind senv =
+  let spec = Inductive.lookup_mind_specif senv.env ind in
+  let () = check_register_peano_nat ind spec in
+  add_retroknowledge (Retroknowledge.Register_peano_nat ind) senv
+
+let check_register_unit_like _ind (mib, mip as spec) =
+  let fail message = CErrors.user_err Pp.(str message) in
+  if not (Int.equal (Array.length mib.mind_packets) 1) then
+    fail "A non-mutual inductive type is expected";
+  if Inductive.is_private spec then
+    fail "A non-private inductive type is expected";
+  if not (Int.equal mip.mind_nrealargs 0) then
+    fail "A unit-like type must have no indices";
+  if not (Int.equal (Array.length mip.mind_user_lc) 1) then
+    fail "A unit-like type must have exactly one constructor";
+  let constructor_context, _ = mip.mind_nf_lc.(0) in
+  let fields, _ =
+    List.chop mip.mind_consnrealdecls.(0) constructor_context
+  in
+  let runtime_irrelevant = function
+    | Context.Rel.Declaration.LocalAssum (annot, _) ->
+      not (Sorts.is_relevant annot.Context.binder_relevance)
+    | Context.Rel.Declaration.LocalDef _ -> true
+  in
+  if not (List.for_all runtime_irrelevant fields) then
+    fail "The constructor of a unit-like type must have no runtime-relevant fields"
+
+let register_unit_like ind senv =
+  let spec = Inductive.lookup_mind_specif senv.env ind in
+  let () = check_register_unit_like ind spec in
+  let duplicate =
+    List.exists (Ind.UserOrd.equal ind)
+      (Environ.retroknowledge senv.env).Retroknowledge.retro_unit_like
+  in
+  if duplicate then senv
+  else add_retroknowledge (Retroknowledge.Register_unit_like ind) senv
+
+let find_peano_nat env ind =
+  match List.find_opt
+    (fun scheme ->
+      Ind.UserOrd.equal ind scheme.Retroknowledge.peano_inductive)
+    (Environ.retroknowledge env).Retroknowledge.retro_peano_nat
+  with
+  | Some scheme -> scheme
+  | None ->
+    CErrors.user_err Pp.(str "Register the Peano inductive first")
+
+let peano_baseline_env env =
+  let retro = Environ.retroknowledge env in
+  let baseline =
+    { retro with
+      Retroknowledge.retro_peano_nat = [];
+      retro_peano_nat_beq = [];
+      retro_peano_nat_ble = [] }
+  in
+  let env = Environ.set_retroknowledge env baseline in
+  Environ.set_oracle env Conv_oracle.empty
+
+let check_peano_conversion env description lhs rhs =
+  match Conversion.conv (peano_baseline_env env) lhs rhs with
+  | Result.Ok () -> ()
+  | Result.Error () ->
+    CErrors.user_err Pp.(str "The registered Peano " ++ str description ++
+      str " does not have the expected computation rules")
+
+let check_peano_equation ?(binders = []) env description lhs rhs =
+  let abstract body =
+    List.fold_left
+      (fun body ty -> Constr.mkLambda (Context.anonR, ty, body))
+      body binders
+  in
+  check_peano_conversion env description (abstract lhs) (abstract rhs)
+
+let mono_const c = Constr.UnsafeMonomorphic.mkConst c
+let mono_ctor c = Constr.UnsafeMonomorphic.mkConstruct c
+let apply1 f x = Constr.mkApp (f, [|x|])
+let apply2 f x y = Constr.mkApp (f, [|x; y|])
+
+let check_transparent env description c =
+  if not (Environ.evaluable_constant c env) then
+    CErrors.user_err Pp.(str "A transparent Peano " ++ str description ++
+      str " is expected")
+
+let peano_unary_type env c =
+  let ty = (Environ.lookup_constant c env).Declarations.const_type in
+  match Constr.kind ty with
+  | Constr.Prod (_, dom, codom) -> begin
+    match Constr.kind dom, Constr.kind codom with
+    | Constr.Ind (ind, u), Constr.Ind (ind', u')
+      when Ind.UserOrd.equal ind ind' &&
+           UVars.Instance.is_empty u && UVars.Instance.is_empty u' -> ind
+    | _ -> CErrors.user_err Pp.(str "A monomorphic function D -> D is expected")
+    end
+  | _ -> CErrors.user_err Pp.(str "A monomorphic function D -> D is expected")
+
+let peano_binary_type env c =
+  let ty = (Environ.lookup_constant c env).Declarations.const_type in
+  match Constr.kind ty with
+  | Constr.Prod (_, dom1, rest) -> begin
+    match Constr.kind dom1, Constr.kind rest with
+    | Constr.Ind (ind, u), Constr.Prod (_, dom2, codom)
+      when UVars.Instance.is_empty u && Constr.equal dom1 dom2 &&
+           Constr.equal dom1 codom -> ind
+    | _ -> CErrors.user_err Pp.(str
+        "A monomorphic function D -> D -> D is expected")
+    end
+  | _ -> CErrors.user_err Pp.(str
+      "A monomorphic function D -> D -> D is expected")
+
+let check_register_peano_nat_double env ind c =
+  let () = check_transparent env "doubling builder" c in
+  let actual_ind = peano_unary_type env c in
+  if not (Ind.UserOrd.equal actual_ind ind) then
+    CErrors.user_err Pp.(str "The doubling builder has the wrong Peano type");
+  let scheme = find_peano_nat env ind in
+  let f = mono_const c in
+  let zero = mono_ctor scheme.peano_zero in
+  let succ x = apply1 (mono_ctor scheme.peano_succ) x in
+  let x = Constr.mkRel 1 in
+  let () = check_peano_equation env "doubling builder"
+    (apply1 f zero) zero in
+  check_peano_equation ~binders:[Constr.UnsafeMonomorphic.mkInd ind]
+    env "doubling builder"
+    (apply1 f (succ x)) (succ (succ (apply1 f x)))
+
+let register_peano_nat_double c senv =
+  let env = senv.env in
+  let ind = peano_unary_type env c in
+  let scheme = find_peano_nat env ind in
+  match scheme.peano_double with
+  | Some old when Constant.UserOrd.equal old c -> senv
+  | Some _ -> CErrors.user_err Pp.(str
+      "A doubling builder is already registered for this Peano type")
+  | None ->
+    let () = check_register_peano_nat_double env ind c in
+    add_retroknowledge (Retroknowledge.Register_peano_nat_double (ind, c)) senv
+
+let peano_decoder_shape env c =
+  let ty = (Environ.lookup_constant c env).Declarations.const_type in
+  let n_ind, ind =
+    match Constr.kind ty with
+    | Constr.Prod (_, dom, codom) -> begin
+      match Constr.kind dom, Constr.kind codom with
+      | Constr.Ind (n_ind, nu), Constr.Ind (ind, u)
+        when UVars.Instance.is_empty nu && UVars.Instance.is_empty u ->
+        n_ind, ind
+      | _ ->
+        CErrors.user_err Pp.(str "A monomorphic function N -> D is expected")
+      end
+    | _ -> CErrors.user_err Pp.(str "A monomorphic function N -> D is expected")
+  in
+  let n_mb, n_ob = Inductive.lookup_mind_specif env n_ind in
+  let fail () =
+    CErrors.user_err Pp.(str
+      "The decoder domain must be a binary natural with constructors zero and positive")
+  in
+  let () =
+    if not (Int.equal (Array.length n_mb.Declarations.mind_packets) 1) ||
+       not (Int.equal n_mb.Declarations.mind_nparams 0) ||
+       not (Int.equal (Array.length n_ob.Declarations.mind_user_lc) 2)
+    then fail ()
+  in
+  let pos_ind =
+    match Constr.kind n_ob.Declarations.mind_user_lc.(1) with
+    | Constr.Prod (_, dom, codom) -> begin
+      match Constr.kind dom, Constr.kind codom with
+      | Constr.Ind (pos_ind, pu), Constr.Ind (n_ind', nu)
+        when UVars.Instance.is_empty pu && UVars.Instance.is_empty nu &&
+             Ind.UserOrd.equal n_ind n_ind' -> pos_ind
+      | _ -> fail ()
+      end
+    | _ -> fail ()
+  in
+  let p_mb, p_ob = Inductive.lookup_mind_specif env pos_ind in
+  let p_term = Constr.UnsafeMonomorphic.mkInd pos_ind in
+  let valid_recursive_ctor t =
+    match Constr.kind t with
+    | Constr.Prod (_, dom, codom) ->
+      Constr.equal dom p_term && Constr.equal codom p_term
+    | _ -> false
+  in
+  let () =
+    if not (Int.equal (Array.length p_mb.Declarations.mind_packets) 1) ||
+       not (Int.equal p_mb.Declarations.mind_nparams 0) ||
+       not (Int.equal (Array.length p_ob.Declarations.mind_user_lc) 3) ||
+       not (valid_recursive_ctor p_ob.Declarations.mind_user_lc.(0)) ||
+       not (valid_recursive_ctor p_ob.Declarations.mind_user_lc.(1)) ||
+       not (Constr.equal p_ob.Declarations.mind_user_lc.(2) p_term)
+    then fail ()
+  in
+  n_ind, ind, pos_ind
+
+let check_register_peano_nat_of_N env ind n_ind pos_ind c =
+  let () = check_transparent env "binary decoder" c in
+  let actual_n, actual_ind, actual_pos = peano_decoder_shape env c in
+  if not (Ind.UserOrd.equal actual_ind ind &&
+          Ind.UserOrd.equal actual_n n_ind &&
+          Ind.UserOrd.equal actual_pos pos_ind)
+  then CErrors.user_err Pp.(str
+    "The binary decoder registration has inconsistent inductive types");
+  let scheme = find_peano_nat env ind in
+  let p_term = Constr.UnsafeMonomorphic.mkInd pos_ind in
+  let double = match scheme.peano_double with
+  | Some double -> mono_const double
+  | None -> CErrors.user_err Pp.(str
+      "Register the Peano doubling builder before its binary decoder")
+  in
+  let f = mono_const c in
+  let zero = mono_ctor scheme.peano_zero in
+  let succ x = apply1 (mono_ctor scheme.peano_succ) x in
+  let nzero = mono_ctor (n_ind, 1) in
+  let npos p = apply1 (mono_ctor (n_ind, 2)) p in
+  let xh = mono_ctor (pos_ind, 3) in
+  let xo p = apply1 (mono_ctor (pos_ind, 2)) p in
+  let xi p = apply1 (mono_ctor (pos_ind, 1)) p in
+  let p = Constr.mkRel 1 in
+  let decoded p = apply1 f (npos p) in
+  let () = check_peano_equation env "binary decoder"
+    (apply1 f nzero) zero in
+  let () = check_peano_equation env "binary decoder"
+    (decoded xh) (succ zero) in
+  let () = check_peano_equation ~binders:[p_term] env "binary decoder"
+    (decoded (xo p)) (apply1 double (decoded p)) in
+  check_peano_equation ~binders:[p_term] env "binary decoder"
+    (decoded (xi p)) (succ (apply1 double (decoded p)))
+
+let register_peano_nat_of_N c senv =
+  let env = senv.env in
+  let n_ind, ind, pos_ind = peano_decoder_shape env c in
+  let scheme = find_peano_nat env ind in
+  let duplicate =
+    List.exists (fun decoder ->
+      Constant.UserOrd.equal decoder.Retroknowledge.decoder_constant c &&
+      Ind.UserOrd.equal decoder.binary_nat n_ind &&
+      Ind.UserOrd.equal decoder.binary_positive pos_ind)
+      scheme.peano_decoders
+  in
+  if duplicate then senv else
+  let () = check_register_peano_nat_of_N env ind n_ind pos_ind c in
+  add_retroknowledge
+    (Retroknowledge.Register_peano_nat_of_N (ind, n_ind, pos_ind, c)) senv
+
+type peano_nat_operation = PeanoAdd | PeanoMul | PeanoPow | PeanoSub
+
+let peano_operation_description = function
+  | PeanoAdd -> "addition"
+  | PeanoMul -> "multiplication"
+  | PeanoPow -> "exponentiation"
+  | PeanoSub -> "subtraction"
+
+let peano_operation_constant scheme = function
+  | PeanoAdd -> scheme.Retroknowledge.peano_add
+  | PeanoMul -> scheme.Retroknowledge.peano_mul
+  | PeanoPow -> scheme.Retroknowledge.peano_pow
+  | PeanoSub -> scheme.Retroknowledge.peano_sub
+
+let peano_predecessor env scheme value =
+  let ind = scheme.Retroknowledge.peano_inductive in
+  let mib, mip = Inductive.lookup_mind_specif env ind in
+  let ci = {
+    Constr.ci_ind = ind;
+    ci_npar = mib.Declarations.mind_nparams;
+    ci_cstr_ndecls = mip.Declarations.mind_consnrealdecls;
+    ci_cstr_nargs = mip.Declarations.mind_consnrealargs;
+    ci_pp_info = { Constr.style = Constr.MatchStyle };
+  } in
+  let binder = Context.make_annot Anonymous Sorts.Relevant in
+  let ind_term = Constr.UnsafeMonomorphic.mkInd ind in
+  let zero = mono_ctor scheme.peano_zero in
+  Constr.mkCase
+    (ci, UVars.Instance.empty, [||],
+     (([|binder|], ind_term), Sorts.Relevant), Constr.NoInvert, value,
+     [|([||], zero); ([|binder|], Constr.mkRel 1)|])
+
+let check_register_peano_nat_operation env operation ind c =
+  let description = peano_operation_description operation in
+  let () = check_transparent env description c in
+  let actual_ind = peano_binary_type env c in
+  if not (Ind.UserOrd.equal actual_ind ind) then
+    CErrors.user_err Pp.(str "The Peano " ++ str description ++
+      str " operation has the wrong type");
+  let scheme = find_peano_nat env ind in
+  let dependency = match operation with
+  | PeanoAdd | PeanoSub -> None
+  | PeanoMul -> Some ("addition", scheme.peano_add)
+  | PeanoPow -> Some ("multiplication", scheme.peano_mul)
+  in
+  let dependency = Option.map (fun (name, dependency) ->
+    match dependency with
+    | Some dependency -> mono_const dependency
+    | None -> CErrors.user_err Pp.(str "Register Peano " ++ str name ++
+        str " before " ++ str description)) dependency
+  in
+  let f = mono_const c in
+  let zero = mono_ctor scheme.peano_zero in
+  let succ x = apply1 (mono_ctor scheme.peano_succ) x in
+  let ind_term = Constr.UnsafeMonomorphic.mkInd ind in
+  let x = Constr.mkRel 1 in
+  let () =
+    let rhs = match operation with
+    | PeanoAdd | PeanoSub -> x
+    | PeanoMul -> zero
+    | PeanoPow -> succ zero
+    in
+    check_peano_equation ~binders:[ind_term] env description
+      (apply2 f x zero) rhs
+  in
+  let x = Constr.mkRel 2 in
+  let y = Constr.mkRel 1 in
+  let recursive = apply2 f x y in
+  let rhs = match operation, dependency with
+  | PeanoAdd, None -> succ recursive
+  | PeanoSub, None -> peano_predecessor env scheme recursive
+  | (PeanoMul | PeanoPow), Some dependency -> apply2 dependency recursive x
+  | (PeanoAdd | PeanoSub), Some _ | (PeanoMul | PeanoPow), None -> assert false
+  in
+  check_peano_equation ~binders:[ind_term; ind_term] env description
+    (apply2 f x (succ y)) rhs
+
+let register_peano_nat_operation operation make_action c senv =
+  let env = senv.env in
+  let ind = peano_binary_type env c in
+  let scheme = find_peano_nat env ind in
+  match peano_operation_constant scheme operation with
+  | Some old when Constant.UserOrd.equal old c -> senv
+  | Some _ -> CErrors.user_err Pp.(str "A Peano " ++
+      str (peano_operation_description operation) ++
+      str " operation is already registered for this Peano type")
+  | None ->
+    let () = check_register_peano_nat_operation env operation ind c in
+    add_retroknowledge (make_action ind c) senv
+
+let register_peano_nat_add c senv =
+  register_peano_nat_operation PeanoAdd
+    (fun ind c -> Retroknowledge.Register_peano_nat_add (ind, c)) c senv
+
+let register_peano_nat_mul c senv =
+  register_peano_nat_operation PeanoMul
+    (fun ind c -> Retroknowledge.Register_peano_nat_mul (ind, c)) c senv
+
+let register_peano_nat_pow c senv =
+  register_peano_nat_operation PeanoPow
+    (fun ind c -> Retroknowledge.Register_peano_nat_pow (ind, c)) c senv
+
+let register_peano_nat_sub c senv =
+  register_peano_nat_operation PeanoSub
+    (fun ind c -> Retroknowledge.Register_peano_nat_sub (ind, c)) c senv
+
+let peano_bool_shape env c =
+  let ty = (Environ.lookup_constant c env).Declarations.const_type in
+  let ind, bool_ind = match Constr.kind ty with
+  | Constr.Prod (_, dom1, rest) -> begin
+    match Constr.kind dom1, Constr.kind rest with
+    | Constr.Ind (ind, u), Constr.Prod (_, dom2, codom)
+      when UVars.Instance.is_empty u && Constr.equal dom1 dom2 -> begin
+      match Constr.kind codom with
+      | Constr.Ind (bool_ind, bu) when UVars.Instance.is_empty bu ->
+        ind, bool_ind
+      | _ -> CErrors.user_err Pp.(str
+          "A monomorphic function D -> D -> B is expected")
+      end
+    | _ -> CErrors.user_err Pp.(str
+        "A monomorphic function D -> D -> B is expected")
+    end
+  | _ -> CErrors.user_err Pp.(str
+      "A monomorphic function D -> D -> B is expected")
+  in
+  let b_mb, b_ob = Inductive.lookup_mind_specif env bool_ind in
+  let bool_term = Constr.UnsafeMonomorphic.mkInd bool_ind in
+  let () =
+    if not (Int.equal (Array.length b_mb.Declarations.mind_packets) 1) ||
+       not (Int.equal b_mb.Declarations.mind_nparams 0) ||
+       not (Int.equal (Array.length b_ob.Declarations.mind_user_lc) 2) ||
+       not (Constr.equal b_ob.Declarations.mind_user_lc.(0) bool_term) ||
+       not (Constr.equal b_ob.Declarations.mind_user_lc.(1) bool_term)
+    then CErrors.user_err Pp.(str
+      "The Boolean codomain must have two nullary constructors")
+  in
+  ind, (bool_ind, 1), (bool_ind, 2)
+
+type peano_bool_operation = PeanoBeq | PeanoBle
+
+let peano_bool_description = function
+  | PeanoBeq -> "equality test"
+  | PeanoBle -> "less-than-or-equal test"
+
+let peano_bool_operations env = function
+  | PeanoBeq ->
+    (Environ.retroknowledge env).Retroknowledge.retro_peano_nat_beq
+  | PeanoBle ->
+    (Environ.retroknowledge env).Retroknowledge.retro_peano_nat_ble
+
+let check_register_peano_nat_bool operation env ind c false_ctor true_ctor =
+  let description = peano_bool_description operation in
+  let () = check_transparent env description c in
+  let actual_ind, actual_false, actual_true = peano_bool_shape env c in
+  if not (Ind.UserOrd.equal actual_ind ind &&
+          Construct.UserOrd.equal actual_false false_ctor &&
+          Construct.UserOrd.equal actual_true true_ctor)
+  then CErrors.user_err Pp.(str
+    "The Peano Boolean operation registration is inconsistent with its type");
+  let scheme = find_peano_nat env ind in
+  let false_term = mono_ctor false_ctor in
+  let true_term = mono_ctor true_ctor in
+  let zero = mono_ctor scheme.peano_zero in
+  let succ x = apply1 (mono_ctor scheme.peano_succ) x in
+  let f = mono_const c in
+  let ind_term = Constr.UnsafeMonomorphic.mkInd ind in
+  let x = Constr.mkRel 1 in
+  let y = Constr.mkRel 2 in
+  let equations = match operation with
+  | PeanoBeq ->
+    [ apply2 f zero zero, true_term;
+      apply2 f zero (succ y), false_term;
+      apply2 f (succ x) zero, false_term;
+      apply2 f (succ x) (succ y), apply2 f x y ]
+  | PeanoBle ->
+    [ apply2 f zero y, true_term;
+      apply2 f (succ x) zero, false_term;
+      apply2 f (succ x) (succ y), apply2 f x y ]
+  in
+  List.iter (fun (lhs, rhs) ->
+    check_peano_equation ~binders:[ind_term; ind_term]
+      env description lhs rhs) equations
+
+let register_peano_nat_bool operation make_action c senv =
+  let env = senv.env in
+  let ind, false_ctor, true_ctor = peano_bool_shape env c in
+  let duplicate = List.exists (fun op ->
+    Ind.UserOrd.equal ind op.Retroknowledge.bool_op_inductive &&
+    Constant.UserOrd.equal c op.bool_op_constant)
+    (peano_bool_operations env operation) in
+  if duplicate then senv else
+  let () = check_register_peano_nat_bool operation env ind c
+    false_ctor true_ctor in
+  add_retroknowledge
+    (make_action ind c false_ctor true_ctor) senv
+
+let register_peano_nat_beq c senv =
+  register_peano_nat_bool PeanoBeq
+    (fun ind c false_ctor true_ctor ->
+      Retroknowledge.Register_peano_nat_beq
+        (ind, c, false_ctor, true_ctor)) c senv
+
+let register_peano_nat_ble c senv =
+  register_peano_nat_bool PeanoBle
+    (fun ind c false_ctor true_ctor ->
+      Retroknowledge.Register_peano_nat_ble
+        (ind, c, false_ctor, true_ctor)) c senv
+
+let peano_convertible env lhs rhs =
+  match Conversion.conv (peano_baseline_env env) lhs rhs with
+  | Result.Ok () -> true
+  | Result.Error () -> false
+
+let fail_peano_fueled_worker message =
+  CErrors.user_err Pp.(str "Invalid Peano fueled worker: " ++
+    str message)
+
+type peano_fueled_worker_kind = PeanoQuotient | PeanoRemainder
+
+let push_rel_assum annot ty env =
+  Environ.push_rel (Context.Rel.Declaration.LocalAssum (annot, ty)) env
+
+let check_peano_le env scheme le_ind =
+  let mib, mip = Inductive.lookup_mind_specif env le_ind in
+  if not (Int.equal (Array.length mib.Declarations.mind_packets) 1) ||
+     not (Int.equal mib.Declarations.mind_nparams 1) ||
+     not (Int.equal (Array.length mip.Declarations.mind_user_lc) 2)
+  then fail_peano_fueled_worker "the comparison predicate is not Peano <=";
+  let ind_term = Constr.UnsafeMonomorphic.mkInd scheme.Retroknowledge.peano_inductive in
+  let le a b = Constr.mkApp
+    (Constr.UnsafeMonomorphic.mkInd le_ind, [|a; b|]) in
+  let succ x = apply1 (mono_ctor scheme.peano_succ) x in
+  let irrelevant = Context.make_annot Anonymous Sorts.Irrelevant in
+  let refl_type =
+    Constr.mkProd (Context.anonR, ind_term, le (Constr.mkRel 1) (Constr.mkRel 1))
+  in
+  let step_type =
+    Constr.mkProd (Context.anonR, ind_term,
+      Constr.mkProd (Context.anonR, ind_term,
+        Constr.mkProd (irrelevant, le (Constr.mkRel 2) (Constr.mkRel 1),
+          le (Constr.mkRel 3) (succ (Constr.mkRel 2)))))
+  in
+  if not (peano_convertible env mip.Declarations.mind_user_lc.(0) refl_type &&
+          peano_convertible env mip.Declarations.mind_user_lc.(1) step_type)
+  then fail_peano_fueled_worker "the comparison predicate is not Peano <="
+
+let peano_fueled_worker_shape description env worker =
+  let () = check_transparent env description worker in
+  let fail () = fail_peano_fueled_worker
+    "the worker must have type D -> proof -> D -> D -> proof -> D" in
+  let ty = (Environ.lookup_constant worker env).Declarations.const_type in
+  match Constr.kind ty with
+  | Constr.Prod (y_annot, ind_term, rest) -> begin
+    match Constr.kind ind_term, Constr.kind rest with
+    | Constr.Ind (ind, u), Constr.Prod (hy_annot, hy_type, rest)
+      when UVars.Instance.is_empty u ->
+      let env_y = push_rel_assum y_annot ind_term env in
+      let env_y_hy = push_rel_assum hy_annot hy_type env_y in
+      begin match Constr.kind rest with
+      | Constr.Prod (fuel_annot, fuel_type, rest)
+        when Constr.equal fuel_type ind_term ->
+        let env_fuel = push_rel_assum fuel_annot fuel_type env_y_hy in
+        begin match Constr.kind rest with
+        | Constr.Prod (x_annot, x_type, rest)
+          when Constr.equal x_type ind_term ->
+          let env_x = push_rel_assum x_annot x_type env_fuel in
+          begin match Constr.kind rest with
+          | Constr.Prod (hfuel_annot, hfuel_type, result)
+            when Constr.equal result ind_term &&
+                 Sorts.relevance_equal hy_annot.binder_relevance
+                   Sorts.Irrelevant &&
+                 Sorts.relevance_equal hfuel_annot.binder_relevance
+                   Sorts.Irrelevant ->
+            ind, ind_term, hy_type, env_y, hfuel_type, env_x
+          | _ -> fail ()
+          end
+        | _ -> fail ()
+        end
+      | _ -> fail ()
+      end
+    | _ -> fail ()
+    end
+  | _ -> fail ()
+
+let check_dependent_if env_ctx dite result_type predicate decider zero succ_zero =
+  let decider_type =
+    Reduction.whd_all (peano_baseline_env env_ctx)
+      (Typeops.infer env_ctx decider).Environ.uj_type
+  in
+  let dec_ind, dec_u =
+    let head, args = Constr.decompose_app decider_type in
+    match Constr.kind head with
+    | Constr.Ind (ind, u) when Int.equal (Array.length args) 1 &&
+        peano_convertible env_ctx args.(0) predicate -> ind, u
+    | _ -> fail_peano_fueled_worker
+        "the condition is not decided by a two-constructor type"
+  in
+  let spec = Inductive.lookup_mind_specif env_ctx dec_ind in
+  let mib, mip = spec in
+  if not (Int.equal (Array.length mib.Declarations.mind_packets) 1) ||
+     not (Int.equal mib.Declarations.mind_nparams 1) ||
+     not (Int.equal (Array.length mip.Declarations.mind_user_lc) 2)
+  then fail_peano_fueled_worker
+    "the condition is not decided by a two-constructor type";
+  let constructor_domain i =
+    let ty = Inductive.type_of_constructor ((dec_ind, i), dec_u) spec in
+    let ty = Reduction.hnf_prod_applist (peano_baseline_env env_ctx)
+      ty [predicate] in
+    match Constr.kind ty with
+    | Constr.Prod (annot, domain, codomain)
+      when peano_convertible env_ctx codomain (Vars.lift 1 decider_type) ->
+      annot, domain
+    | _ -> fail_peano_fueled_worker "a decision constructor has the wrong type"
+  in
+  let first_annot, first_domain = constructor_domain 1 in
+  let second_annot, second_domain = constructor_domain 2 in
+  let true_ctor, true_annot, false_ctor, false_annot, false_domain =
+    if peano_convertible env_ctx first_domain predicate then
+      (dec_ind, 1), first_annot, (dec_ind, 2), second_annot, second_domain
+    else if peano_convertible env_ctx second_domain predicate then
+      (dec_ind, 2), second_annot, (dec_ind, 1), first_annot, first_domain
+    else fail_peano_fueled_worker
+      "the decision type has no positive constructor"
+  in
+  let empty_type =
+    match Constr.kind (Reduction.whd_all (peano_baseline_env env_ctx) false_domain) with
+    | Constr.Prod (_, domain, codomain)
+      when peano_convertible env_ctx domain predicate -> codomain
+    | _ -> fail_peano_fueled_worker
+        "the negative decision constructor is not a negation"
+  in
+  let empty_ind =
+    let head, args = Constr.decompose_app
+      (Reduction.whd_all (peano_baseline_env env_ctx) empty_type) in
+    match Constr.kind head with
+    | Constr.Ind (ind, _) when Array.is_empty args -> ind
+    | _ -> fail_peano_fueled_worker
+        "the negation does not target an empty inductive"
+  in
+  let empty_mib, empty_mip = Inductive.lookup_mind_specif env_ctx empty_ind in
+  if not (Int.equal (Array.length empty_mib.Declarations.mind_packets) 1) ||
+     not (Array.is_empty empty_mip.Declarations.mind_user_lc)
+  then fail_peano_fueled_worker
+    "the negation does not target an empty inductive";
+  let make_branch annot domain result = Constr.mkLambda (annot, domain, result) in
+  let check ctor outer_annot outer_domain expected =
+    let lifted_predicate = Vars.lift 1 predicate in
+    let lifted_false_domain = Vars.lift 1 false_domain in
+    let decision = Constr.mkApp
+      (Constr.mkConstructU (ctor, dec_u), [|lifted_predicate; Constr.mkRel 1|]) in
+    let on_true = make_branch true_annot lifted_predicate zero in
+    let on_false = make_branch false_annot lifted_false_domain succ_zero in
+    let body = Constr.mkApp
+      (dite, [|result_type; lifted_predicate; decision; on_true; on_false|]) in
+    check_peano_conversion env_ctx "division worker conditional"
+      (Constr.mkLambda (outer_annot, outer_domain, body))
+      (Constr.mkLambda (outer_annot, outer_domain, expected))
+  in
+  check true_ctor true_annot predicate zero;
+  check false_ctor false_annot false_domain succ_zero;
+  dec_ind, dec_u, true_ctor, false_ctor, empty_ind
+
+let check_register_peano_nat_fueled_go kind env expected_ind worker =
+  let description = match kind with
+  | PeanoQuotient -> "division worker"
+  | PeanoRemainder -> "modulus worker"
+  in
+  let ind, ind_term, hy_type, env_y, hfuel_type, env_x =
+    peano_fueled_worker_shape description env worker in
+  let scheme = find_peano_nat env ind in
+  let zero = mono_ctor scheme.peano_zero in
+  let succ x = apply1 (mono_ctor scheme.peano_succ) x in
+  let is_rel n t = match Constr.kind t with
+    | Constr.Rel n' -> Int.equal n n'
+    | _ -> false
+  in
+  let le_ind =
+    let hy_type = Reduction.whd_all (peano_baseline_env env_y) hy_type in
+    let head, args = Constr.decompose_app hy_type in
+    match Constr.kind head with
+    | Constr.Ind (le_ind, u) when UVars.Instance.is_empty u &&
+        Int.equal (Array.length args) 2 &&
+        peano_convertible env_y args.(0) (succ zero) && is_rel 1 args.(1) ->
+      le_ind
+    | _ -> fail_peano_fueled_worker
+        "the divisor proof is not 0 < divisor"
+  in
+  let () = check_peano_le env scheme le_ind in
+  let le a b = Constr.mkApp
+    (Constr.UnsafeMonomorphic.mkInd le_ind, [|a; b|]) in
+  let irrelevant = Context.make_annot Anonymous Sorts.Irrelevant in
+  let env_y_hy = push_rel_assum irrelevant hy_type env_y in
+  let env_y_hy_x = push_rel_assum Context.anonR ind_term env_y_hy in
+  let env_y_hy_x_fuel =
+    push_rel_assum Context.anonR ind_term env_y_hy_x in
+  let equation_hfuel_type = le (succ (Constr.mkRel 2))
+    (succ (Constr.mkRel 1)) in
+  let env_ctx =
+    push_rel_assum irrelevant equation_hfuel_type env_y_hy_x_fuel in
+  let lhs = Constr.mkApp (mono_const worker,
+    [|Constr.mkRel 5; Constr.mkRel 4; succ (Constr.mkRel 2);
+      Constr.mkRel 3; Constr.mkRel 1|]) in
+  let rec unfold_to_conditional depth constants projections =
+    if Int.equal depth 0 then
+      fail_peano_fueled_worker
+        "one-step unfolding exceeded its constant bound";
+    let flags = RedFlags.mkflags
+      [RedFlags.fBETA; RedFlags.fDELTA; RedFlags.fMATCH; RedFlags.fFIX;
+       RedFlags.fCOFIX; RedFlags.fZETA] in
+    let flags = List.fold_left (fun flags c ->
+      RedFlags.red_add flags (RedFlags.fCONST c)) flags constants in
+    let flags = List.fold_left (fun flags p ->
+      RedFlags.red_add flags (RedFlags.fPROJ p)) flags projections in
+    let baseline = peano_baseline_env env_ctx in
+    let infos = CClosure.create_clos_infos flags baseline in
+    let reduced = CClosure.whd_val infos (CClosure.create_tab ())
+      (CClosure.inject lhs) in
+    let head, args = Constr.decompose_app reduced in
+    let conditional = match Constr.kind head with
+    | Constr.Const _ ->
+      Int.equal (Array.length args) 5 &&
+      peano_convertible env_ctx args.(0) ind_term &&
+      begin match Constr.kind args.(3), Constr.kind args.(4) with
+      | Constr.Lambda _, Constr.Lambda _ -> true
+      | _ -> false
+      end
+    | _ -> false
+    in
+    if conditional then reduced
+    else match Constr.kind head with
+    | Constr.Const (c, _) when
+        not (List.exists (Constant.UserOrd.equal c) constants) ->
+      unfold_to_conditional (depth - 1) (c :: constants) projections
+    | Constr.Proj (p, _, record) ->
+      let p = Projection.repr p in
+      let projection_is_new =
+        not (List.exists (Projection.Repr.UserOrd.equal p) projections) in
+      let projections =
+        if projection_is_new then p :: projections else projections in
+      let record_head, _ = Constr.decompose_app record in
+      begin match Constr.kind record_head with
+      | Constr.Const (c, _) when
+          not (List.exists (Constant.UserOrd.equal c) constants) ->
+        unfold_to_conditional (depth - 1) (c :: constants) projections
+      | _ when projection_is_new ->
+        unfold_to_conditional (depth - 1) constants projections
+      | _ -> fail_peano_fueled_worker
+          "one-step unfolding is blocked at a projection"
+      end
+    | _ -> fail_peano_fueled_worker
+        "one-step unfolding did not expose its conditional"
+  in
+  let rhs = unfold_to_conditional 64 [worker] [] in
+  let dite, predicate, decider, on_true, on_false =
+    let head, args = Constr.decompose_app rhs in
+    match Constr.kind head with
+    | Constr.Const _ when Int.equal (Array.length args) 5 &&
+        peano_convertible env_ctx args.(0) ind_term ->
+      head, args.(1), args.(2), args.(3), args.(4)
+    | _ -> fail_peano_fueled_worker
+        "one-step unfolding is not a dependent conditional"
+  in
+  let predicate_le_ind =
+    let predicate = Reduction.whd_all (peano_baseline_env env_ctx) predicate in
+    let head, args = Constr.decompose_app predicate in
+    match Constr.kind head with
+    | Constr.Ind (le_ind, u) when UVars.Instance.is_empty u &&
+        Int.equal (Array.length args) 2 && is_rel 5 args.(0) &&
+        is_rel 3 args.(1) -> le_ind
+    | _ -> fail_peano_fueled_worker "the condition is not y <= x"
+  in
+  if not (Ind.UserOrd.equal predicate_le_ind le_ind) then
+    fail_peano_fueled_worker "the worker uses two comparison predicates";
+  let decider_constant =
+    let head, args = Constr.decompose_app decider in
+    match Constr.kind head with
+    | Constr.Const (decider_constant, u)
+      when UVars.Instance.is_empty u && Int.equal (Array.length args) 2 &&
+        is_rel 5 args.(0) && is_rel 3 args.(1) -> decider_constant
+    | _ -> fail_peano_fueled_worker
+        "the decision procedure is not applied to y and x"
+  in
+  check_peano_conversion env_y description hy_type
+    (le (succ zero) (Constr.mkRel 1));
+  check_peano_conversion env_x description hfuel_type
+    (le (succ (Constr.mkRel 1)) (Constr.mkRel 2));
+  let true_annot, true_type, true_body = match Constr.kind on_true with
+  | Constr.Lambda (annot, ty, body) -> annot, ty, body
+  | _ -> fail_peano_fueled_worker "the positive branch is not a function"
+  in
+  check_peano_conversion env_ctx description true_type predicate;
+  let env_true = push_rel_assum true_annot true_type env_ctx in
+  let sub = match scheme.Retroknowledge.peano_sub with
+  | Some sub -> mono_const sub
+  | None -> fail_peano_fueled_worker "register Peano subtraction first"
+  in
+  let recursive =
+    let _, true_args = Constr.decompose_app true_body in
+    let candidates = true_body :: Array.to_list true_args in
+    let recognize candidate =
+      let _, args = Constr.decompose_app candidate in
+      if Array.is_empty args then None else
+      let recursive_proof = args.(Array.length args - 1) in
+      let expected = Constr.mkApp (mono_const worker,
+        [|Constr.mkRel 6; Constr.mkRel 5; Constr.mkRel 3;
+          apply2 sub (Constr.mkRel 4) (Constr.mkRel 6); recursive_proof|]) in
+      try
+        let expected_type =
+          (Typeops.infer env_true expected).Environ.uj_type in
+        if peano_convertible env_true expected_type ind_term &&
+           peano_convertible env_true candidate expected
+        then Some candidate else None
+      with error when CErrors.noncritical error -> None
+    in
+    match List.filter_map recognize candidates with
+    | [recursive] -> recursive
+    | _ -> fail_peano_fueled_worker
+        "the positive branch does not expose one recursive result"
+  in
+  let expected_true = match kind with
+  | PeanoQuotient -> succ recursive
+  | PeanoRemainder -> recursive
+  in
+  check_peano_conversion env_true description true_body expected_true;
+  let false_annot, false_type, false_body = match Constr.kind on_false with
+  | Constr.Lambda (annot, ty, body) -> annot, ty, body
+  | _ -> fail_peano_fueled_worker "the negative branch is not a function"
+  in
+  let env_false = push_rel_assum false_annot false_type env_ctx in
+  let expected_false = match kind with
+  | PeanoQuotient -> zero
+  | PeanoRemainder -> Constr.mkRel 4
+  in
+  check_peano_conversion env_false description false_body expected_false;
+  let decision_ind, decision_u, decision_true, decision_false, empty_ind =
+    check_dependent_if env_ctx dite ind_term predicate decider zero (succ zero) in
+  let empty = Constr.UnsafeMonomorphic.mkInd empty_ind in
+  let observe predicate decision =
+    let negative = Constr.mkProd (true_annot, predicate, empty) in
+    let on_true = Constr.mkLambda (true_annot, predicate, zero) in
+    let on_false = Constr.mkLambda (false_annot, negative, succ zero) in
+    Constr.mkApp
+      (dite, [|ind_term; predicate; decision; on_true; on_false|])
+  in
+  let bool_operation =
+    List.find_opt (fun operation ->
+      Ind.UserOrd.equal ind operation.Retroknowledge.bool_op_inductive)
+      (Environ.retroknowledge env).Retroknowledge.retro_peano_nat_ble
+  in
+  let bool_operation = match bool_operation with
+  | Some operation -> operation
+  | None -> fail_peano_fueled_worker
+      "register Peano <= before its decision procedure"
+  in
+  let bool_ind = fst bool_operation.Retroknowledge.bool_op_false in
+  let bool_term = Constr.UnsafeMonomorphic.mkInd bool_ind in
+  let bool_false = mono_ctor bool_operation.bool_op_false in
+  let bool_true = mono_ctor bool_operation.bool_op_true in
+  let ble = mono_const bool_operation.bool_op_constant in
+  let decider_body = Environ.constant_value_in env
+    (decider_constant, UVars.Instance.empty) in
+  let decider_lambdas, decider_body = Term.decompose_lambda decider_body in
+  if not (Int.equal (List.length decider_lambdas) 2) then
+    fail_peano_fueled_worker
+      "the decision procedure must abstract y and x";
+  let body_head, body_args = Constr.decompose_app decider_body in
+  let dite_constant = match Constr.kind dite with
+  | Constr.Const (constant, _) -> constant
+  | _ -> assert false
+  in
+  begin match Constr.kind body_head with
+  | Constr.Const (constant, _) when Constant.UserOrd.equal constant dite_constant &&
+      Int.equal (Array.length body_args) 5 -> ()
+  | _ -> fail_peano_fueled_worker
+      "the decision procedure is not a dependent Boolean test"
+  end;
+  let equality_ind, equality_u, tested_bool =
+    let head, args = Constr.decompose_app body_args.(1) in
+    match Constr.kind head with
+    | Constr.Ind (equality_ind, equality_u)
+      when Int.equal (Array.length args) 3 &&
+        Constr.equal args.(0) bool_term &&
+        Constr.equal args.(1)
+          (apply2 ble (Constr.mkRel 2) (Constr.mkRel 1)) &&
+        Constr.equal args.(2) bool_true ->
+      equality_ind, equality_u, args.(1)
+    | _ -> fail_peano_fueled_worker
+      "the decision procedure does not test whether y <= x is true"
+  in
+  let equality_mib, equality_mip =
+    Inductive.lookup_mind_specif env equality_ind in
+  if not
+      (Int.equal
+         (Array.length equality_mib.Declarations.mind_packets) 1 &&
+       Int.equal equality_mib.Declarations.mind_nparams 2 &&
+       Int.equal
+         (Array.length equality_mip.Declarations.mind_user_lc) 1 &&
+       Int.equal equality_mip.Declarations.mind_consnrealargs.(0) 0)
+  then fail_peano_fueled_worker
+    "the Boolean test does not use an equality type";
+  let bool_decider_head =
+    let head, args = Constr.decompose_app body_args.(2) in
+    match Constr.kind head with
+    | Constr.Const (_, _) when Int.equal (Array.length args) 2 &&
+        Constr.equal args.(0) tested_bool && Constr.equal args.(1) bool_true ->
+      head
+    | _ -> fail_peano_fueled_worker
+      "the Boolean equality test has the wrong arguments"
+  in
+  let check_decision_branch expected branch =
+    match Constr.kind branch with
+    | Constr.Lambda (_, _, body) ->
+      let head, _ = Constr.decompose_app body in
+      begin match Constr.kind head with
+      | Constr.Construct (constructor, _) when
+          Construct.UserOrd.equal constructor expected -> ()
+      | _ -> fail_peano_fueled_worker
+          "a decision branch returns the wrong constructor"
+      end
+    | _ -> fail_peano_fueled_worker
+        "a decision branch is not a function"
+  in
+  check_decision_branch decision_true body_args.(3);
+  check_decision_branch decision_false body_args.(4);
+  let equality a b = Constr.mkApp
+    (Constr.mkIndU (equality_ind, equality_u), [|bool_term; a; b|]) in
+  let decide_bool a b = Constr.mkApp (bool_decider_head, [|a; b|]) in
+  let observe_equality a b = observe (equality a b) (decide_bool a b) in
+  check_peano_conversion env (description ^ " Boolean decision")
+    (observe_equality bool_false bool_false) zero;
+  check_peano_conversion env (description ^ " Boolean decision")
+    (observe_equality bool_false bool_true) (succ zero);
+  check_peano_conversion env (description ^ " Boolean decision")
+    (observe_equality bool_true bool_false) (succ zero);
+  check_peano_conversion env (description ^ " Boolean decision")
+    (observe_equality bool_true bool_true) zero;
+  let expected_decision = Constr.mkApp
+    (Constr.mkIndU (decision_ind, decision_u), [|le (Constr.mkRel 2)
+      (Constr.mkRel 1)|]) in
+  let env_y_x = push_rel_assum Context.anonR ind_term
+    (push_rel_assum Context.anonR ind_term env) in
+  check_peano_conversion env_y_x (description ^ " decision result")
+    body_args.(0) expected_decision;
+  begin match expected_ind with
+  | Some expected_ind when Ind.UserOrd.equal expected_ind ind -> ()
+  | None -> ()
+  | Some _ -> fail_peano_fueled_worker
+      "the persisted descriptor does not match the worker"
+  end;
+  ind, worker
+
+let register_peano_nat_div_go worker senv =
+  let env = senv.env in
+  let ind, worker = check_register_peano_nat_fueled_go PeanoQuotient
+    env None worker in
+  let scheme = find_peano_nat env ind in
+  let duplicate =
+    List.exists (Constant.UserOrd.equal worker) scheme.peano_div_go in
+  if duplicate then senv
+  else add_retroknowledge
+    (Retroknowledge.Register_peano_nat_div_go (ind, worker)) senv
+
+let register_peano_nat_mod_go worker senv =
+  let env = senv.env in
+  let ind, worker = check_register_peano_nat_fueled_go PeanoRemainder
+    env None worker in
+  let scheme = find_peano_nat env ind in
+  let duplicate =
+    List.exists (Constant.UserOrd.equal worker) scheme.peano_mod_go in
+  if duplicate then senv
+  else add_retroknowledge
+    (Retroknowledge.Register_peano_nat_mod_go (ind, worker)) senv
+
+let check_peano_retroknowledge env = function
+  | Retroknowledge.Register_peano_nat ind ->
+    check_register_peano_nat ind (Inductive.lookup_mind_specif env ind)
+  | Retroknowledge.Register_peano_nat_double (ind, c) ->
+    check_register_peano_nat_double env ind c
+  | Retroknowledge.Register_peano_nat_of_N (ind, n_ind, pos_ind, c) ->
+    check_register_peano_nat_of_N env ind n_ind pos_ind c
+  | Retroknowledge.Register_peano_nat_add (ind, c) ->
+    check_register_peano_nat_operation env PeanoAdd ind c
+  | Retroknowledge.Register_peano_nat_mul (ind, c) ->
+    check_register_peano_nat_operation env PeanoMul ind c
+  | Retroknowledge.Register_peano_nat_pow (ind, c) ->
+    check_register_peano_nat_operation env PeanoPow ind c
+  | Retroknowledge.Register_peano_nat_sub (ind, c) ->
+    check_register_peano_nat_operation env PeanoSub ind c
+  | Retroknowledge.Register_peano_nat_div_go (ind, worker) ->
+    ignore (check_register_peano_nat_fueled_go PeanoQuotient
+      env (Some ind) worker)
+  | Retroknowledge.Register_peano_nat_mod_go (ind, worker) ->
+    ignore (check_register_peano_nat_fueled_go PeanoRemainder
+      env (Some ind) worker)
+  | Retroknowledge.Register_peano_nat_beq (ind, c, false_ctor, true_ctor) ->
+    check_register_peano_nat_bool PeanoBeq env ind c false_ctor true_ctor
+  | Retroknowledge.Register_peano_nat_ble (ind, c, false_ctor, true_ctor) ->
+    check_register_peano_nat_bool PeanoBle env ind c false_ctor true_ctor
+  | Retroknowledge.Register_unit_like ind ->
+    check_register_unit_like ind (Inductive.lookup_mind_specif env ind)
+  | Retroknowledge.Register_ind _ | Retroknowledge.Register_type _ ->
+    invalid_arg "Safe_typing.check_peano_retroknowledge"
+
 (* NB: The next old comment probably refers to [propagate_loads] above.
    When a Require is done inside a module, we'll redo this require
    at the upper level after the module is ended, and so on.

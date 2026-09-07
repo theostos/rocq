@@ -2417,18 +2417,58 @@ let vernac_register ~atts qid r =
     let ns, id = Libnames.repr_qualid n in
     if DirPath.equal (dirpath_of_string "kernel") ns then begin
       unsupported_attributes atts;
-      let CPrimitives.PIE pind = match Id.to_string id with
-        | "ind_bool" -> CPrimitives.(PIE PIT_bool)
-        | "ind_carry" -> CPrimitives.(PIE PIT_carry)
-        | "ind_pair" -> CPrimitives.(PIE PIT_pair)
-        | "ind_cmp" -> CPrimitives.(PIE PIT_cmp)
-        | "ind_f_cmp" -> CPrimitives.(PIE PIT_f_cmp)
-        | "ind_f_class" -> CPrimitives.(PIE PIT_f_class)
-        | k -> CErrors.user_err ?loc:n.loc Pp.(str "Register: unknown identifier “" ++ str k ++ str "” in the \"kernel\" namespace.")
-      in
-      match gr with
-      | GlobRef.IndRef ind -> Global.register_inductive ind pind
-      | _ -> CErrors.user_err ?loc:qid.loc (Pp.str "Register in kernel: expecting an inductive type.")
+      match Id.to_string id, gr with
+      | "ind_peano_nat", GlobRef.IndRef ind ->
+        Global.register_peano_nat ind
+      | "unit_like", GlobRef.IndRef ind ->
+        Global.register_unit_like ind
+      | "peano_nat_double", GlobRef.ConstRef c ->
+        Global.register_peano_nat_double c
+      | "peano_nat_of_N", GlobRef.ConstRef c ->
+        Global.register_peano_nat_of_N c
+      | "peano_nat_add", GlobRef.ConstRef c ->
+        Global.register_peano_nat_add c
+      | "peano_nat_mul", GlobRef.ConstRef c ->
+        Global.register_peano_nat_mul c
+      | "peano_nat_pow", GlobRef.ConstRef c ->
+        Global.register_peano_nat_pow c
+      | "peano_nat_sub", GlobRef.ConstRef c ->
+        Global.register_peano_nat_sub c
+      | "peano_nat_div_go", GlobRef.ConstRef c ->
+        Global.register_peano_nat_div_go c
+      | "peano_nat_mod_go", GlobRef.ConstRef c ->
+        Global.register_peano_nat_mod_go c
+      | "peano_nat_beq", GlobRef.ConstRef c ->
+        Global.register_peano_nat_beq c
+      | "peano_nat_ble", GlobRef.ConstRef c ->
+        Global.register_peano_nat_ble c
+      | ("ind_peano_nat" | "unit_like"), _ ->
+        CErrors.user_err ?loc:qid.loc
+          (Pp.str "Register in kernel: expecting an inductive type.")
+      | ("peano_nat_double" | "peano_nat_add" | "peano_nat_mul" |
+         "peano_nat_pow" | "peano_nat_sub" | "peano_nat_div_go" |
+         "peano_nat_mod_go" | "peano_nat_beq"), _ ->
+        CErrors.user_err ?loc:qid.loc
+          (Pp.str "Register in kernel: expecting a constant.")
+      | "peano_nat_of_N", _ ->
+        CErrors.user_err ?loc:qid.loc
+          (Pp.str "Register in kernel: expecting a constant.")
+      | "peano_nat_ble", _ ->
+        CErrors.user_err ?loc:qid.loc
+          (Pp.str "Register in kernel: expecting a constant.")
+      | kind, gr ->
+        let CPrimitives.PIE pind = match kind with
+          | "ind_bool" -> CPrimitives.(PIE PIT_bool)
+          | "ind_carry" -> CPrimitives.(PIE PIT_carry)
+          | "ind_pair" -> CPrimitives.(PIE PIT_pair)
+          | "ind_cmp" -> CPrimitives.(PIE PIT_cmp)
+          | "ind_f_cmp" -> CPrimitives.(PIE PIT_f_cmp)
+          | "ind_f_class" -> CPrimitives.(PIE PIT_f_class)
+          | k -> CErrors.user_err ?loc:n.loc Pp.(str "Register: unknown identifier “" ++ str k ++ str "” in the \"kernel\" namespace.")
+        in
+        match gr with
+        | GlobRef.IndRef ind -> Global.register_inductive ind pind
+        | _ -> CErrors.user_err ?loc:qid.loc (Pp.str "Register in kernel: expecting an inductive type.")
     end
     else
       let local = Attributes.parse hint_locality_default_superglobal atts in

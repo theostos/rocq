@@ -1,8 +1,8 @@
-# Preserve DAG sharing during kernel term traversals
+# Validate and persist experimental reduction registrations
 
-Base: `review/dependency-cache`. Compare against this base, not upstream.
+Base: `review/term-sharing`. Compare against this base, not upstream.
 
-Memoize hash-consing and universe traversals by physical term and, where needed, binder context. Large imported proof DAGs otherwise repeat the same traversal. These are traversal changes, not additional conversion equations.
+Add checked registrations for Peano naturals, arithmetic operations and unit-like inductives. Validate operation equations with compact arithmetic disabled, and carry registrations through modules and the checker. This is the registration layer; the following branches implement the evaluator and unit conversion. Unit eta changes definitional equality and needs separate soundness review.
 
 ## Validation
 
