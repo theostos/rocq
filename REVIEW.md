@@ -1,8 +1,8 @@
-# Evaluate registered Peano arithmetic using compact closures
+# Support conversion for registered unit-like inductives
 
-Base: `review/reduction-registrations`. Compare against this base, not upstream.
+Base: `review/compact-peano`. Compare against this base, not upstream.
 
-Keep large Peano values compact inside reduction and expose zero/successor only when elimination needs it. Includes a read-only substitution inspection used to recognize eligible closed operations without copying or reducing their arguments. Motivating imports include Int32.toInt_lt and Int32.ofInt_tdiv. No new source-term constructor is added; the registered definitions remain the specification. Arithmetic/registration controls are in compact_peano.v; closure_inspection.ml tests the read-only substitution view.
+Recognize neutral inhabitants of registered unindexed single-constructor types without runtime-relevant fields, including supported unit-valued projections. This addresses FinLoop totality and LawfulMonadStateOf.modify_eq. Projection parameter substitution stays lazy: reifying an erased proof parameter caused the LinearMap.exists_ne_zero_of_sSup_eq assertion. Dependent projection types are conservatively excluded from the unit query. This is a change to definitional equality, not merely an unfolding heuristic.
 
 ## Validation
 

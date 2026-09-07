@@ -500,9 +500,14 @@ let make_project env sigma ind pred c branches ps =
   let na, ty, t = destLambda sigma pred in
   let _, u = destInd sigma (fst (decompose_app sigma ty)) in
   let mib, mip as specif = Inductive.lookup_mind_specif env ind in
+  let registered_unit_like =
+    List.exists (Ind.UserOrd.equal ind)
+      (Environ.retroknowledge env).Retroknowledge.retro_unit_like
+  in
   let () =
     if (* dependent *) not (Vars.noccurn sigma 1 t) &&
-         not (has_dependent_elim sigma specif u) then
+         not registered_unit_like && not (has_dependent_elim sigma specif u)
+    then
       Pretype_errors.error_not_allowed_dependent_elimination env sigma false ind
   in
   let branch = branches.(0) in

@@ -3,6 +3,84 @@ From Stdlib Require Import NArith.
 
 Set Primitive Projections.
 
+Inductive EtaUnit@{u} : Type@{u} := eta_unit.
+Register EtaUnit as kernel.unit_like.
+
+Example unit_like_constructor_eta (x : EtaUnit) : x = eta_unit.
+Proof. exact (eq_refl x). Qed.
+
+Example unit_like_neutral_eta (x y : EtaUnit) : x = y.
+Proof. exact (eq_refl x). Qed.
+
+Example unit_like_application_eta
+    (operation : EtaUnit -> EtaUnit) (x : EtaUnit) :
+  operation x = eta_unit.
+Proof. exact (eq_refl eta_unit). Qed.
+
+Example unit_like_applications_eta
+    (operation : nat -> EtaUnit) (x y : nat) :
+  operation x = operation y.
+Proof. exact (eq_refl (operation x)). Qed.
+
+Axiom dependent_operation : forall A : Type, nat -> A.
+
+Example dependent_unit_like_applications_eta (x y : nat) :
+  dependent_operation EtaUnit x = dependent_operation EtaUnit y.
+Proof. exact (eq_refl (dependent_operation EtaUnit x)). Qed.
+
+Definition unit_like_match (n : nat) : EtaUnit :=
+  match n with O | S _ => eta_unit end.
+
+Example transparent_unit_like_applications_eta (x y : nat) :
+  unit_like_match x = unit_like_match y.
+Proof. exact (eq_refl (unit_like_match x)). Qed.
+
+Definition EtaUnitAlias := EtaUnit.
+Strategy expand [EtaUnitAlias].
+
+Definition EtaUnitRegularAlias := EtaUnit.
+
+Example dependent_aliased_unit_like_applications_eta (x y : nat) :
+  dependent_operation EtaUnitRegularAlias x =
+  dependent_operation EtaUnitRegularAlias y.
+Proof. exact (eq_refl (dependent_operation EtaUnitRegularAlias x)). Qed.
+
+Definition aliased_unit_like_match (n : nat) : EtaUnitAlias :=
+  match n with O | S _ => eta_unit end.
+
+Example transparent_aliased_unit_like_applications_eta (x y : nat) :
+  aliased_unit_like_match x = aliased_unit_like_match y.
+Proof. exact (eq_refl (aliased_unit_like_match x)). Qed.
+
+Inductive EtaProof : SProp := eta_proof.
+
+Definition aliased_unit_like_with_proof
+    (n : nat) (_ : EtaProof) : EtaUnitAlias :=
+  match n with O | S _ => eta_unit end.
+
+Example transparent_aliased_unit_like_irrelevant_applications_eta
+    (x y : nat) (p q : EtaProof) :
+  aliased_unit_like_with_proof x p = aliased_unit_like_with_proof y q.
+Proof. exact (eq_refl (aliased_unit_like_with_proof x p)). Qed.
+
+Inductive PhantomUnit (A : Type) := phantom_unit.
+Register PhantomUnit as kernel.unit_like.
+
+Example parameterized_unit_like_eta (A : Type) (x y : PhantomUnit A) : x = y.
+Proof. exact (eq_refl x). Qed.
+
+Record EtaPair (A B : Type) := eta_pair { eta_fst : A; eta_snd : B }.
+
+Example unit_like_under_record_eta (A : Type) (p : EtaPair A EtaUnit) :
+  eta_pair A EtaUnit (eta_fst A EtaUnit p) eta_unit = p.
+Proof. exact (eq_refl p). Qed.
+
+Inductive BadIndexedUnit : nat -> Type := bad_indexed_unit : BadIndexedUnit 0.
+Fail Register BadIndexedUnit as kernel.unit_like.
+
+Inductive BadRecursiveUnit := bad_recursive_unit : BadRecursiveUnit -> BadRecursiveUnit.
+Fail Register BadRecursiveUnit as kernel.unit_like.
+
 Inductive BadNat := BadZero | BadSucc : BadNat -> BadNat | BadExtra.
 Fail Register BadNat as kernel.ind_peano_nat.
 
