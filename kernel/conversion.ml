@@ -2220,7 +2220,20 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
             let all = RedFlags.(red_add_transparent all (red_transparent (info_flags infos.cnv_inf))) in
             let r1 = whd_stack (infos_with_reds infos.cnv_inf all) infos.lft_tab def1 v1 in
             eqwhnf cv_pb l2r infos (lft1, r1) appr2 cuniv
-        | None -> raise NotConvertible
+        | None ->
+          (* The early eta probe is incomplete for stuck eliminations.
+             Preserve ordinary record eta when no unfolding is possible. *)
+          (match c2 with
+           | FConstruct (((ind2, 1), u2), args2) ->
+             let () = assert_reduced_constructor v2 in
+             (try
+                let v2, v1 =
+                  eta_expand_ind_stack (info_env infos.cnv_inf)
+                    (ind2, u2) args2 (snd appr1)
+                in
+                convert_stacks l2r infos lft1 lft2 v1 v2 cuniv
+              with Not_found -> raise NotConvertible)
+           | _ -> raise NotConvertible)
       end
 
     | (c1, FFlex fl2)      ->
@@ -2265,7 +2278,19 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
           let all = RedFlags.(red_add_transparent all (red_transparent (info_flags infos.cnv_inf))) in
           let r2 = whd_stack (infos_with_reds infos.cnv_inf all) infos.rgt_tab def2 v2 in
           eqwhnf cv_pb l2r infos appr1 (lft2, r2) cuniv
-        | None -> raise NotConvertible
+        | None ->
+          (* Symmetric record-eta fallback, as above. *)
+          match c1 with
+          | FConstruct (((ind1, 1), u1), args1) ->
+            let () = assert_reduced_constructor v1 in
+            (try
+               let v1, v2 =
+                 eta_expand_ind_stack (info_env infos.cnv_inf)
+                   (ind1, u1) args1 (snd appr2)
+               in
+               convert_stacks l2r infos lft1 lft2 v1 v2 cuniv
+             with Not_found -> raise NotConvertible)
+          | _ -> raise NotConvertible
        end
 
     (* Inductive types:  MutInd MutConstruct Fix Cofix *)

@@ -1,28 +1,32 @@
-# Unfold constructor wrappers before record eta
+# Restore record eta after failed unfolding
 
-Base: `fix/compact-fueled-arguments`. Compare against this base, not upstream.
+Base: `fix/constructor-wrapper-conversion`. Compare against this base.
 
-When comparing a transparent record wrapper with a constructor, conversion
-tried record eta before unfolding the wrapper. The resulting projections
-could force an expensive field computation (`UInt32.toInt32_not`).
+The experimental early-eta probe only recognizes some elimination stacks.
+It can miss the record type of a computation stuck on a variable. The
+optimization had also removed Rocq's original eta fallback when that variable
+cannot unfold, causing valid conversions to be rejected.
 
-Prefer ordinary unfolding for syntactic lambda/application-to-constructor
-wrappers with application-only stacks. Other bodies, existing eliminations
-and opaque constants keep the previous path. No new conversion rule, cache
-or importer special case.
+Restore that fallback in both directions. This reuses the original
+`eta_expand_ind_stack` and field comparison; it adds no new equality rule.
+The speculative early probe and constructor-wrapper ordering are unchanged.
 
 ## Validation
 
-The original theorem and dependencies export to 22,363 lines. Before the fix,
-the target overflows with an 8 MiB diagnostic stack. It passes with the same
-stack after the fix, as do fresh imports of all five unsigned-to-signed
-complement theorems. A pure Rocq regression times out before the fix, succeeds
-after it in both directions, and rejects unequal values and opaque wrappers
-at Qed. Reproduction: arena workspace, `work/uint32-not-repro`.
+The original Lean theorem
+`Std.Tactic.BVDecide.LRAT.Internal.DefaultFormula.restoreAssignments_performRupCheck_base_case`
+fails at cslib export line 15,281,867. Its dependency-only export has 138,299
+lines and reproduces the same error before the fix, with or without the
+dependency heuristic. Afterward the unchanged theorem passes, including a
+fresh import and reload.
 
-These checks use the combined experimental kernel with this exact correction,
-not a separate clean build of this review branch. No library proof or importer
-code was changed.
+`stuck_record_eta.v` reproduces the failure without the importer. It checks
+stuck matches and fixpoints in both directions, and rejects unequal fields
+and eta for an ordinary non-record inductive.
 
-The full cslib continuation has not been rerun. The inherited experimental
-kernel changes still need review.
+These tests use the combined experimental kernel with this exact correction,
+not a separate clean build of this review branch. Reproduction and logs are
+in the arena workspace, `work/lrat-restore-repro`.
+
+No importer or library proof was changed. The full-library check remains
+incomplete; the inherited experimental kernel still needs review.
