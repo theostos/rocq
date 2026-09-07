@@ -328,6 +328,32 @@ let same_args_size sk1 sk2 =
   if Int.equal n (CClosure.stack_args_size sk2) then n
   else raise NotConvertible
 
+(* A transparent constructor wrapper can expose its record without forcing
+   any fields. Unfold it before eta expansion adds projections that may send
+   conversion into the implementation of those fields. Inspect syntax only;
+   existing eliminations and bodies requiring computation keep the eta path. *)
+let constructor_wrapper infos reference stack =
+  let rec constructor_head term =
+    match Constr.kind term with
+    | Lambda (_, _, body) -> constructor_head body
+    | App (head, _) -> constructor_head head
+    | Construct _ -> true
+    | _ -> false
+  in
+  let applications_only = List.for_all (function
+    | Zapp _ | Zupdate _ | Zshift _ -> true
+    | Zproj _ | Zfix _ | ZcaseT _ | Zprimitive _ -> false)
+  in
+  match reference with
+  | ConstKey (constant, _) when applications_only stack &&
+      RedFlags.red_set (info_flags infos.cnv_inf) (RedFlags.fCONST constant) ->
+    begin match (Environ.lookup_constant constant
+      (info_env infos.cnv_inf)).Declarations.const_body with
+    | Def body -> constructor_head body
+    | Undef _ | OpaqueDef _ | Primitive _ | Symbol _ -> false
+    end
+  | ConstKey _ | RelKey _ | VarKey _ -> false
+
 (** The same heap separation invariant must hold for the fconstr arguments
     passed to each respective side of the conversion function below. *)
 
@@ -2160,7 +2186,8 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
       else
       let eta_before_unfolding () =
         match c2 with
-        | FConstruct (((ind2, 1), u2), args2) ->
+        | FConstruct (((ind2, 1), u2), args2)
+          when not (constructor_wrapper infos fl1 v1) ->
           let () = assert_reduced_constructor v2 in
           if not (flex_has_inductive infos infos.lft_tab lft1 v1 fl1 ind2)
           then None
@@ -2207,7 +2234,8 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
       else
        let eta_before_unfolding () =
          match c1 with
-         | FConstruct (((ind1, 1), u1), args1) ->
+         | FConstruct (((ind1, 1), u1), args1)
+           when not (constructor_wrapper infos fl2 v2) ->
            let () = assert_reduced_constructor v1 in
            if not (flex_has_inductive infos infos.rgt_tab lft2 v2 fl2 ind1)
            then None
