@@ -329,7 +329,11 @@ and intern_library_deps ~root ~intern libs dir m =
 and intern_mandatory_library ~intern caller libs (dir,d) =
   let m, libs = intern_library ~root:false ~intern libs dir in
   let digest = m.library_digests in
-  let () = if not (Safe_typing.digest_match ~actual:digest ~required:d) then
+  let ignore_digest =
+    Option.has_some (Sys.getenv_opt "ROCQ_DIAGNOSTIC_IGNORE_VO_DIGEST")
+  in
+  let () = if not ignore_digest &&
+              not (Safe_typing.digest_match ~actual:digest ~required:d) then
     let from = library_full_filename caller in
     user_err
       (str "Compiled library " ++ DirPath.print caller ++
