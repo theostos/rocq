@@ -701,7 +701,8 @@ let check_required current_libs needed =
   | None ->
     CErrors.user_err Pp.(pr_sequence str ["Reference to unknown module"; DirPath.to_string id; "."])
   | Some { req_root; req_digest = actual } ->
-    if not (digest_match ~actual ~required) then
+    if Option.is_empty (Sys.getenv_opt "ROCQ_DIAGNOSTIC_IGNORE_VO_DIGEST") &&
+       not (digest_match ~actual ~required) then
       CErrors.user_err Pp.(pr_sequence str
         ["Inconsistent assumptions over module"; DirPath.to_string id; "."])
     else if req_root then
@@ -1161,13 +1162,22 @@ let export_private_constants eff senv =
   exported, senv
 
 let add_constant l decl senv =
+  let trace stage =
+    if Option.has_some (Sys.getenv_opt "ROCQ_OPAQUE_TRACE") then
+      Printf.eprintf "[safe-typing] %s\n%!" stage
+  in
   let kn = Constant.make2 senv.modpath l in
+  let () = trace "after constant name" in
   let senv, (hbody, cb) =
     let sec_univs = Option.map Section.all_poly_univs senv.sections in
+    let () = trace "after section universes" in
       match decl with
       | Entries.OpaqueEntry ce ->
+        let () = trace "before opaque handle" in
         let senv, o = push_opaque_proof senv in
+        let () = trace "before opaque type" in
         let cb, ctx = Constant_typing.infer_opaque ~sec_univs senv.env ce in
+        let () = trace "after opaque type" in
         (* Push the delayed data in the environment *)
         let (_, _, _, i) = Opaqueproof.repr o in
         let nonce = Nonce.create () in

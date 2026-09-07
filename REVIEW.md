@@ -1,8 +1,8 @@
-# Guide conversion through dependencies and shared projections
+# Preserve the remaining kernel experiment diagnostics
 
-Base: `review/unit-eta`. Compare against this base, not upstream.
+Base: `review/conversion-strategies`. Compare against this base, not upstream.
 
-Prefer useful dependency/constructor unfolding, try projection congruence, respect constructor-field relevance and memoize successful typed comparisons with their lift/context. Motivating imports include Int32.toBitVec_not, Std.DHashMap.Internal.Raw₀.Const.insertManyIfNewUnit_cons and Lean.Widget.MsgEmbed._sizeOf_2_eq. Includes the experimental strategy switches and tracing embedded in conversion; these still need cleanup and kernel-expert review. The unit-eta rules are in the base branch.
+Reproduce the exact experimental source snapshot, including opt-in type/error traces and the ROCQ_DIAGNOSTIC_IGNORE_VO_DIGEST escape hatch. The digest bypass is diagnostic-only and must not be enabled for a checking result or proposed as a production fix. This branch is for reproducing the experiment, not an upstream PR.
 
 ## Validation
 
