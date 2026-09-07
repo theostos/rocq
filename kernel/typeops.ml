@@ -207,6 +207,8 @@ let rec check_empty_stack = function
 | CClosure.Zupdate _ :: s -> check_empty_stack s
 | _ -> false
 
+let dump_eq_ndrec_argument_count = ref 0
+
 let type_of_apply env func funt argsv argstv =
   let open CClosure in
   let len = Array.length argsv in
@@ -223,9 +225,98 @@ let type_of_apply env func funt argsv argstv =
         let arg = argsv.(i) in
         let argt = argstv.(i) in
         let c1 = term_of_fconstr c1 in
-        begin match conv_leq env argt c1 with
+        let () =
+          if Option.has_some (Sys.getenv_opt "ROCQ_DUMP_EQ_NDREC_ARGUMENT") &&
+             Int.equal i 3
+          then
+            let head, _ = Constr.decompose_app func in
+            match Constr.kind head with
+            | Const (constant, _) when
+                String.ends_with ~suffix:"Eq_ndrec_inst1"
+                  (Constant.to_string constant) ->
+              incr dump_eq_ndrec_argument_count;
+              if Int.equal !dump_eq_ndrec_argument_count 2 then
+                CErrors.user_err
+                  Pp.(str "Eq_ndrec proof actual type:" ++ fnl () ++
+                      Constr.debug_print argt ++
+                      fnl () ++ str "Eq_ndrec proof expected type:" ++ fnl () ++
+                      Constr.debug_print c1)
+            | _ -> ()
+        in
+        let conversion = conv_leq env argt c1 in
+        let conversion =
+          match conversion with
+          | Result.Error ()
+            when Option.has_some
+                   (Sys.getenv_opt
+                      "ROCQ_DIAGNOSTIC_NORMALIZE_APPLICATION_TYPES") ->
+            let reduction_infos =
+              CClosure.create_clos_infos RedFlags.betaiotazeta env
+            in
+            let normalize term =
+              CClosure.norm_val reduction_infos (CClosure.create_tab ())
+                (CClosure.inject term)
+            in
+            conv_leq env (normalize argt) (normalize c1)
+          | Result.Error ()
+            when Option.has_some
+                   (Sys.getenv_opt "ROCQ_DIAGNOSTIC_REVERSE_CONVERSION") ->
+            Conversion.conv_leq ~l2r:true env argt c1
+          | result -> result
+        in
+        begin match conversion with
         | Result.Ok () -> apply_rec (i+1) (mk_clos (CClosure.usubs_cons (inject arg) e) c2)
         | Result.Error () ->
+          let () =
+            if Option.has_some
+                 (Sys.getenv_opt "ROCQ_DIAGNOSTIC_BAD_APPLICATION_INDEX")
+            then
+              let compact_head term =
+                let head, arguments = Constr.decompose_app term in
+                let name =
+                  match Constr.kind head with
+                  | Const (constant, _) -> Constant.to_string constant
+                  | Ind (inductive, _) ->
+                    MutInd.to_string (fst inductive) ^ ".<inductive>"
+                  | Construct (constructor, _) ->
+                    MutInd.to_string (fst (fst constructor)) ^ ".<constructor>"
+                  | Rel index -> Printf.sprintf "Rel(%d)" index
+                  | Sort _ -> "<sort>"
+                  | Prod _ -> "<product>"
+                  | Lambda _ -> "<lambda>"
+                  | LetIn _ -> "<let>"
+                  | App _ -> assert false
+                  | Case _ -> "<case>"
+                  | Fix _ -> "<fix>"
+                  | CoFix _ -> "<cofix>"
+                  | Proj _ -> "<projection>"
+                  | Meta _ -> "<meta>"
+                  | Evar _ -> "<evar>"
+                  | Var id -> Id.to_string id
+                  | Cast _ -> "<cast>"
+                  | Int _ -> "<int>"
+                  | Float _ -> "<float>"
+                  | String _ -> "<string>"
+                  | Array _ -> "<array>"
+                in
+                Printf.sprintf "%s/%d" name (Array.length arguments)
+              in
+              let compact_type term =
+                let binders, conclusion = Term.decompose_prod term in
+                let domains =
+                  binders
+                  |> List.map (fun (_, domain) -> compact_head domain)
+                  |> String.concat ", "
+                in
+                Printf.sprintf "[%s] => %s" domains
+                  (compact_head conclusion)
+              in
+              CErrors.user_err
+                Pp.(str (Printf.sprintf
+                     "Bad application argument %d; function %s; expected %s; actual %s"
+                     (i + 1) (compact_head func) (compact_type c1)
+                     (compact_type argt)))
+          in
           error_cant_apply_bad_type env
             (i+1,c1,argt)
             (make_judge func funt)
@@ -846,8 +937,15 @@ let check_wellformed_universes env c =
 
 let infer_hconstr env hconstr =
   let constr = HConstr.self hconstr in
+  let trace stage =
+    if Option.has_some (Sys.getenv_opt "ROCQ_OPAQUE_TRACE") then
+      Printf.eprintf "[infer-hconstr] %s\n%!" stage
+  in
+  let () = trace "before wellformed universes" in
   let () = check_wellformed_universes env constr in
+  let () = trace "before execute" in
   let t = execute env hconstr in
+  let () = trace "after execute" in
   make_judge constr t
 
 let infer env c =

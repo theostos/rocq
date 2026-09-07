@@ -214,17 +214,30 @@ let infer_parameter ~sec_univs env entry =
   }
 
 let infer_definition ~sec_univs env entry =
+  let trace stage =
+    if Option.has_some (Sys.getenv_opt "ROCQ_OPAQUE_TRACE") then
+      Printf.eprintf "[definition] %s\n%!" stage
+  in
+  let () = trace "before universes" in
   let env, usubst, _, univs = process_universes env entry.definition_entry_universes in
+  let () = trace "before body universe substitution" in
   let body = Vars.subst_univs_level_constr usubst entry.definition_entry_body in
+  let () = trace "before hconstr" in
   let hbody = HConstr.of_constr env body in
+  let () = trace "before infer" in
   let j = Typeops.infer_hconstr env hbody in
+  let () = trace "after infer" in
   let typ = match entry.definition_entry_type with
     | None ->
       j.uj_type
     | Some t ->
+      let () = trace "before type universe substitution" in
       let t = Vars.subst_univs_level_constr usubst t in
+      let () = trace "before declared type" in
       let tj = Typeops.infer_type env t in
+      let () = trace "before cast" in
       let () = Typeops.check_cast env j DEFAULTcast tj in
+      let () = trace "after cast" in
       tj.utj_val
   in
   let body = j.uj_val in
@@ -245,9 +258,19 @@ let infer_definition ~sec_univs env entry =
 
 (** Definition is opaque (Qed), so we delay the typing of its body. *)
 let infer_opaque ~sec_univs env entry =
+  let trace stage =
+    if Option.has_some (Sys.getenv_opt "ROCQ_OPAQUE_TRACE") then
+      Printf.eprintf "[opaque] %s\n%!" stage
+  in
+  let () = trace "before universes" in
   let env, usubst, _, univs = process_universes env entry.opaque_entry_universes in
+  let () = trace "after universes" in
+  let () = trace "before type universe substitution" in
   let typ = Vars.subst_univs_level_constr usubst entry.opaque_entry_type in
+  let () = trace "after type universe substitution" in
+  let () = trace "before declared type" in
   let typj = Typeops.infer_type env typ in
+  let () = trace "after declared type" in
   let context = TyCtx (env, typj, entry.opaque_entry_secctx, usubst, univs) in
   let def = OpaqueDef () in
   let typ = typj.utj_val in
@@ -280,14 +303,24 @@ let check_delayed (type a) (handle : a effect_handler) tyenv (body : a proof_out
   in
   (* Note: non-trivial usubst only in polymorphic case *)
   let body = Vars.subst_univs_level_constr usubst body in
+  let trace stage =
+    if Option.has_some (Sys.getenv_opt "ROCQ_OPAQUE_TRACE") then
+      Printf.eprintf "[opaque] %s\n%!" stage
+  in
+  let () = trace "before hconstr" in
   let hbody = HConstr.of_constr env body in
+  let () = trace "after hconstr" in
   (* Note: non-trivial trusted side-effects only in monomorphic case *)
   let () =
     let eff_body, eff_env = skip_trusted_seff valid_signatures hbody env in
+    let () = trace "before infer" in
     let j = Typeops.infer_hconstr eff_env eff_body in
+    let () = trace "after infer" in
     let () = assert (HConstr.self eff_body == j.uj_val) in
     let j = { uj_val = HConstr.self hbody; uj_type = j.uj_type } in
-    Typeops.check_cast eff_env j DEFAULTcast tyj
+    let () = trace "before cast" in
+    let () = Typeops.check_cast eff_env j DEFAULTcast tyj in
+    trace "after cast"
   in
   let declared =
     if List.is_empty (named_context env) then declared
