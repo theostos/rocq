@@ -1,32 +1,38 @@
-# Preserve binder scope in application-congruence probes
+# Bound speculative congruence before unfolding
 
-Base: `fix/stuck-record-eta`. Compare against this base.
+Base: `fix/congruence-probe-scope`. Compare against this base.
 
-The experimental application-congruence probe reified closures, then used
-`inject`, whose substitution has zero local binders. Under a binder, this
-mistook a bound `FRel` for an external `RelKey`. Relevance lookup could then
-raise `Not_found` in the outer environment.
+`UInt32.toUInt64_shiftLeft_of_lt` overflows at cslib export line 16,372,304.
+Conversion compares recursor branches involving different large bounds,
+although evaluating the original applications would discard those branches.
 
-Apply each side's lift before rebuilding its closure with the current local
-binder depth. Compare the rebuilt terms with identity lifts. This retains
-the probe's isolated sharing state and ordinary conversion checks; it does
-not catch the exception or add an equality rule.
+With the dependency heuristic enabled, limit speculative congruence on
+unfoldable definitions to 256 nested, uncached conversion calls. Nested
+comparisons share the counter, restoring it on return; only its owner catches
+exhaustion and resumes ordinary unfolding. The peeled-application probe uses
+the same mechanism. Long, shallow comparisons are not limited by their work.
+Opaque and local heads cannot start a budget: without an unfolding fallback,
+congruence may be their only valid checking route.
+
+This limits a trial strategy, not whole-proof checking or every reduction
+step. No new equality rule, arithmetic operation, importer patch or library
+proof replacement.
 
 ## Validation
 
-The unchanged Lean theorem `List.insertIdx_eraseIdx_of_le` fails at cslib
-export line 15,367,062. A 4,380-line dependency-only export reproduces the
-same anomaly before the patch and passes afterward, including fresh import
-and reload.
+The 117,502-line export of the unchanged theorem and dependencies fails
+before the patch and passes afterward, including fresh import and reload.
+Six original widening-shift theorems cover UInt8, UInt16, UInt32 and UInt64.
 
-`congruence_probe_scope.v` reproduces the anomaly without the importer.
-It covers lambdas, eta lifts, external relatives, fixpoint bodies, SProp
-binders and products, and rejects equalities between distinct variables.
+`bounded_congruence.v` reproduces the overflow without the importer. It tests
+both comparison directions, binders, wrong results and genuine opacity, plus
+long valid comparisons under opaque and local heads.
 
-All 40 selected kernel/importer checks and 19 checkpoint-runner unit tests
-pass. These use the combined experimental kernel with this exact source
-correction, not a clean build of this review branch or the full Rocq suite.
-Reproduction and logs: arena workspace, `work/list-insert-erase-repro`.
+All 45 selected kernel/importer checks pass under tag `depth-final`, along
+with 19 checkpoint-runner unit tests. This includes the earlier HashMap,
+integer arithmetic, record eta, binder-scope and nested-inductive regressions.
 
-No importer or library proof changed. Full cslib verification remains
-incomplete; the inherited experimental kernel still needs review.
+These checks use the combined experimental kernel with this exact source
+delta, not a clean build of this review branch or the full Rocq suite.
+Reproduction and logs: arena workspace, `work/uint32-shift-repro`.
+Full cslib verification remains incomplete; the inherited kernel needs review.

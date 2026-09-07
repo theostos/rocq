@@ -264,6 +264,8 @@ type 'e conv_tab = {
   cnv_inf : clos_infos;
   cnv_typ : bool; (* true if the input terms were well-typed *)
   cnv_rel_types : fconstr option Range.t;
+  (* Remaining depth, shared within one speculative congruence check. *)
+  cnv_probe_budget : int ref option;
   cnv_projection_conversions : projection_conversion list ref;
   cnv_successful_conversions : successful_conversion_cache;
   cnv_memoize_successful_conversions : bool;
@@ -282,6 +284,20 @@ let fail_check (infos : 'err conv_tab) (state, check) = match state with
 | Result.Ok state -> (state, check)
 | Result.Error None -> raise NotConvertible
 | Result.Error (Some err) -> raise (NotConvertibleTrace (infos.err_ret err))
+
+exception Probe_budget_exhausted
+
+(* Congruence can compare branches that evaluation of the actual application
+   would discard. Limit its nesting depth, not ordinary conversion:
+   the owner of the budget turns exhaustion into the usual unfolding fallback.
+   Nested comparisons share the counter and must not catch exhaustion. *)
+let with_congruence_budget infos compare =
+  if Option.has_some infos.cnv_probe_budget ||
+     not (Environ.typing_flags (info_env infos.cnv_inf)).unfold_dep_heuristic
+  then compare infos
+  else
+    try compare { infos with cnv_probe_budget = Some (ref 256) }
+    with Probe_budget_exhausted -> raise NotConvertible
 
 let convert_inductives cv_pb ind nargs u1 u2 (s, check) =
   convert_inductives_gen (check.compare_instances ~flex:false) check.compare_cumul_instances
@@ -1189,8 +1205,16 @@ let rec ccnv cv_pb l2r infos lft1 lft2 term1 term2 cuniv =
   then cuniv
   else begin
     let result =
-      eqappr cv_pb l2r infos
-        (lft1, (term1,[])) (lft2, (term2,[])) cuniv
+      let compare () =
+        eqappr cv_pb l2r infos
+          (lft1, (term1,[])) (lft2, (term2,[])) cuniv
+      in
+      match infos.cnv_probe_budget with
+      | None -> compare ()
+      | Some remaining ->
+        if Int.equal !remaining 0 then raise Probe_budget_exhausted;
+        decr remaining;
+        Fun.protect compare ~finally:(fun () -> incr remaining)
     in
     remember_successful_conversion infos cv_pb lft1 lft2 term1 term2;
     result
@@ -1313,8 +1337,20 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
            (Environ.typing_flags (info_env infos.cnv_inf)).unfold_dep_heuristic &&
            (match fl1 with ConstKey _ -> true | RelKey _ | VarKey _ -> false)
          in
-         convert_stacks ~mask ~constructor_first
-           l2r infos lft1 lft2 v1 v2 cuniv
+         let compare infos =
+           convert_stacks ~mask ~constructor_first
+             l2r infos lft1 lft2 v1 v2 cuniv
+         in
+         let can_unfold = match fl1 with
+           | ConstKey (c, _) when
+               RedFlags.red_set (info_flags infos.cnv_inf) (RedFlags.fCONST c) ->
+             (match (Environ.lookup_constant c (info_env infos.cnv_inf)).const_body with
+              | Def _ -> true
+              | Undef _ | OpaqueDef _ | Primitive _ | Symbol _ -> false)
+           | ConstKey _ | RelKey _ | VarKey _ -> false
+         in
+         if can_unfold then with_congruence_budget infos compare
+         else compare infos
        with NotConvertible | NotConvertibleTrace _ ->
         let () = trace_flex "fallback" in
         if same_unit_like_flexes infos lft1 v1 fl1 lft2 v2 fl2 then cuniv
@@ -1400,13 +1436,14 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
                   fresh_term lift (CClosure.term_of_process head stack)
                 in
                 (try
+                   Some (with_congruence_budget infos (fun infos ->
                    let cuniv =
                      ccnv CONV l2r infos el_id el_id
                        (fresh_argument lft1 args1.(prefix_length))
                        (fresh_argument lft2 args2.(prefix_length)) cuniv
                    in
-                   Some (ccnv cv_pb l2r infos el_id el_id
-                     (fresh_prefix lft1 hd1 args1) (fresh_prefix lft2 hd2 args2) cuniv)
+                   ccnv cv_pb l2r infos el_id el_id
+                     (fresh_prefix lft1 hd1 args1) (fresh_prefix lft2 hd2 args2) cuniv))
                  with NotConvertible | NotConvertibleTrace _ -> None)
             | _ -> None
           in
@@ -2770,6 +2807,7 @@ let clos_gen_conv (type err) ~typed ~constructor_relevance
         cnv_inf = infos;
         cnv_typ = typed;
         cnv_rel_types = Range.empty;
+        cnv_probe_budget = None;
         cnv_projection_conversions = ref [];
         cnv_successful_conversions =
           make_successful_conversion_cache (successful_conversion_limit ());
@@ -2882,6 +2920,7 @@ let () =
         cnv_inf = infos;
         cnv_typ = true;
         cnv_rel_types = Range.empty;
+        cnv_probe_budget = None;
         cnv_projection_conversions = ref [];
         cnv_successful_conversions = make_successful_conversion_cache 0;
         cnv_memoize_successful_conversions = false;
