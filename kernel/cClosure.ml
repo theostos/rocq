@@ -3267,11 +3267,23 @@ let unfold_ref_with_args infos tab fl v =
           let reds = RedFlags.(red_add_transparent all
               (red_transparent (info_flags infos))) in
           let reduction_infos = infos_with_reds infos reds in
-          let reduced_args = Array.copy args in
-          reduced_args.(0) <- kh reduction_infos tab args.(0) [];
-          reduced_args.(2) <- kh reduction_infos tab args.(2) [];
-          reduced_args.(3) <- kh reduction_infos tab args.(3) [];
-          compact_peano_nat_constant infos c reduced_args
+          let reduce arg = kh reduction_infos tab arg [] in
+          (* Fuel is commonly [S dividend]. Head reduction alone leaves its
+             predecessor unevaluated, so use the same compact numeral probe
+             as the reduction machine before deciding to unfold the worker. *)
+          begin match
+            compact_peano_reduced_fconstr infos reduce args.(0),
+            compact_peano_reduced_fconstr infos reduce args.(2),
+            compact_peano_reduced_fconstr infos reduce args.(3)
+          with
+          | Some divisor, Some fuel, Some dividend ->
+            let reduced_args = Array.copy args in
+            reduced_args.(0) <- divisor;
+            reduced_args.(2) <- fuel;
+            reduced_args.(3) <- dividend;
+            compact_peano_nat_constant infos c reduced_args
+          | _ -> None
+          end
         | None when Array.length args >= 2 ->
           let reds = RedFlags.(red_add_transparent all
               (red_transparent (info_flags infos))) in
