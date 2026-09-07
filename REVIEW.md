@@ -1,8 +1,8 @@
-# Support conversion for registered unit-like inductives
+# Guide conversion through dependencies and shared projections
 
-Base: `review/compact-peano`. Compare against this base, not upstream.
+Base: `review/unit-eta`. Compare against this base, not upstream.
 
-Recognize neutral inhabitants of registered unindexed single-constructor types without runtime-relevant fields, including supported unit-valued projections. This addresses FinLoop totality and LawfulMonadStateOf.modify_eq. Projection parameter substitution stays lazy: reifying an erased proof parameter caused the LinearMap.exists_ne_zero_of_sSup_eq assertion. Dependent projection types are conservatively excluded from the unit query. This is a change to definitional equality, not merely an unfolding heuristic.
+Prefer useful dependency/constructor unfolding, try projection congruence, respect constructor-field relevance and memoize successful typed comparisons with their lift/context. Motivating imports include Int32.toBitVec_not, Std.DHashMap.Internal.Raw₀.Const.insertManyIfNewUnit_cons and Lean.Widget.MsgEmbed._sizeOf_2_eq. Includes the experimental strategy switches and tracing embedded in conversion; these still need cleanup and kernel-expert review. The unit-eta rules are in the base branch.
 
 ## Validation
 
