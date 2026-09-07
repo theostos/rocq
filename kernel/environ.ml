@@ -48,29 +48,118 @@ type link_info =
 
 type constant_key = constant_body * (link_info ref * key) * KerName.t
 
+(* Temporary, opt-in diagnostics. Keep scalar counters only: recording query
+   pairs here would defeat the dependency cache's memory bound. *)
+module DependencyDiagnostics = struct
+  let enabled =
+    Option.has_some (Sys.getenv_opt "ROCQ_DIAGNOSTIC_DEPENDENCY_STATS")
+
+  let calls = ref 0
+  let hits = ref 0
+  let misses = ref 0
+  let clears = ref 0
+  let uncached = ref 0
+  let vertices = ref 0
+  let cpu = ref 0.
+  let max_query_cpu = ref 0.
+  let slow_reports = ref 0
+
+  let measure source target compute =
+    incr calls;
+    let call = !calls in
+    let started = Sys.time () in
+    let first_vertex = !vertices in
+    let finish outcome =
+      let elapsed = Sys.time () -. started in
+      cpu := !cpu +. elapsed;
+      max_query_cpu := max !max_query_cpu elapsed;
+      let slow = elapsed >= 0.25 && !slow_reports < 16 in
+      if slow then incr slow_reports;
+      if slow || (call land (call - 1)) = 0 then begin
+        Printf.eprintf
+          "[dependency stats] calls=%d hits=%d misses=%d clears=%d uncached=%d vertices=%d cpu=%.6f max_query_cpu=%.6f query_vertices=%d query_cpu=%.6f outcome=%s\n%!"
+          call !hits !misses !clears !uncached !vertices !cpu
+          !max_query_cpu (!vertices - first_vertex) elapsed outcome;
+        if slow then
+          Printf.eprintf "[dependency slow] %s -> %s\n%!"
+            (Constant.to_string source) (Constant.to_string target)
+      end
+    in
+    match compute () with
+    | answer ->
+      finish (if answer then "true" else "false");
+      answer
+    | exception error ->
+      let error = Exninfo.capture error in
+      finish "raised";
+      Exninfo.iraise error
+end
+
 module DepCache :
 sig
   type t
   val empty : t
   val get : Constant.t -> t -> (Cset_env.t, Cset_env.t -> unit) union
+  val memo : t -> Constant.t -> Constant.t -> (unit -> bool) -> bool
   val fresh : t -> t
 end =
 struct
 
-type t = Cset_env.t Cmap_env.t ref option
+module Answers = Hashtbl.Make(struct
+  type t = Constant.t * Constant.t
+  let equal (a, b) (c, d) =
+    Constant.UserOrd.equal a c && Constant.UserOrd.equal b d
+  let hash (a, b) =
+    Hashtbl.hash (Constant.UserOrd.hash a, Constant.UserOrd.hash b)
+end)
+
+type cache = {
+  direct : Cset_env.t Cmap_env.t ref;
+  answers : bool Answers.t;
+}
+
+type t = cache option
 
 let empty = None
+let answer_limit = 16_384
 
 let get kn cache = match cache with
 | None -> Inr ignore
 | Some cache ->
-  match Cmap_env.find_opt kn !cache with
-  | None -> Inr (fun s -> cache := Cmap_env.add kn s !cache)
+  match Cmap_env.find_opt kn !(cache.direct) with
+  | None -> Inr (fun s -> cache.direct := Cmap_env.add kn s !(cache.direct))
   | Some s -> Inl s
 
-let fresh = function
-| None -> Some (ref Cmap_env.empty)
-| Some cache -> Some (ref !cache)
+let memo cache source target compute = match cache with
+| None ->
+  if DependencyDiagnostics.enabled then incr DependencyDiagnostics.uncached;
+  compute ()
+| Some cache ->
+  let key = source, target in
+  match Answers.find_opt cache.answers key with
+  | Some answer ->
+    if DependencyDiagnostics.enabled then incr DependencyDiagnostics.hits;
+    answer
+  | None ->
+    if DependencyDiagnostics.enabled then incr DependencyDiagnostics.misses;
+    let answer = compute () in
+    (* Repeated reachability queries are common during conversion. Bound the
+       saved answers so they cannot recreate a quadratic dependency cache. *)
+    if Answers.length cache.answers >= answer_limit then begin
+      if DependencyDiagnostics.enabled then incr DependencyDiagnostics.clears;
+      Answers.clear cache.answers
+    end;
+    Answers.replace cache.answers key answer;
+    answer
+
+let fresh cache =
+  let direct = match cache with
+  | None -> Cmap_env.empty
+  | Some cache -> !(cache.direct)
+  in
+  (* Appending a constant can change answers involving a formerly missing
+     name. Never carry answers into, or share them with, the new environment. *)
+  Some { direct = ref direct; answers = Answers.create 16 }
 
 end
 
@@ -1270,7 +1359,9 @@ end
 
 module QGlobRef = HackQ(GlobRef)(GlobRef.Map_env)
 
-let rec constant_dependencies_with_cache env cache kn =
+(* Cache direct edges only: storing every transitive closure can retain
+   quadratically many set nodes even for a simple chain of definitions. *)
+let direct_constant_dependencies env cache kn =
   match DepCache.get kn cache with
   | Inl deps -> deps
   | Inr set ->
@@ -1278,11 +1369,25 @@ let rec constant_dependencies_with_cache env cache kn =
     | None -> Cset_env.empty
     | Some (body, _, _) ->
       let deps = match body.const_body with
+      | Def c when isConst c -> Cset_env.singleton (fst (destConst c))
       | Def c ->
+        (* Bodies can be shared DAGs. Remember completed scans locally, without
+           retaining dependency sets per subterm. Fixed slots keep both memory
+           and lookup cost bounded; hash collisions only cause repeated work. *)
+        let seen = Array.make 4096 None in
+        let mask = Array.length seen - 1 in
         let rec compute_dependencies accu c = match kind c with
-        | Const (kn, _) ->
-          Cset_env.fold Cset_env.add (constant_dependencies_with_cache env cache kn) (Cset_env.add kn accu)
-        | _ -> Constr.fold compute_dependencies accu c
+        | Const (kn, _) -> Cset_env.add kn accu
+        | _ ->
+          let slot = Hashtbl.hash_param 4 16 c land mask in
+          match seen.(slot) with
+          | Some previous when previous == c -> accu
+          | _ ->
+            let accu = Constr.fold compute_dependencies accu c in
+            (* Insert after the children: even a chain of colliding hashes then
+               retains its root for an immediately repeated shared subtree. *)
+            seen.(slot) <- Some c;
+            accu
         in
         compute_dependencies Cset_env.empty c
       | Undef _ | OpaqueDef _ | Primitive _ | Symbol _ -> Cset_env.empty
@@ -1290,15 +1395,30 @@ let rec constant_dependencies_with_cache env cache kn =
       let () = set deps in
       deps
 
-let constant_dependencies env kn =
+let constant_depends_on env cst1 cst2 =
   let cache =
     try CEphemeron.get env.constant_deps
     with CEphemeron.InvalidKey -> DepCache.empty
   in
-  constant_dependencies_with_cache env cache kn
-
-let constant_depends_on env cst1 cst2 =
-  Cset_env.mem cst2 (constant_dependencies env cst1)
+  let rec search seen = function
+  | [] -> false
+  | cst :: pending ->
+    if DependencyDiagnostics.enabled then incr DependencyDiagnostics.vertices;
+    let deps = direct_constant_dependencies env cache cst in
+    if Cset_env.mem cst2 deps then true
+    else
+      let seen, pending = Cset_env.fold (fun dep (seen, pending) ->
+        if Cset_env.mem dep seen then seen, pending
+        else Cset_env.add dep seen, dep :: pending)
+        deps (seen, pending)
+      in
+      search seen pending
+  in
+  let compute () = search (Cset_env.singleton cst1) [cst1] in
+  if DependencyDiagnostics.enabled then
+    DependencyDiagnostics.measure cst1 cst2 (fun () ->
+      DepCache.memo cache cst1 cst2 compute)
+  else DepCache.memo cache cst1 cst2 compute
 
 module Internal = struct
   let push_template_context uctx env =
