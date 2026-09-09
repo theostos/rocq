@@ -53,24 +53,56 @@ sig
   type t
   val empty : t
   val get : Constant.t -> t -> (Cset_env.t, Cset_env.t -> unit) union
+  val memo : t -> Constant.t -> Constant.t -> (unit -> bool) -> bool
   val fresh : t -> t
 end =
 struct
 
-type t = Cset_env.t Cmap_env.t ref option
+module Answers = Hashtbl.Make(struct
+  type t = Constant.t * Constant.t
+  let equal (a, b) (c, d) =
+    Constant.UserOrd.equal a c && Constant.UserOrd.equal b d
+  let hash (a, b) =
+    Hashtbl.hash (Constant.UserOrd.hash a, Constant.UserOrd.hash b)
+end)
+
+type cache = {
+  direct : Cset_env.t Cmap_env.t ref;
+  answers : bool Answers.t;
+}
+
+type t = cache option
 
 let empty = None
+let answer_limit = 16_384
 
 let get kn cache = match cache with
 | None -> Inr ignore
 | Some cache ->
-  match Cmap_env.find_opt kn !cache with
-  | None -> Inr (fun s -> cache := Cmap_env.add kn s !cache)
+  match Cmap_env.find_opt kn !(cache.direct) with
+  | None -> Inr (fun s -> cache.direct := Cmap_env.add kn s !(cache.direct))
   | Some s -> Inl s
 
-let fresh = function
-| None -> Some (ref Cmap_env.empty)
-| Some cache -> Some (ref !cache)
+let memo cache source target compute = match cache with
+| None -> compute ()
+| Some cache ->
+  let key = source, target in
+  match Answers.find_opt cache.answers key with
+  | Some answer -> answer
+  | None ->
+    let answer = compute () in
+    if Answers.length cache.answers >= answer_limit then
+      Answers.clear cache.answers;
+    Answers.replace cache.answers key answer;
+    answer
+
+let fresh cache =
+  let direct = match cache with
+  | None -> Cmap_env.empty
+  | Some cache -> !(cache.direct)
+  in
+  (* Newly defined constants can invalidate answers about missing names. *)
+  Some { direct = ref direct; answers = Answers.create 16 }
 
 end
 
@@ -1270,7 +1302,8 @@ end
 
 module QGlobRef = HackQ(GlobRef)(GlobRef.Map_env)
 
-let rec constant_dependencies_with_cache env cache kn =
+(* Cache direct edges: transitive closures can require quadratic space. *)
+let direct_constant_dependencies env cache kn =
   match DepCache.get kn cache with
   | Inl deps -> deps
   | Inr set ->
@@ -1278,11 +1311,22 @@ let rec constant_dependencies_with_cache env cache kn =
     | None -> Cset_env.empty
     | Some (body, _, _) ->
       let deps = match body.const_body with
+      | Def c when isConst c -> Cset_env.singleton (fst (destConst c))
       | Def c ->
+        (* Skip shared subterms with bounded storage; collisions only repeat work. *)
+        let seen = Array.make 4096 None in
+        let mask = Array.length seen - 1 in
         let rec compute_dependencies accu c = match kind c with
-        | Const (kn, _) ->
-          Cset_env.fold Cset_env.add (constant_dependencies_with_cache env cache kn) (Cset_env.add kn accu)
-        | _ -> Constr.fold compute_dependencies accu c
+        | Const (kn, _) -> Cset_env.add kn accu
+        | _ ->
+          let slot = Hashtbl.hash_param 4 16 c land mask in
+          match seen.(slot) with
+          | Some previous when previous == c -> accu
+          | _ ->
+            let accu = Constr.fold compute_dependencies accu c in
+            (* Insert last so collisions with descendants preserve this root. *)
+            seen.(slot) <- Some c;
+            accu
         in
         compute_dependencies Cset_env.empty c
       | Undef _ | OpaqueDef _ | Primitive _ | Symbol _ -> Cset_env.empty
@@ -1290,15 +1334,26 @@ let rec constant_dependencies_with_cache env cache kn =
       let () = set deps in
       deps
 
-let constant_dependencies env kn =
+let constant_depends_on env cst1 cst2 =
   let cache =
     try CEphemeron.get env.constant_deps
     with CEphemeron.InvalidKey -> DepCache.empty
   in
-  constant_dependencies_with_cache env cache kn
-
-let constant_depends_on env cst1 cst2 =
-  Cset_env.mem cst2 (constant_dependencies env cst1)
+  let rec search seen = function
+  | [] -> false
+  | cst :: pending ->
+    let deps = direct_constant_dependencies env cache cst in
+    if Cset_env.mem cst2 deps then true
+    else
+      let seen, pending = Cset_env.fold (fun dep (seen, pending) ->
+        if Cset_env.mem dep seen then seen, pending
+        else Cset_env.add dep seen, dep :: pending)
+        deps (seen, pending)
+      in
+      search seen pending
+  in
+  let compute () = search (Cset_env.singleton cst1) [cst1] in
+  DepCache.memo cache cst1 cst2 compute
 
 module Internal = struct
   let push_template_context uctx env =
