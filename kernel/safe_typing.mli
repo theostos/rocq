@@ -279,7 +279,22 @@ val mind_of_delta_kn_senv : safe_environment -> KerName.t -> MutInd.t
 
 val register_inline : Constant.t -> safe_transformer0
 val register_inductive : inductive -> 'a CPrimitives.prim_ind -> safe_transformer0
+val register_peano_nat : inductive -> safe_transformer0
+val register_peano_nat_double : Constant.t -> safe_transformer0
+val register_peano_nat_of_N : Constant.t -> safe_transformer0
+val register_peano_nat_add : Constant.t -> safe_transformer0
+val register_peano_nat_mul : Constant.t -> safe_transformer0
+val register_peano_nat_pow : Constant.t -> safe_transformer0
+val register_peano_nat_sub : Constant.t -> safe_transformer0
+val register_peano_nat_div_go : Constant.t -> safe_transformer0
+val register_peano_nat_mod_go : Constant.t -> safe_transformer0
+val register_peano_nat_beq : Constant.t -> safe_transformer0
+val register_peano_nat_ble : Constant.t -> safe_transformer0
+val register_unit_like : inductive -> safe_transformer0
+val check_peano_retroknowledge : Environ.env -> Retroknowledge.action -> unit
 val check_register_ind : inductive -> 'a CPrimitives.prim_ind -> Declarations.mind_specif -> unit
+val check_register_peano_nat : inductive -> Declarations.mind_specif -> unit
+val check_register_unit_like : inductive -> Declarations.mind_specif -> unit
 
 val set_oracle : Conv_oracle.oracle -> safe_transformer0
 val set_strategy : Conv_oracle.evaluable -> Conv_oracle.level -> safe_transformer0
