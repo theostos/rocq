@@ -601,9 +601,7 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
               Conversion check to rigid terms eventually implies full weak-head
               reduction, so instead of repeatedly performing small-step
               unfoldings, we perform reduction with all flags on. *)
-            let all = RedFlags.(red_add_transparent all (red_transparent (info_flags infos.cnv_inf))) in
-            let r1 = whd_stack (infos_with_reds infos.cnv_inf all) infos.lft_tab def1 v1 in
-            eqwhnf cv_pb l2r infos (lft1, r1) appr2 cuniv
+            eqappr cv_pb l2r infos (lft1, (def1, v1)) appr2 cuniv
         | None ->
           (match c2 with
            | FConstruct (((ind2, 1), u2), args2) ->
@@ -620,9 +618,7 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
        begin match unfold_ref_with_args infos.cnv_inf infos.rgt_tab fl2 v2 with
         | Some (def2, v2) ->
           (** Symmetrical case of above. *)
-          let all = RedFlags.(red_add_transparent all (red_transparent (info_flags infos.cnv_inf))) in
-          let r2 = whd_stack (infos_with_reds infos.cnv_inf all) infos.rgt_tab def2 v2 in
-          eqwhnf cv_pb l2r infos appr1 (lft2, r2) cuniv
+          eqappr cv_pb l2r infos appr1 (lft2, (def2, v2)) cuniv
         | None ->
           match c1 with
           | FConstruct (((ind1, 1), u1), args1) ->
