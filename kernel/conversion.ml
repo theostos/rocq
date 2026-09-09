@@ -301,7 +301,12 @@ let eq_universes (_,e1) (_,e2) u1 u2 =
   UVars.Instance.equal (subst e1 u1) (subst e2 u2)
 
 let rec compare_under e1 c1 e2 c2 =
-  match Constr.kind c1, Constr.kind c2 with
+  if
+    c1 == c2
+    && fst e1 == fst e2
+    && UVars.Instance.equal (snd e1) (snd e2)
+  then true
+  else match Constr.kind c1, Constr.kind c2 with
   | Cast (c1, _, _), _ -> compare_under e1 c1 e2 c2
   | _, Cast (c2, _, _) -> compare_under e1 c1 e2 c2
   | Rel i, Rel j -> begin match Esubst.expand_rel i (fst e1) with
@@ -597,13 +602,12 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
     | (FFlex fl1, c2)      ->
       begin match unfold_ref_with_args infos.cnv_inf infos.lft_tab fl1 v1 with
         | Some (def1,v1) ->
-          (** By virtue of the previous case analyses, we know [c2] is rigid.
-              Conversion check to rigid terms eventually implies full weak-head
-              reduction, so instead of repeatedly performing small-step
-              unfoldings, we perform reduction with all flags on. *)
-            let all = RedFlags.(red_add_transparent all (red_transparent (info_flags infos.cnv_inf))) in
-            let r1 = whd_stack (infos_with_reds infos.cnv_inf all) infos.lft_tab def1 v1 in
-            eqwhnf cv_pb l2r infos (lft1, r1) appr2 cuniv
+          (** Unfold one reference at a time.  The rigid side can be an
+              explicit intermediate reduct whose head is blocked by a
+              transparent argument.  Fully reducing the flexible side here
+              would step past that reduct and needlessly force the blocked
+              computation. *)
+          eqappr cv_pb l2r infos (lft1, (def1, v1)) appr2 cuniv
         | None ->
           (match c2 with
            | FConstruct (((ind2, 1), u2), args2) ->
@@ -620,9 +624,7 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
        begin match unfold_ref_with_args infos.cnv_inf infos.rgt_tab fl2 v2 with
         | Some (def2, v2) ->
           (** Symmetrical case of above. *)
-          let all = RedFlags.(red_add_transparent all (red_transparent (info_flags infos.cnv_inf))) in
-          let r2 = whd_stack (infos_with_reds infos.cnv_inf all) infos.rgt_tab def2 v2 in
-          eqwhnf cv_pb l2r infos appr1 (lft2, r2) cuniv
+          eqappr cv_pb l2r infos appr1 (lft2, (def2, v2)) cuniv
         | None ->
           match c1 with
           | FConstruct (((ind1, 1), u1), args1) ->
@@ -1019,6 +1021,199 @@ let () =
   in
   CClosure.set_conv conv
 
+(** Compare explicit intermediate reducts without forcing either term to weak
+    head normal form.  Generated proof terms often retain physical sharing
+    around a single beta/zeta/delta step; preserving that zipper makes this
+    check linear in the changed path instead of in the unfolded computation.
+
+    This is only a fast path: it accepts structural equality modulo universes
+    and ordinary kernel reductions.  Failure falls back to the complete
+    closure conversion below. *)
+let direct_reduct_convertible env left right =
+  let trace =
+    Option.has_some (Sys.getenv_opt "ROCQ_DIRECT_TRACE")
+    &&
+    let is_hequality term =
+      let head, _ = decompose_app term in
+      match kind head with
+      | Const (constant, _) ->
+        String.equal (Constant.to_string constant) "LeanImport.Lean.HEquality"
+      | Ind ((inductive, _), _) ->
+        String.equal (MutInd.to_string inductive) "LeanImport.Lean.HEquality"
+      | _ -> false
+    in
+    is_hequality left || is_hequality right
+  in
+  if trace then Printf.eprintf "[direct-trace] begin HEquality\n%!";
+  let graph = Environ.universes env in
+  let module Pairs = Hashtbl.Make(struct
+    type t = constr * constr
+    let equal (l1, r1) (l2, r2) = l1 == l2 && r1 == r2
+    let hash (left, right) =
+      Hashtbl.hash
+        (Hashtbl.hash_param 10 100 left,
+         Hashtbl.hash_param 10 100 right)
+  end)
+  in
+  let rebuild head arguments =
+    if Array.is_empty arguments then head else mkApp (head, arguments)
+  in
+  let rec apply_beta_zeta fuel head arguments =
+    if fuel = 0 then rebuild head arguments
+    else
+      match kind head with
+      | Cast (head, _, _) ->
+        apply_beta_zeta (fuel - 1) head arguments
+      | LetIn (_, value, _, body) ->
+        apply_beta_zeta (fuel - 1) (Vars.subst1 value body) arguments
+      | Lambda (_, _, body) when not (Array.is_empty arguments) ->
+        apply_beta_zeta (fuel - 1)
+          (Vars.subst1 arguments.(0) body)
+          (Array.sub arguments 1 (Array.length arguments - 1))
+      | _ -> rebuild head arguments
+  in
+  let structural_whd term =
+    let reduced =
+      whd_val
+        (create_clos_infos RedFlags.betaiotazeta env)
+        (create_tab ()) (inject term)
+    in
+    if Constr.equal term reduced then None else Some reduced
+  in
+  let reduce_case term =
+    match kind term with
+    | Case (info, _instance, params, _, _, scrutinee, branches) ->
+      let constructor, constructor_arguments = decompose_app scrutinee in
+      (match kind constructor with
+       | Construct ((inductive, index), constructor_instance) ->
+         let specif = Inductive.lookup_mind_specif env inductive in
+         let _, packet = specif in
+         let real_count =
+           Array.length constructor_arguments - info.ci_npar
+         in
+         if
+           real_count < 0
+           || not
+                (Int.equal real_count
+                   packet.mind_consnrealargs.(index - 1))
+         then None
+         else
+           let contexts =
+             Inductive.expand_branch_contexts specif constructor_instance
+               params branches
+           in
+           let branch = branches.(index - 1) in
+           let branch =
+             Term.it_mkLambda_or_LetIn (snd branch) contexts.(index - 1)
+           in
+           let arguments =
+             Array.sub constructor_arguments info.ci_npar real_count
+           in
+           Some (rebuild branch arguments)
+       | _ -> None)
+    | _ -> None
+  in
+  let one_step term =
+    match kind term with
+    | Cast (value, _, _) -> Some value
+    | LetIn (_, value, _, body) -> Some (Vars.subst1 value body)
+    | Const constant ->
+      (try Some (Environ.constant_value_in env constant)
+       with Environ.NotEvaluableConst _ -> None)
+    | App (head, arguments) ->
+      (match kind head with
+       | Lambda _ when not (Array.is_empty arguments) ->
+         Some (apply_beta_zeta 64 head arguments)
+       | LetIn (_, value, _, body) ->
+         Some (apply_beta_zeta 64 (Vars.subst1 value body) arguments)
+       | Const constant ->
+         (try
+            Some
+              (apply_beta_zeta 64
+                 (Environ.constant_value_in env constant) arguments)
+          with Environ.NotEvaluableConst _ -> None)
+       | Case _ ->
+         Option.map (fun head -> rebuild head arguments) (reduce_case head)
+       | Fix _ | CoFix _ | Proj _ -> structural_whd term
+       | _ -> None)
+    | Proj (projection, _, scrutinee) ->
+      let constructor, arguments = decompose_app scrutinee in
+      (match kind constructor with
+       | Construct _ ->
+         let index = Projection.npars projection + Projection.arg projection in
+         if index < Array.length arguments then Some arguments.(index)
+         else None
+       | _ -> None)
+    | Case _ ->
+      (match reduce_case term with
+       | Some _ as reduced -> reduced
+       | None -> structural_whd term)
+    | _ -> None
+  in
+  let seen = Pairs.create 251 in
+  let eq_universes _ =
+    UGraph.check_eq_instances Sorts.Quality.equal graph
+  in
+  let eq_sorts left right =
+    left == right
+    || UGraph.check_eq_sort Sorts.Quality.equal graph left right
+  in
+  let remaining = ref 1000 in
+  let rec compare left right =
+    left == right
+    || Constr.equal left right
+    ||
+    let key = left, right in
+    match Pairs.find_opt seen key with
+    | Some (`Done result) -> result
+    | Some `Visiting -> false
+    | None when !remaining = 0 -> false
+    | None ->
+      decr remaining;
+      Pairs.add seen key `Visiting;
+      let result =
+        Constr.compare_head_gen eq_universes eq_sorts
+          (fun _ _ -> false) (fun _ left right -> compare left right)
+          0 left right
+        || (match one_step left with
+            | Some left -> compare left right
+            | None -> false)
+        || (match one_step right with
+            | Some right -> compare left right
+            | None -> false)
+      in
+      Pairs.replace seen key (`Done result);
+      result
+  in
+  let result = compare left right in
+  if trace then begin
+    Printf.eprintf "[direct-trace] end HEquality=%b\n%!" result;
+    if not result then begin
+      let _, left_arguments = decompose_app left in
+      let _, right_arguments = decompose_app right in
+      let left_head, _ = decompose_app left in
+      let right_head, _ = decompose_app right in
+      Pairs.clear seen;
+      Printf.eprintf "[direct-trace] head result=%b\n%!"
+        (compare left_head right_head);
+      (match kind left_head, kind right_head with
+       | Ind (_, left_instance), Ind (_, right_instance) ->
+         Printf.eprintf "[direct-trace] instances physical=%b graph=%b\n%!"
+           (UVars.Instance.equal left_instance right_instance)
+           (UGraph.check_eq_instances Sorts.Quality.equal graph
+              left_instance right_instance)
+       | _ -> ());
+      if Array.length left_arguments = Array.length right_arguments then
+        Array.iteri
+          (fun index left ->
+            Pairs.clear seen;
+            Printf.eprintf "[direct-trace] argument=%d result=%b\n%!" index
+              (compare left right_arguments.(index)))
+          left_arguments
+    end
+  end;
+  result
+
 let gen_conv ~typed cv_pb ?(l2r=false) ?(reds=TransparentState.full) env ?(evars=default_evar_handler env) t1 t2 =
   let univs = Environ.universes env in
   let state = univs in
@@ -1027,10 +1222,24 @@ let gen_conv ~typed cv_pb ?(l2r=false) ?(reds=TransparentState.full) env ?(evars
     else eq_constr_univs univs t1 t2
   in
     if b then Result.Ok ()
-    else match clos_gen_conv ~typed reds cv_pb l2r evars env univs (state, checked_universes) t1 t2 with
-    | Result.Ok (_ : 'a * ('a, Empty.t) universe_compare)-> Result.Ok ()
-    | Result.Error None -> Result.Error ()
-    | Result.Error (Some e) -> Empty.abort e
+    else
+      let started = Unix.gettimeofday () in
+      let direct =
+        not (Option.has_some (Sys.getenv_opt "ROCQ_DISABLE_DIRECT"))
+        && direct_reduct_convertible env t1 t2
+      in
+      let elapsed = Unix.gettimeofday () -. started in
+      if
+        Option.has_some (Sys.getenv_opt "ROCQ_DIRECT_TIMING")
+        && elapsed >= 0.05
+      then
+        Printf.eprintf "[direct-timing] result=%b elapsed=%.3f\n%!"
+          direct elapsed;
+      if direct then Result.Ok ()
+      else match clos_gen_conv ~typed reds cv_pb l2r evars env univs (state, checked_universes) t1 t2 with
+      | Result.Ok (_ : 'a * ('a, Empty.t) universe_compare)-> Result.Ok ()
+      | Result.Error None -> Result.Error ()
+      | Result.Error (Some e) -> Empty.abort e
 
 let conv = gen_conv ~typed:false CONV
 let conv_leq = gen_conv ~typed:false CUMUL

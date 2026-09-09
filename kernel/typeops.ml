@@ -223,7 +223,32 @@ let type_of_apply env func funt argsv argstv =
         let arg = argsv.(i) in
         let argt = argstv.(i) in
         let c1 = term_of_fconstr c1 in
-        begin match conv_leq env argt c1 with
+        if Option.has_some (Sys.getenv_opt "ROCQ_HEQ_TYPES") && i = 3 then begin
+          let name term =
+            let head, _ = decompose_app term in
+            match kind head with
+            | Const (constant, _) -> Constant.to_string constant
+            | Cast _ -> "<cast>"
+            | LetIn _ -> "<let>"
+            | _ -> "<other>"
+          in
+          Printf.eprintf "[heq-types] actual=%s expected=%s\n%!"
+            (name argt) (name c1)
+        end;
+        let trace = Option.has_some (Sys.getenv_opt "ROCQ_TYPEOPS_TRACE") in
+        let started = Unix.gettimeofday () in
+        let conversion = conv_leq env argt c1 in
+        let elapsed = Unix.gettimeofday () -. started in
+        if trace && elapsed >= 0.05 then begin
+          let name = match kind func with
+          | Const (c, _) -> Constant.to_string c
+          | _ -> "<term>"
+          in
+          Printf.eprintf
+            "[typeops-trace] %s argument=%d conversion=%.3f\n%!"
+            name i elapsed
+        end;
+        begin match conversion with
         | Result.Ok () -> apply_rec (i+1) (mk_clos (CClosure.usubs_cons (inject arg) e) c2)
         | Result.Error () ->
           error_cant_apply_bad_type env
@@ -851,18 +876,33 @@ let infer_hconstr env hconstr =
   make_judge constr t
 
 let infer env c =
+  let trace = Option.has_some (Sys.getenv_opt "ROCQ_INFER_TRACE") in
+  let started = Unix.gettimeofday () in
   let c = HConstr.of_constr env c in
-  infer_hconstr env c
+  let hashed = Unix.gettimeofday () in
+  let result = infer_hconstr env c in
+  let finished = Unix.gettimeofday () in
+  if trace && finished -. started >= 0.1 then
+    Printf.eprintf "[infer-trace] term hash=%.3f execute=%.3f\n%!"
+      (hashed -. started) (finished -. hashed);
+  result
 
 let assumption_of_judgment env {uj_val=c; uj_type=t} =
   infer_assumption env c t
 
 let infer_type env constr =
+  let trace = Option.has_some (Sys.getenv_opt "ROCQ_INFER_TRACE") in
+  let started = Unix.gettimeofday () in
   let () = check_wellformed_universes env constr in
   let hconstr = HConstr.of_constr env constr in
+  let hashed = Unix.gettimeofday () in
   let constr = HConstr.self hconstr in
   let t = execute env hconstr in
   let s = check_type env constr t in
+  let finished = Unix.gettimeofday () in
+  if trace && finished -. started >= 0.1 then
+    Printf.eprintf "[infer-trace] type hash=%.3f execute=%.3f\n%!"
+      (hashed -. started) (finished -. hashed);
   {utj_val = constr; utj_type = s}
 
 (* Typing of several terms. *)
