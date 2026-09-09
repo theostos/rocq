@@ -194,10 +194,75 @@ let convert_inductives_gen cmp_instances cmp_cumul cv_pb (mind,ind) nargs u1 u2 
     else
       cmp_cumul cv_pb variances u1 u2 s
 
+type projection_conversion = {
+  projection_left_lift : lift;
+  projection_left_term : fconstr;
+  projection_right_lift : lift;
+  projection_right_term : fconstr;
+  projection_relevances : Sorts.relevance Range.t;
+  projection_rel_types : fconstr option Range.t;
+}
+
+type successful_conversion = {
+  conversion_problem : conv_pb;
+  conversion_left_lift : lift;
+  conversion_right_lift : lift;
+  conversion_relevances : Sorts.relevance Range.t;
+  conversion_rel_types : fconstr option Range.t;
+}
+
+module ConversionPairs = Hashtbl.Make (struct
+  type t = fconstr * fconstr
+
+  let equal (left1, right1) (left2, right2) =
+    left1 == left2 && right1 == right2
+
+  let hash (left, right) =
+    Hashtbl.hash (fconstr_hash left, fconstr_hash right)
+end)
+
+type successful_conversion_cache = {
+  successful_conversion_table :
+    successful_conversion list ConversionPairs.t;
+  successful_conversion_limit : int;
+  mutable successful_conversion_size : int;
+}
+
+let successful_conversion_limit = 32_768
+
+let make_successful_conversion_cache limit =
+  {
+    successful_conversion_table =
+      ConversionPairs.create (if limit > 0 then min limit 251 else 0);
+    successful_conversion_limit = limit;
+    successful_conversion_size = 0;
+  }
+
+module ConstructorMasks = Hashtbl.Make (struct
+  type t = pconstructor
+
+  let equal (constructor1, instance1) (constructor2, instance2) =
+    Construct.UserOrd.equal constructor1 constructor2 &&
+    UVars.Instance.equal instance1 instance2
+
+  let hash (constructor, instance) =
+    Hashtbl.hash
+      (Construct.UserOrd.hash constructor, UVars.Instance.hash instance)
+end)
+
 type 'e conv_tab = {
   cnv_inf : clos_infos;
   cnv_typ : bool; (* true if the input terms were well-typed *)
   cnv_rel_types : fconstr option Range.t;
+  (* Remaining depth, shared within one speculative congruence check. *)
+  cnv_probe_budget : int ref option;
+  cnv_projection_conversions : projection_conversion list ref;
+  cnv_successful_conversions : successful_conversion_cache;
+  cnv_memoize_successful_conversions : bool;
+  cnv_projection_congruence : bool;
+  cnv_dependency_preference : bool;
+  cnv_constructor_relevance : bool;
+  cnv_constructor_masks : bool array ConstructorMasks.t;
   lft_tab : clos_tab;
   rgt_tab : clos_tab;
   err_ret : 'e -> payload;
@@ -209,6 +274,17 @@ let fail_check (infos : 'err conv_tab) (state, check) = match state with
 | Result.Ok state -> (state, check)
 | Result.Error None -> raise NotConvertible
 | Result.Error (Some err) -> raise (NotConvertibleTrace (infos.err_ret err))
+
+exception Probe_budget_exhausted
+
+(* Bound speculative congruence depth; only the owner catches exhaustion. *)
+let with_congruence_budget infos compare =
+  if Option.has_some infos.cnv_probe_budget ||
+     not (Environ.typing_flags (info_env infos.cnv_inf)).unfold_dep_heuristic
+  then compare infos
+  else
+    try compare { infos with cnv_probe_budget = Some (ref 256) }
+    with Probe_budget_exhausted -> raise NotConvertible
 
 let convert_inductives cv_pb ind nargs u1 u2 (s, check) =
   convert_inductives_gen (check.compare_instances ~flex:false) check.compare_cumul_instances
@@ -254,6 +330,72 @@ let same_args_size sk1 sk2 =
   let n = CClosure.stack_args_size sk1 in
   if Int.equal n (CClosure.stack_args_size sk2) then n
   else raise NotConvertible
+
+(* Expose cheap wrappers before eta; keep eta first for other record producers. *)
+let record_wrapper infos reference stack =
+  let env = info_env infos.cnv_inf in
+  let transparent constant =
+    RedFlags.red_set (info_flags infos.cnv_inf) (RedFlags.fCONST constant)
+  in
+  let rec wrapper_head fuel term =
+    match Constr.kind term with
+    | Lambda (_, _, body) -> wrapper_head fuel body
+    | App (head, _) -> wrapper_head fuel head
+    | Construct _ | Proj _ -> true
+    | Const (constant, _) when fuel > 0 && transparent constant ->
+      begin match (Environ.lookup_constant constant env).Declarations.const_body with
+      | Def body -> wrapper_head (fuel - 1) body
+      | Undef _ | OpaqueDef _ | Primitive _ | Symbol _ -> false
+      end
+    | _ -> false
+  in
+  let applications_only = List.for_all (function
+    | Zapp _ | Zupdate _ | Zshift _ -> true
+    | Zproj _ | Zfix _ | ZcaseT _ | Zprimitive _ -> false)
+  in
+  match reference with
+  | ConstKey (constant, _) when applications_only stack && transparent constant ->
+    begin match (Environ.lookup_constant constant env).Declarations.const_body with
+    | Def body -> wrapper_head 32 body
+    | Undef _ | OpaqueDef _ | Primitive _ | Symbol _ -> false
+    end
+  | ConstKey _ | RelKey _ | VarKey _ -> false
+
+(* Projected forwarding wrappers can discard costly arguments. *)
+let projected_record_wrapper infos reference stack =
+  let rec projection = function
+    | (Zapp _ | Zshift _ | Zupdate _) :: stack -> projection stack
+    | Zproj (projection, _) :: _ -> Some projection
+    | [] | (Zfix _ | ZcaseT _ | Zprimitive _) :: _ -> None
+  in
+  let rec forwarded term = match Constr.kind term with
+    | Rel _ -> true
+    | Proj (_, _, source) -> forwarded source
+    | _ -> false
+  in
+  let rec constructor_body term = match Constr.kind term with
+    | Lambda (_, _, body) -> constructor_body body
+    | _ -> Constr.decompose_app term
+  in
+  let env = info_env infos.cnv_inf in
+  if not infos.cnv_typ || not (Environ.typing_flags env).unfold_dep_heuristic
+  then false
+  else match reference, projection stack with
+  | ConstKey (constant, _), Some projection
+    when RedFlags.red_set (info_flags infos.cnv_inf) (RedFlags.fCONST constant) ->
+    begin match (Environ.lookup_constant constant env).Declarations.const_body with
+    | Def body ->
+      let head, arguments = constructor_body body in
+      begin match Constr.kind head with
+      | Construct ((ind, 1), _)
+        when Environ.QInd.equal env ind (Projection.Repr.inductive projection) ->
+        let field = Projection.Repr.npars projection + Projection.Repr.arg projection in
+        field < Array.length arguments && forwarded arguments.(field)
+      | _ -> false
+      end
+    | Undef _ | OpaqueDef _ | Primitive _ | Symbol _ -> false
+    end
+  | _ -> false
 
 (** The same heap separation invariant must hold for the fconstr arguments
     passed to each respective side of the conversion function below. *)
@@ -307,6 +449,35 @@ let record_unit_like_mask infos tab ((ind, _) as pind) args =
       | _ -> [||]
   in
   fields 0 constructor_type []
+
+let constructor_relevance_mask infos (((ind, _), instance) as constructor) =
+  match ConstructorMasks.find_opt infos.cnv_constructor_masks constructor with
+  | Some mask -> mask
+  | None ->
+    let env = info_env infos.cnv_inf in
+    let spec = Inductive.lookup_mind_specif env ind in
+    let constructor_type =
+      Inductive.type_of_constructor constructor spec
+    in
+    let binders, _ = Term.decompose_prod constructor_type in
+    let mask_arguments =
+      binders
+      |> List.rev
+      |> List.map (fun (binder, _) ->
+           let relevance =
+             UVars.subst_instance_relevance instance
+               binder.Context.binder_relevance
+           in
+           not (is_irrelevant infos.cnv_inf relevance))
+      |> Array.of_list
+    in
+    let mask_arguments =
+      if Array.exists (fun compare -> not compare) mask_arguments
+      then mask_arguments
+      else [||]
+    in
+    ConstructorMasks.add infos.cnv_constructor_masks constructor mask_arguments;
+    mask_arguments
 
 let rel_type infos n =
   let local_depth = Range.length infos.cnv_rel_types in
@@ -367,7 +538,13 @@ let eq_universes (_,e1) (_,e2) u1 u2 =
   let subst e u = if UVars.Instance.is_empty e then u else UVars.subst_instance_instance e u in
   UVars.Instance.equal (subst e1 u1) (subst e2 u2)
 
+let eq_usubs_fast (s1, u1) (s2, u2) =
+  (s1 == s2 || (Esubst.is_subs_id s1 && Esubst.is_subs_id s2)) &&
+  (u1 == u2 || UVars.Instance.equal u1 u2)
+
 let rec compare_under e1 c1 e2 c2 =
+  (c1 == c2 && eq_usubs_fast e1 e2)
+  ||
   match Constr.kind c1, Constr.kind c2 with
   | Cast (c1, _, _), _ -> compare_under e1 c1 e2 c2
   | _, Cast (c2, _, _) -> compare_under e1 c1 e2 c2
@@ -414,7 +591,6 @@ let rec compare_under e1 c1 e2 c2 =
   | Ind (c1,u1), Ind (c2,u2) -> Ind.UserOrd.equal c1 c2 && eq_universes e1 e2 u1 u2
   | Construct (c1,u1), Construct (c2,u2) ->
     Construct.UserOrd.equal c1 c2 && eq_universes e1 e2 u1 u2
-  | Case _, Case _ | Fix _, Fix _ | CoFix _, CoFix _ -> false (* todo some other time *)
   | Array(_,t1,def1,ty1), Array(_,t2,def2,ty2) ->
     Array.equal_norefl (fun c1 c2 -> compare_under e1 c1 e2 c2) t1 t2
     && compare_under e1 def1 e2 def2
@@ -423,19 +599,24 @@ let rec compare_under e1 c1 e2 c2 =
     | Proj _ | Evar _ | Const _ | Ind _ | Construct _ | Case _ | Fix _
     | CoFix _ | Int _ | Float _ | String _ | Array _), _ -> false
 
-let rec fast_test lft1 term1 lft2 term2 = match fterm_of term1, fterm_of term2 with
+and fast_test lft1 term1 lft2 term2 = match fterm_of term1, fterm_of term2 with
   | FLIFT (i, term1), (FLIFT _ | FCLOS _) -> fast_test (el_shft i lft1) term1 lft2 term2
   | FCLOS _, FLIFT (j, term2) -> fast_test lft1 term1 (el_shft j lft2) term2
   | FCLOS (c1, (e1,u1)), FCLOS (c2, (e2,u2)) ->
     eq_lift lft1 lft2 &&
     compare_under (e1, u1) c1 (e2, u2) c2
+  | FFix (fix1, e1), FFix (fix2, e2) ->
+    eq_lift lft1 lft2 &&
+    compare_under e1 (mkFix fix1) e2 (mkFix fix2)
+  | FCoFix (fix1, e1), FCoFix (fix2, e2) ->
+    eq_lift lft1 lft2 &&
+    compare_under e1 (mkCoFix fix1) e2 (mkCoFix fix2)
   | _ -> false
 
 let assert_reduced_constructor s =
   if not @@ CList.is_empty s then
     CErrors.anomaly Pp.(str "conversion was given unreduced term (FConstruct).")
 
-(* Conversion between  [lft1]term1 and [lft2]term2 *)
 let is_registered_unit_like env ind =
   List.exists (Ind.UserOrd.equal ind)
     (Environ.retroknowledge env).Retroknowledge.retro_unit_like
@@ -706,6 +887,73 @@ let same_unit_like_flex_rel infos flex_tab flex_lift flex_stack flex
   | Some flex_ind, Some rel_ind -> Ind.UserOrd.equal flex_ind rel_ind
   | _ -> false
 
+let matches_registered_compact_peano_operation infos matches =
+  let retroknowledge =
+    Environ.retroknowledge (CClosure.info_env infos)
+  in
+  let matches_optional = function
+    | Some operation -> matches operation
+    | None -> false
+  in
+  List.exists
+    (fun scheme ->
+      matches_optional scheme.Retroknowledge.peano_double ||
+      matches_optional scheme.peano_add || matches_optional scheme.peano_mul ||
+      matches_optional scheme.peano_pow || matches_optional scheme.peano_sub ||
+      List.exists matches scheme.peano_div_go ||
+      List.exists matches scheme.peano_mod_go ||
+      List.exists
+        (fun decoder ->
+          matches decoder.Retroknowledge.decoder_constant)
+        scheme.peano_decoders)
+    retroknowledge.Retroknowledge.retro_peano_nat ||
+  List.exists
+    (fun operation ->
+      matches operation.Retroknowledge.bool_op_constant)
+    retroknowledge.retro_peano_nat_beq ||
+  List.exists
+    (fun operation ->
+      matches operation.Retroknowledge.bool_op_constant)
+    retroknowledge.retro_peano_nat_ble
+
+let is_registered_compact_peano_operation infos constant =
+  matches_registered_compact_peano_operation infos
+    (Constant.UserOrd.equal constant)
+
+let depends_on_registered_compact_peano_operation infos constant =
+  let env = CClosure.info_env infos in
+  matches_registered_compact_peano_operation infos (fun operation ->
+    Constant.UserOrd.equal constant operation ||
+    Environ.constant_depends_on env constant operation)
+
+let is_compact_peano_wrapper env ind =
+  let retroknowledge = Environ.retroknowledge env in
+  let is_peano_type typ =
+    let head, _ = Constr.decompose_app typ in
+    match Constr.kind head with
+    | Ind (candidate, _) ->
+      List.exists
+        (fun scheme ->
+          Ind.UserOrd.equal candidate
+            scheme.Retroknowledge.peano_inductive)
+        retroknowledge.Retroknowledge.retro_peano_nat
+    | _ -> false
+  in
+  try
+    let mib, mip = Inductive.lookup_mind_specif env ind in
+    Int.equal (Array.length mib.Declarations.mind_packets) 1 &&
+    Int.equal mib.mind_nparams 0 &&
+    Int.equal (Array.length mip.mind_consnames) 2 &&
+    Array.for_all (Int.equal 1) mip.mind_consnrealargs &&
+    Array.for_all
+      (fun (context, _) ->
+        match context with
+        | [declaration] ->
+          is_peano_type (Context.Rel.Declaration.get_type declaration)
+        | _ -> false)
+      mip.mind_nf_lc
+  with Not_found -> false
+
 let flex_result_inductive infos tab lft stack fl =
   let env = info_env infos.cnv_inf in
   let typ = match fl with
@@ -731,19 +979,77 @@ let flex_has_inductive infos tab lft stack fl ind =
   | Some flex_ind -> Ind.UserOrd.equal ind flex_ind
   | None -> false
 
+let successful_conversion_cached infos cv_pb lft1 lft2 term1 term2 =
+  infos.cnv_memoize_successful_conversions &&
+  match ConversionPairs.find_opt
+          infos.cnv_successful_conversions.successful_conversion_table
+          (term1, term2) with
+  | None -> false
+  | Some conversions ->
+    let relevances = info_relevances infos.cnv_inf in
+    List.exists (fun conversion ->
+      conversion.conversion_problem = cv_pb &&
+      eq_lift conversion.conversion_left_lift lft1 &&
+      eq_lift conversion.conversion_right_lift lft2 &&
+      conversion.conversion_relevances == relevances &&
+      conversion.conversion_rel_types == infos.cnv_rel_types)
+      conversions
+
+let remember_successful_conversion infos cv_pb lft1 lft2 term1 term2 =
+  if infos.cnv_memoize_successful_conversions then begin
+    let cache = infos.cnv_successful_conversions in
+    if cache.successful_conversion_size >= cache.successful_conversion_limit
+    then begin
+      ConversionPairs.clear cache.successful_conversion_table;
+      cache.successful_conversion_size <- 0
+    end;
+    let key = term1, term2 in
+    let previous =
+      Option.default []
+        (ConversionPairs.find_opt cache.successful_conversion_table key)
+    in
+    ConversionPairs.replace cache.successful_conversion_table key
+      ({
+        conversion_problem = cv_pb;
+        conversion_left_lift = lft1;
+        conversion_right_lift = lft2;
+        conversion_relevances = info_relevances infos.cnv_inf;
+        conversion_rel_types = infos.cnv_rel_types;
+      } :: previous);
+    cache.successful_conversion_size <- cache.successful_conversion_size + 1
+  end
+
+(* Conversion between  [lft1]term1 and [lft2]term2 *)
 let rec ccnv cv_pb l2r infos lft1 lft2 term1 term2 cuniv =
   let fast = fast_test lft1 term1 lft2 term2 in
-  if fast then cuniv
-  else
-    eqappr cv_pb l2r infos (lft1, (term1,[])) (lft2, (term2,[])) cuniv
+  if fast || successful_conversion_cached infos cv_pb lft1 lft2 term1 term2
+  then cuniv
+  else begin
+    let result =
+      let compare () =
+        eqappr cv_pb l2r infos
+          (lft1, (term1,[])) (lft2, (term2,[])) cuniv
+      in
+      match infos.cnv_probe_budget with
+      | None -> compare ()
+      | Some remaining ->
+        if Int.equal !remaining 0 then raise Probe_budget_exhausted;
+        decr remaining;
+        Fun.protect compare ~finally:(fun () -> incr remaining)
+    in
+    remember_successful_conversion infos cv_pb lft1 lft2 term1 term2;
+    result
+  end
 
 (* Conversion between [lft1](hd1 v1) and [lft2](hd2 v2) *)
 and eqappr cv_pb l2r infos (lft1,st1) (lft2,st2) cuniv =
   Control.check_for_interrupt ();
   (* First head reduce both terms *)
   let ninfos = infos_with_reds infos.cnv_inf RedFlags.betaiotazeta in
-  let appr1 = whd_stack ninfos infos.lft_tab (fst st1) (snd st1) in
-  let appr2 = whd_stack ninfos infos.rgt_tab (fst st2) (snd st2) in
+  let appr1 = whd_stack ninfos infos.lft_tab
+    (fst st1) (snd st1) in
+  let appr2 = whd_stack ninfos infos.rgt_tab
+    (fst st2) (snd st2) in
   eqwhnf cv_pb l2r infos (lft1, appr1) (lft2, appr2) cuniv
 
 (* assumes that appr1 and appr2 are in whnf *)
@@ -812,23 +1118,45 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
     (* 2 constants, 2 local defined vars or 2 defined rels *)
     | (FFlex fl1, FFlex fl2) ->
       (try
+         if projected_record_wrapper infos fl1 v1 ||
+            projected_record_wrapper infos fl2 v2
+         then raise NotConvertible;
          let nargs = same_args_size v1 v2 in
          let cuniv = conv_table_key infos ~nargs fl1 fl2 cuniv in
-         let () = if irr_flex infos.cnv_inf fl1 then raise NotConvertible (* trigger the fallback *) in
+         let irrelevant1 = irr_flex infos.cnv_inf fl1 in
+         let () = if irrelevant1 then raise NotConvertible (* trigger the fallback *) in
          let mask = if infos.cnv_typ then match fl1 with
          | ConstKey _ -> get_ref_mask infos.cnv_inf infos.lft_tab fl1
          | RelKey _ | VarKey _ -> [||]
          else [||]
          in
-         convert_stacks ~mask l2r infos lft1 lft2 v1 v2 cuniv
+         let constructor_first =
+           infos.cnv_typ && infos.cnv_dependency_preference &&
+           (Environ.typing_flags (info_env infos.cnv_inf)).unfold_dep_heuristic &&
+           (match fl1 with ConstKey _ -> true | RelKey _ | VarKey _ -> false)
+         in
+         let compare infos =
+           convert_stacks ~mask ~constructor_first
+             l2r infos lft1 lft2 v1 v2 cuniv
+         in
+         let can_unfold = match fl1 with
+           | ConstKey (c, _) when
+               RedFlags.red_set (info_flags infos.cnv_inf) (RedFlags.fCONST c) ->
+             (match (Environ.lookup_constant c (info_env infos.cnv_inf)).const_body with
+              | Def _ -> true
+              | Undef _ | OpaqueDef _ | Primitive _ | Symbol _ -> false)
+           | ConstKey _ | RelKey _ | VarKey _ -> false
+         in
+         if can_unfold then with_congruence_budget infos compare
+         else compare infos
        with NotConvertible | NotConvertibleTrace _ ->
         if same_unit_like_flexes infos lft1 v1 fl1 lft2 v2 fl2 then cuniv
         else
-        let r1 = unfold_ref_with_args infos.cnv_inf infos.lft_tab fl1 v1 in
-        let r2 = unfold_ref_with_args infos.cnv_inf infos.rgt_tab fl2 v2 in
-        match r1, r2 with
-        | None, None -> raise NotConvertible
-        | Some (t1, v1), Some (t2, v2) ->
+          let r1 = unfold_ref_with_args infos.cnv_inf infos.lft_tab fl1 v1 in
+          let r2 = unfold_ref_with_args infos.cnv_inf infos.rgt_tab fl2 v2 in
+          match r1, r2 with
+          | None, None -> raise NotConvertible
+          | Some (t1, v1), Some (t2, v2) ->
           (* else the oracle tells which constant is to be expanded *)
           let oracle = CClosure.oracle_of_infos infos.cnv_inf in
           let to_er fl =
@@ -838,24 +1166,495 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
             | RelKey _ -> None
           in
           let ninfos = infos_with_reds infos.cnv_inf RedFlags.betaiotazeta in
+          let is_compact_peano_elimination tab term stack =
+            let symbolic_infos =
+              infos_with_reds infos.cnv_inf RedFlags.betazeta
+            in
+            let head, stack = whd_stack symbolic_infos tab term stack in
+            match fterm_of head, stack with
+            | FPeanoNat _, Zfix _ :: _ -> true
+            | _ -> false
+          in
+          let compact_elimination1 =
+            is_compact_peano_elimination infos.lft_tab t1 v1
+          in
+          let compact_elimination2 =
+            is_compact_peano_elimination infos.rgt_tab t2 v2
+          in
+          (* Try outermost application congruence before a compact elimination.
+             Fresh closures must preserve lifts and local binder depth. *)
+          let common_application_congruence () =
+            let env = CClosure.info_env infos.cnv_inf in
+            if not (Environ.typing_flags env).unfold_dep_heuristic ||
+               not (compact_elimination1 || compact_elimination2)
+            then None
+            else match v1, v2 with
+            | Zapp args1 :: rest1, Zapp args2 :: rest2
+              when Int.equal (Array.length args1) (Array.length args2) &&
+                   List.for_all (function Zupdate _ -> true | _ -> false) rest1 &&
+                   List.for_all (function Zupdate _ -> true | _ -> false) rest2 ->
+              let argument_count = Array.length args1 in
+              if Int.equal argument_count 0 then None
+              else
+                let prefix_length = argument_count - 1 in
+                let subst =
+                  subs_id (Range.length (info_relevances infos.cnv_inf)),
+                  UVars.Instance.empty
+                in
+                let fresh_term lift term =
+                  mk_clos subst (Vars.exliftn lift term)
+                in
+                let fresh_argument lift argument =
+                  fresh_term lift (CClosure.term_of_fconstr argument)
+                in
+                let fresh_prefix lift head args =
+                  let stack =
+                    if Int.equal prefix_length 0 then []
+                    else [Zapp (Array.sub args 0 prefix_length)]
+                  in
+                  fresh_term lift (CClosure.term_of_process head stack)
+                in
+                (try
+                   Some (with_congruence_budget infos (fun infos ->
+                   let cuniv =
+                     ccnv CONV l2r infos el_id el_id
+                       (fresh_argument lft1 args1.(prefix_length))
+                       (fresh_argument lft2 args2.(prefix_length)) cuniv
+                   in
+                   ccnv cv_pb l2r infos el_id el_id
+                     (fresh_prefix lft1 hd1 args1) (fresh_prefix lft2 hd2 args2) cuniv))
+                 with NotConvertible | NotConvertibleTrace _ -> None)
+            | _ -> None
+          in
+          begin match common_application_congruence () with
+          | Some cuniv -> cuniv
+          | None ->
           let () = Control.check_for_interrupt () in
+          let same_reference =
+            match fl1, fl2 with
+            | ConstKey (constant1, _), ConstKey (constant2, _) ->
+              Constant.UserOrd.equal constant1 constant2
+            | VarKey id1, VarKey id2 -> Id.equal id1 id2
+            | RelKey index1, RelKey index2 -> Int.equal index1 index2
+            | (ConstKey _ | VarKey _ | RelKey _), _ -> false
+          in
+          let has_constructor_argument tab stack =
+            let symbolic_infos =
+              infos_with_reds infos.cnv_inf RedFlags.betazeta
+            in
+            let constructor argument =
+              let head, _ = whd_stack symbolic_infos tab argument [] in
+              match fterm_of head with
+              | FConstruct _ | FPeanoNat _ -> true
+              | _ -> false
+            in
+            List.exists
+              (function
+                | Zapp arguments -> Array.exists constructor arguments
+                | Zupdate _ | Zshift _ | Zproj _ | Zfix _ | ZcaseT _
+                | Zprimitive _ -> false)
+              stack
+          in
+          let indirectly_depends_on ?(transitive = true) term stack target =
+            (* Probe dependencies without reifying or mutating shared closures.
+               Unknown forms and exhausted budgets retain the ordinary unfolding strategy. *)
+            let exception Found_dependency in
+            let exception Unknown_dependency in
+            let remaining = ref 1024 in
+            let update_targets = ref [] in
+            let visit () =
+              if Int.equal !remaining 0 then
+                raise Unknown_dependency;
+              decr remaining
+            in
+            let inspect_constant constant =
+              if Constant.UserOrd.equal constant target ||
+                 (transitive && Environ.constant_depends_on
+                   (CClosure.info_env infos.cnv_inf) constant target)
+              then raise Found_dependency
+            in
+            let enter_binder depth =
+              visit ();
+              depth + 1
+            in
+            let rec inspect_constr ~aliases_only substitution depth term =
+              visit ();
+              match Constr.kind term with
+              | Rel index when index > depth ->
+                (match substitution with
+                | None -> ()
+                | Some substitution ->
+                  (match inspect_substituted_rel substitution (index - depth) with
+                  | Some term -> inspect_closure ~aliases_only term
+                  | None ->
+                    raise Unknown_dependency))
+              | Const (constant, _) ->
+                if not aliases_only then inspect_constant constant
+              | _ ->
+                Constr.iter_with_binders enter_binder
+                  (inspect_constr ~aliases_only substitution) depth term
+            and inspect_closure ~aliases_only term =
+              visit ();
+              if aliases_only &&
+                 List.exists (fun target -> target == term) !update_targets
+              then raise Unknown_dependency;
+              match fterm_of term with
+              | FFlex (ConstKey (constant, _)) ->
+                if not aliases_only then inspect_constant constant
+              | FRel _ | FFlex (RelKey _ | VarKey _) | FInd _
+              | FInt _ | FFloat _ | FString _ -> ()
+              | FAtom term ->
+                if not aliases_only then inspect_constr ~aliases_only None 0 term
+              | FConstruct (_, arguments) ->
+                Array.iter (inspect_closure ~aliases_only) arguments
+              | FApp (head, arguments) ->
+                inspect_closure ~aliases_only head;
+                Array.iter (inspect_closure ~aliases_only) arguments
+              | FProj (_, _, term) | FLIFT (_, term) ->
+                inspect_closure ~aliases_only term
+              | FCLOS (term, substitution) when is_subs_id (fst substitution) ->
+                (* Raw terms contain no mutable closure cells. *)
+                if not aliases_only then inspect_constr ~aliases_only None 0 term
+              | FCLOS (term, substitution) ->
+                inspect_constr ~aliases_only (Some substitution) 0 term
+              | FLambda (len, domains, body, substitution) ->
+                let substitution =
+                  if is_subs_id (fst substitution) then None
+                  else Some substitution
+                in
+                if not aliases_only || Option.has_some substitution then begin
+                  (* Domains are outermost first; only free references use the substitution. *)
+                  let rec inspect_domains depth = function
+                    | [] ->
+                      if not (Int.equal depth len) then
+                        raise Unknown_dependency;
+                      inspect_constr ~aliases_only substitution len body
+                    | (_, domain) :: rest ->
+                      visit ();
+                      inspect_constr ~aliases_only substitution depth domain;
+                      inspect_domains (enter_binder depth) rest
+                  in
+                  inspect_domains 0 domains
+                end
+              | FFix _ | FCoFix _ | FCaseT _ | FCaseInvert _ | FProd _
+              | FLetIn _ | FEvar _ | FArray _ | FPeanoNat _ | FIrrelevant
+              | FLOCKED -> raise Unknown_dependency
+            in
+            let rec inspect_stack ~aliases_only = function
+              | [] -> ()
+              | frame :: rest ->
+                visit ();
+                (match frame with
+                | Zapp arguments ->
+                  Array.iter (inspect_closure ~aliases_only) arguments
+                | Zproj _ | Zshift _ | Zupdate _ -> ()
+                | Zfix _ | ZcaseT _ | Zprimitive _ -> raise Unknown_dependency);
+                inspect_stack ~aliases_only rest
+            in
+            let rec check_stack = function
+              | [] -> ()
+              | frame :: rest ->
+                visit ();
+                (match frame with
+                | Zapp _ | Zproj _ | Zshift _ -> check_stack rest
+                | Zupdate target ->
+                  if List.exists (fun previous -> previous == target)
+                      !update_targets
+                  then raise Unknown_dependency;
+                  update_targets := target :: !update_targets;
+                  check_stack rest
+                | Zfix _ | ZcaseT _ | Zprimitive _ -> raise Unknown_dependency)
+            in
+            try
+              (* Check update aliases before accepting an early dependency witness. *)
+              check_stack stack;
+              if not (CList.is_empty !update_targets) then begin
+                inspect_closure ~aliases_only:true term;
+                inspect_stack ~aliases_only:true stack
+              end;
+              inspect_closure ~aliases_only:false term;
+              inspect_stack ~aliases_only:false stack;
+              Some false
+            with
+            | Found_dependency -> Some true
+            | Unknown_dependency | Assert_failure _ -> None
+          in
+          (* Normalize eligible compact applications independently to avoid alternating delta steps. *)
+          let reduce_applications_to_whnf () =
+            let env = CClosure.info_env infos.cnv_inf in
+            let compact_backed_closed_process term stack =
+              (* Check closedness and a compact witness without expanding shared closures. *)
+              let exception Unknown_eligibility in
+              let remaining = ref 1024 in
+              let backed = ref false in
+              let update_targets = ref [] in
+              let visit () =
+                if Int.equal !remaining 0 then
+                  raise Unknown_eligibility;
+                decr remaining
+              in
+              let enter_binder depth =
+                visit ();
+                depth + 1
+              in
+              let inspect_constant constant =
+                if not !backed &&
+                   depends_on_registered_compact_peano_operation
+                     infos.cnv_inf constant
+                then backed := true
+              in
+              let rec inspect_constr substitution depth term =
+                visit ();
+                match Constr.kind term with
+                | Rel index ->
+                  if index > depth then begin
+                    (* Inspect referenced substitutions; an unresolved relative variable is not closed. *)
+                    match Option.bind substitution (fun substitution ->
+                        inspect_substituted_rel substitution (index - depth)) with
+                    | Some term -> inspect_closure term
+                    | None -> raise Unknown_eligibility
+                  end
+                | Const (constant, _) -> inspect_constant constant
+                | Evar _ -> raise Unknown_eligibility
+                | _ ->
+                  Constr.iter_with_binders enter_binder
+                    (inspect_constr substitution) depth term
+              and inspect_closure term =
+                visit ();
+                if List.exists (fun target -> target == term) !update_targets
+                then raise Unknown_eligibility;
+                match fterm_of term with
+                | FFlex (ConstKey (constant, _)) -> inspect_constant constant
+                | FFlex (VarKey _) | FInd _ | FInt _ | FFloat _ | FString _
+                | FPeanoNat _ -> ()
+                | FAtom term -> inspect_constr None 0 term
+                | FConstruct (_, arguments) -> Array.iter inspect_closure arguments
+                | FApp (head, arguments) ->
+                  inspect_closure head;
+                  Array.iter inspect_closure arguments
+                | FProj (_, _, term) | FLIFT (_, term) -> inspect_closure term
+                | FCLOS (term, substitution) ->
+                  inspect_constr (Some substitution) 0 term
+                | FLambda (len, domains, body, substitution) ->
+                  (* Domains are outermost first; the body is under all [len] binders. *)
+                  let rec inspect_domains depth = function
+                    | [] ->
+                      if not (Int.equal depth len) then
+                        raise Unknown_eligibility;
+                      inspect_constr (Some substitution) len body
+                    | (_, domain) :: rest ->
+                      visit ();
+                      inspect_constr (Some substitution) depth domain;
+                      inspect_domains (enter_binder depth) rest
+                  in
+                  inspect_domains 0 domains
+                | FRel _ | FFlex (RelKey _) | FFix _ | FCoFix _ | FCaseT _
+                | FCaseInvert _ | FProd _ | FLetIn _ | FEvar _ | FArray _
+                | FIrrelevant | FLOCKED -> raise Unknown_eligibility
+              in
+              let rec check_stack = function
+                | [] -> ()
+                | frame :: rest ->
+                  visit ();
+                  (match frame with
+                  | Zapp _ | Zproj _ | Zshift _ -> check_stack rest
+                  | Zupdate target ->
+                    if List.exists (fun previous -> previous == target)
+                        !update_targets
+                    then raise Unknown_eligibility;
+                    update_targets := target :: !update_targets;
+                    check_stack rest
+                  | Zfix _ | ZcaseT _ | Zprimitive _ -> raise Unknown_eligibility)
+              in
+              let rec inspect_stack = function
+                | [] -> ()
+                | frame :: rest ->
+                  visit ();
+                  (match frame with
+                  | Zapp arguments -> Array.iter inspect_closure arguments
+                  | Zproj _ | Zshift _ | Zupdate _ -> ()
+                  | Zfix _ | ZcaseT _ | Zprimitive _ -> raise Unknown_eligibility);
+                  inspect_stack rest
+              in
+              let eligible =
+                try
+                  (* Update targets must not alias inspected subtrees. *)
+                  check_stack stack;
+                  inspect_closure term;
+                  inspect_stack stack;
+                  !backed
+                with
+                | Unknown_eligibility | Assert_failure _ -> false
+              in
+              eligible
+            in
+            let closed_applications () =
+              (* Check bounded eligibility before inspecting result types. *)
+              if not (compact_backed_closed_process t1 v1 &&
+                      compact_backed_closed_process t2 v2)
+              then false
+              else
+              let compact_wrapper_result =
+                match
+                  flex_result_inductive infos infos.lft_tab lft1 v1 fl1,
+                  flex_result_inductive infos infos.rgt_tab lft2 v2 fl2
+                with
+                | Some inductive1, Some inductive2
+                  when Ind.UserOrd.equal inductive1 inductive2 ->
+                  is_compact_peano_wrapper env inductive1
+                | _ -> false
+              in
+              compact_wrapper_result
+            in
+            if not (Environ.typing_flags env).unfold_dep_heuristic then
+              None
+            else if same_reference then
+              (* Leave equal heads to ordinary unfolding after congruence fails. *)
+              None
+            else if
+              match fl1, fl2 with
+              | ConstKey (constant1, _), ConstKey (constant2, _) ->
+                not (is_registered_compact_peano_operation
+                     infos.cnv_inf constant1 &&
+                   is_registered_compact_peano_operation
+                     infos.cnv_inf constant2) &&
+                not (closed_applications ())
+              | (ConstKey _ | VarKey _ | RelKey _), _ -> true
+            then
+              (* Only registered compact computations justify complete evaluation here. *)
+              None
+            else if
+              compact_elimination1 || compact_elimination2
+            then None
+            else if
+              match fl1, fl2 with
+              | ConstKey (cst1, _), ConstKey (cst2, _) ->
+                Environ.constant_depends_on env cst1 cst2
+                || Environ.constant_depends_on env cst2 cst1
+              | _ -> false
+            then
+              (* A common dependency can be exposed without evaluating either application. *)
+              None
+            else
+              let all =
+                RedFlags.(red_add_transparent all
+                  (red_transparent (info_flags infos.cnv_inf)))
+              in
+              let full_infos = infos_with_reds infos.cnv_inf all in
+              let appr1 = whd_stack full_infos infos.lft_tab t1 v1 in
+              let appr2 = whd_stack full_infos infos.rgt_tab t2 v2 in
+              Some (eqwhnf cv_pb l2r infos
+                (lft1, appr1) (lft2, appr2) cuniv)
+          in
+          begin match reduce_applications_to_whnf () with
+          | Some cuniv -> cuniv
+          | None ->
           (* Determine which constant to unfold first *)
           let unfold_left =
+            let wrapper1 = projected_record_wrapper infos fl1 v1 in
+            let wrapper2 = projected_record_wrapper infos fl2 v2 in
+            if wrapper1 <> wrapper2 then wrapper1 else
             let order = Conv_oracle.oracle_compare oracle (to_er fl1) (to_er fl2) in
-            match order with
-            | Conv_oracle.Left -> true
-            | Conv_oracle.Right -> false
-            | Conv_oracle.Same ->
-              (* When oracle doesn't prefer either, optionally use dependency heuristic *)
-              let env = CClosure.info_env infos.cnv_inf in
-              if (Environ.typing_flags env).unfold_dep_heuristic then
-                match fl1, fl2 with
-                | ConstKey (cst1, _), ConstKey (cst2, _) ->
-                  if Environ.constant_depends_on env cst1 cst2 then true
-                  else if Environ.constant_depends_on env cst2 cst1 then false
-                  else l2r
-                | _ -> l2r
-              else l2r
+            let oracle_choice () =
+              match order with
+              | Conv_oracle.Left -> true
+              | Conv_oracle.Right -> false
+              | Conv_oracle.Same -> l2r
+            in
+            let constructor_argument_preference () =
+              if infos.cnv_constructor_relevance && not same_reference
+              then None
+              else
+                let constructor1 =
+                  has_constructor_argument infos.lft_tab v1
+                in
+                let constructor2 =
+                  has_constructor_argument infos.rgt_tab v2
+                in
+                if constructor1 <> constructor2 then Some constructor1
+                else if not constructor1 || not same_reference then None
+                else
+                let rec application_prefix arrays = function
+                  | Zapp arguments :: stack ->
+                    application_prefix (arguments :: arrays) stack
+                  | (Zshift _ | Zupdate _) :: stack ->
+                    application_prefix arrays stack
+                  | _ -> Array.concat (List.rev arrays)
+                in
+                let arguments1 = application_prefix [] v1 in
+                let arguments2 = application_prefix [] v2 in
+                if not (Array.is_empty arguments1) &&
+                   Int.equal (Array.length arguments1)
+                     (Array.length arguments2)
+                then
+                  let symbolic_infos =
+                    infos_with_reds infos.cnv_inf RedFlags.betazeta
+                  in
+                  let is_constructor tab argument =
+                    let head, _ =
+                      whd_stack symbolic_infos tab argument empty_stack
+                    in
+                    match fterm_of head with
+                    | FConstruct _ | FPeanoNat _ -> true
+                    | _ -> false
+                  in
+                  let rec rightmost_difference index =
+                    if index < 0 then None
+                    else
+                      let left =
+                        is_constructor infos.lft_tab arguments1.(index)
+                      in
+                      let right =
+                        is_constructor infos.rgt_tab arguments2.(index)
+                      in
+                      if left <> right then Some left
+                      else rightmost_difference (index - 1)
+                  in
+                  rightmost_difference (Array.length arguments1 - 1)
+                else None
+            in
+            let global_constants =
+              match fl1, fl2 with
+              | ConstKey _, ConstKey _ -> true
+              | _ -> false
+            in
+            let constructor_preference =
+              if global_constants then constructor_argument_preference ()
+              else None
+            in
+            let dependency_preference =
+              if not infos.cnv_dependency_preference then None
+              else match fl1, fl2 with
+              | ConstKey (constant1, _), ConstKey (constant2, _) ->
+                let left = indirectly_depends_on t1 v1 constant2 in
+                let right = indirectly_depends_on t2 v2 constant1 in
+                (match left, right with
+                | Some left, Some right when not (Bool.equal left right) -> Some left
+                (* An unknown reverse probe requires a direct, not merely transitive, witness. *)
+                | Some true, None when
+                    indirectly_depends_on ~transitive:false t1 v1 constant2 = Some true ->
+                  Some true
+                | None, Some true when
+                    indirectly_depends_on ~transitive:false t2 v2 constant1 = Some true ->
+                  Some false
+                | _ -> None)
+              | (ConstKey _ | VarKey _ | RelKey _), _ -> None
+            in
+            if (Environ.typing_flags
+                  (CClosure.info_env infos.cnv_inf)).unfold_dep_heuristic &&
+               global_constants
+            then
+              match dependency_preference, constructor_preference with
+              | Some unfold_left, _ -> unfold_left
+              | None, Some unfold_left ->
+                unfold_left
+              | None, None ->
+                if compact_elimination1 && not compact_elimination2 then false
+                else if compact_elimination2 && not compact_elimination1 then true
+                else oracle_choice ()
+            else if compact_elimination1 && not compact_elimination2 then false
+            else if compact_elimination2 && not compact_elimination1 then true
+            else oracle_choice ()
           in
           if unfold_left then
             let appr1 = whd_stack ninfos infos.lft_tab t1 v1 in
@@ -863,11 +1662,13 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
           else
             let appr2 = whd_stack ninfos infos.rgt_tab t2 v2 in
             eqwhnf cv_pb l2r infos appr1 (lft2, appr2) cuniv
-        | Some (t1, v1), None ->
+          end
+          end
+          | Some (t1, v1), None ->
           let all = RedFlags.(red_add_transparent all (red_transparent (info_flags infos.cnv_inf))) in
           let t1 = whd_stack (infos_with_reds infos.cnv_inf all) infos.lft_tab t1 v1 in
           eqwhnf cv_pb l2r infos (lft1, t1) appr2 cuniv
-        | None, Some (t2, v2) ->
+          | None, Some (t2, v2) ->
           let all = RedFlags.(red_add_transparent all (red_transparent (info_flags infos.cnv_inf))) in
           let t2 = whd_stack (infos_with_reds infos.cnv_inf all) infos.rgt_tab t2 v2 in
           eqwhnf cv_pb l2r infos appr1 (lft2, t2) cuniv
@@ -922,10 +1723,69 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
       end
 
     | (FProj (p1,r1,c1), FProj (p2, r2, c2)) ->
-      (* Projections: prefer unfolding to first-order unification,
-         which will happen naturally if the terms c1, c2 are not in constructor
-         form *)
-      (match unfold_projection infos.cnv_inf p1 r1 with
+      let same_projections =
+        Projection.Repr.CanOrd.equal
+          (Projection.repr p1) (Projection.repr p2) &&
+        compare_stack_shape v1 v2
+      in
+      let congruence_first () =
+        let env = CClosure.info_env infos.cnv_inf in
+        let unit_like_projection =
+          is_registered_unit_like env
+            (Projection.Repr.inductive (Projection.repr p1))
+        in
+        let projection_of_constructor =
+          match fterm_of c1, fterm_of c2 with
+          | FConstruct _, _ | _, FConstruct _ -> true
+          | _ -> false
+        in
+        if not infos.cnv_typ ||
+           not (Environ.typing_flags env).unfold_dep_heuristic ||
+           not (unit_like_projection ||
+                (infos.cnv_projection_congruence &&
+                 not projection_of_constructor)) ||
+           not same_projections
+        then None
+        else
+          try
+            let el1 = el_stack lft1 v1 in
+            let el2 = el_stack lft2 v2 in
+            let relevances = info_relevances infos.cnv_inf in
+            (* Cache successful source comparisons in this typed conversion only.
+               Include lifts and local contexts; the universe graph is fixed. *)
+            let cached =
+              List.exists (fun conversion ->
+                conversion.projection_left_term == c1 &&
+                conversion.projection_right_term == c2 &&
+                eq_lift conversion.projection_left_lift el1 &&
+                eq_lift conversion.projection_right_lift el2 &&
+                conversion.projection_relevances == relevances &&
+                conversion.projection_rel_types == infos.cnv_rel_types)
+                !(infos.cnv_projection_conversions)
+            in
+            let cuniv =
+              if cached then cuniv
+              else ccnv CONV l2r infos el1 el2 c1 c2 cuniv
+            in
+            let () =
+              if not cached then
+                infos.cnv_projection_conversions := {
+                  projection_left_lift = el1;
+                  projection_left_term = c1;
+                  projection_right_lift = el2;
+                  projection_right_term = c2;
+                  projection_relevances = relevances;
+                  projection_rel_types = infos.cnv_rel_types;
+                } :: !(infos.cnv_projection_conversions)
+            in
+            Some (convert_stacks l2r infos lft1 lft2 v1 v2 cuniv)
+          with NotConvertible | NotConvertibleTrace _ -> None
+      in
+      begin match congruence_first () with
+      | Some cuniv -> cuniv
+      | None ->
+      (* Projections normally unfold before first-order unification. *)
+      match unfold_projection infos.cnv_inf p1 r1 with
       | Some s1 ->
         eqappr cv_pb l2r infos (lft1, (c1, (s1 :: v1))) appr2 cuniv
       | None ->
@@ -933,14 +1793,34 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
         | Some s2 ->
           eqappr cv_pb l2r infos appr1 (lft2, (c2, (s2 :: v2))) cuniv
         | None ->
-          if Projection.Repr.CanOrd.equal (Projection.repr p1) (Projection.repr p2)
-             && compare_stack_shape v1 v2 then
+          if same_projections then
             let el1 = el_stack lft1 v1 in
             let el2 = el_stack lft2 v2 in
             let u1 = ccnv CONV l2r infos el1 el2 c1 c2 cuniv in
               convert_stacks l2r infos lft1 lft2 v1 v2 u1
           else (* Two projections in WHNF: unfold *)
-            raise NotConvertible)
+            raise NotConvertible
+      end
+
+    | (FProj _, FFlex (ConstKey (c2, _) as fl2))
+      when (match Conv_oracle.get_strategy
+        (CClosure.oracle_of_infos infos.cnv_inf) (Conv_oracle.EvalConstRef c2) with
+        | Conv_oracle.Expand -> true
+        | Conv_oracle.Level _ | Conv_oracle.Opaque -> false) ->
+      begin match unfold_ref_with_args infos.cnv_inf infos.rgt_tab fl2 v2 with
+      | Some t2 -> eqappr cv_pb l2r infos appr1 (lft2, t2) cuniv
+      | None -> raise NotConvertible
+      end
+
+    | (FFlex (ConstKey (c1, _) as fl1), FProj _)
+      when (match Conv_oracle.get_strategy
+        (CClosure.oracle_of_infos infos.cnv_inf) (Conv_oracle.EvalConstRef c1) with
+        | Conv_oracle.Expand -> true
+        | Conv_oracle.Level _ | Conv_oracle.Opaque -> false) ->
+      begin match unfold_ref_with_args infos.cnv_inf infos.lft_tab fl1 v1 with
+      | Some t1 -> eqappr cv_pb l2r infos (lft1, t1) appr2 cuniv
+      | None -> raise NotConvertible
+      end
 
     | (FProj (p1,r1,c1), t2) ->
       begin match unfold_projection infos.cnv_inf p1 r1 with
@@ -985,7 +1865,8 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
         let el1 = el_stack lft1 v1 in
         let el2 = el_stack lft2 v2 in
         let cuniv = ccnv CONV l2r infos el1 el2 ty1 ty2 cuniv in
-        ccnv CONV l2r (push_relevance ~typ:(Some ty1) infos x1) (el_lift el1) (el_lift el2) bd1 bd2 cuniv
+        ccnv CONV l2r (push_relevance ~typ:(Some ty1) infos x1)
+          (el_lift el1) (el_lift el2) bd1 bd2 cuniv
 
     | (FProd (x1, c1, c2, e), FProd (_, c'1, c'2, e')) ->
         if not (is_empty_stack v1 && is_empty_stack v2) then
@@ -996,7 +1877,9 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
         let el2 = el_stack lft2 v2 in
         let cuniv = ccnv CONV l2r infos el1 el2 c1 c'1 cuniv in
         let x1 = usubst_binder e x1 in
-        ccnv cv_pb l2r (push_relevance ~typ:(Some c1) infos x1) (el_lift el1) (el_lift el2) (mk_clos (usubs_lift e) c2) (mk_clos (usubs_lift e') c'2) cuniv
+        ccnv cv_pb l2r (push_relevance ~typ:(Some c1) infos x1)
+          (el_lift el1) (el_lift el2)
+          (mk_clos (usubs_lift e) c2) (mk_clos (usubs_lift e') c'2) cuniv
 
     (* Eta-expansion on the fly *)
     | (FLambda _, _) ->
@@ -1032,7 +1915,8 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
       else
       let eta_before_unfolding () =
         match c2 with
-        | FConstruct (((ind2, 1), u2), args2) ->
+        | FConstruct (((ind2, 1), u2), args2)
+          when not (record_wrapper infos fl1 v1) ->
           let () = assert_reduced_constructor v2 in
           if not (flex_has_inductive infos infos.lft_tab lft1 v1 fl1 ind2)
           then None
@@ -1065,7 +1949,19 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
             let all = RedFlags.(red_add_transparent all (red_transparent (info_flags infos.cnv_inf))) in
             let r1 = whd_stack (infos_with_reds infos.cnv_inf all) infos.lft_tab def1 v1 in
             eqwhnf cv_pb l2r infos (lft1, r1) appr2 cuniv
-        | None -> raise NotConvertible
+        | None ->
+          (* Stuck eliminations can still use ordinary record eta. *)
+          (match c2 with
+           | FConstruct (((ind2, 1), u2), args2) ->
+             let () = assert_reduced_constructor v2 in
+             (try
+                let v2, v1 =
+                  eta_expand_ind_stack (info_env infos.cnv_inf)
+                    (ind2, u2) args2 (snd appr1)
+                in
+                convert_stacks l2r infos lft1 lft2 v1 v2 cuniv
+              with Not_found -> raise NotConvertible)
+           | _ -> raise NotConvertible)
       end
 
     | (c1, FFlex fl2)      ->
@@ -1079,7 +1975,8 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
       else
        let eta_before_unfolding () =
          match c1 with
-         | FConstruct (((ind1, 1), u1), args1) ->
+         | FConstruct (((ind1, 1), u1), args1)
+           when not (record_wrapper infos fl2 v2) ->
            let () = assert_reduced_constructor v1 in
            if not (flex_has_inductive infos infos.rgt_tab lft2 v2 fl2 ind1)
            then None
@@ -1109,7 +2006,18 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
           let all = RedFlags.(red_add_transparent all (red_transparent (info_flags infos.cnv_inf))) in
           let r2 = whd_stack (infos_with_reds infos.cnv_inf all) infos.rgt_tab def2 v2 in
           eqwhnf cv_pb l2r infos appr1 (lft2, r2) cuniv
-        | None -> raise NotConvertible
+        | None ->
+          match c1 with
+          | FConstruct (((ind1, 1), u1), args1) ->
+            let () = assert_reduced_constructor v1 in
+            (try
+               let v1, v2 =
+                 eta_expand_ind_stack (info_env infos.cnv_inf)
+                   (ind1, u1) args1 (snd appr2)
+               in
+               convert_stacks l2r infos lft1 lft2 v1 v2 cuniv
+             with Not_found -> raise NotConvertible)
+          | _ -> raise NotConvertible
        end
 
     (* Inductive types:  MutInd MutConstruct Fix Cofix *)
@@ -1152,13 +2060,18 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
       let v1 = append_stack args1 v1 in
       let v2 = append_stack args2 v2 in
       if Int.equal j1 j2 && Ind.CanOrd.equal ind1 ind2 then
+        let mask =
+          if infos.cnv_typ && infos.cnv_constructor_relevance
+          then constructor_relevance_mask infos pctor1
+          else [||]
+        in
         if UVars.Instance.is_empty u1 || UVars.Instance.is_empty u2 then
           let cuniv = fail_check infos @@ convert_instances ~flex:false u1 u2 cuniv in
-          convert_stacks l2r infos lft1 lft2 v1 v2 cuniv
+          convert_stacks ~mask l2r infos lft1 lft2 v1 v2 cuniv
         else
           let mind = Environ.lookup_mind (fst ind1) (info_env infos.cnv_inf) in
           match fail_check infos @@ convert_constructors (mind, snd ind1, j1) nargs u1 u2 cuniv with
-          | cuniv -> convert_stacks l2r infos lft1 lft2 v1 v2 cuniv
+          | cuniv -> convert_stacks ~mask l2r infos lft1 lft2 v1 v2 cuniv
           | exception MustExpand ->
             let env = info_env infos.cnv_inf in
             let hd1 = eta_expand_constructor env pctor1 in
@@ -1315,9 +2228,25 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
        | FProd _ | FEvar _ | FInt _ | FFloat _ | FString _
        | FArray _ | FIrrelevant), _ -> raise NotConvertible
 
-and convert_stacks ?(mask = [||]) l2r infos lft1 lft2 stk1 stk2 cuniv =
+and convert_stacks ?(mask = [||]) ?(constructor_first = false)
+    l2r infos lft1 lft2 stk1 stk2 cuniv =
   let f (l1, t1) (l2, t2) cuniv = ccnv CONV l2r infos l1 l2 t1 t2 cuniv in
-  let rec cmp_rec nargs pstk1 pstk2 cuniv =
+  let relevant nargs i =
+    nargs < 0 || nargs + i >= Array.length mask || mask.(nargs + i)
+  in
+  let fold_arguments selected nargs a1 a2 cuniv =
+    let rec loop i cu =
+      if i < 0 then cu
+      else
+        let cu =
+          if relevant nargs i && selected i then f a1.(i) a2.(i) cu
+          else cu
+        in
+        loop (i - 1) cu
+    in
+    loop (Array.length a1 - 1) cuniv
+  in
+  let rec cmp_rec compared nargs pstk1 pstk2 cuniv =
     match (pstk1,pstk2) with
       | (z1::s1, z2::s2) ->
           (* Stacks are known to have the same argument size *)
@@ -1325,28 +2254,19 @@ and convert_stacks ?(mask = [||]) l2r infos lft1 lft2 stk1 stk2 cuniv =
           | Zlapp a -> if nargs < 0 then -1 else nargs + Array.length a
           | Zlproj _ | Zlfix _ | Zlcase _ | Zlprimitive _ -> -1
           in
-          let cu1 = cmp_rec rnargs s1 s2 cuniv in
+          let cu1 = cmp_rec [||] rnargs s1 s2 cuniv in
           (match (z1,z2) with
             | (Zlapp a1,Zlapp a2) ->
-              if nargs < 0 then
-               Array.fold_right2 f a1 a2 cu1
-              else
-                let rec fold i cu =
-                  if i < 0 then cu
-                  else if nargs + i < Array.length mask && not mask.(nargs + i) then
-                    fold (i - 1) cu (* skip runtime irrelevant argument *)
-                  else
-                    let cu = f a1.(i) a2.(i) cu in
-                    fold (i - 1) cu
-                in
-                fold (Array.length a1 - 1) cu1
+              fold_arguments
+                (fun i -> Array.is_empty compared || not compared.(i))
+                nargs a1 a2 cu1
             | (Zlproj (c1,_l1),Zlproj (c2,_l2)) ->
               if not (Projection.Repr.CanOrd.equal c1 c2) then
                 raise NotConvertible
               else cu1
             | (Zlfix(fx1,a1),Zlfix(fx2,a2)) ->
                 let cu2 = f fx1 fx2 cu1 in
-                cmp_rec (-1) a1 a2 cu2
+                cmp_rec [||] (-1) a1 a2 cu2
             | (Zlcase(ci1,l1,u1,pms1,p1,br1,e1),Zlcase(ci2,l2,u2,pms2,p2,br2,e2)) ->
                 if not (Ind.CanOrd.equal ci1.ci_ind ci2.ci_ind) then
                   raise NotConvertible;
@@ -1378,9 +2298,27 @@ and convert_stacks ?(mask = [||]) l2r infos lft1 lft2 stk1 stk2 cuniv =
                 List.fold_right2 fk kargs1 kargs2 cu2
             | ((Zlapp _ | Zlproj _ | Zlfix _| Zlcase _| Zlprimitive _), _) -> assert false)
       | _ -> cuniv in
-  if compare_stack_shape stk1 stk2 then
+  let same_shape = compare_stack_shape stk1 stk2 in
+  if same_shape then
     let nargs = if Array.is_empty mask then -1 else 0 in
-    cmp_rec nargs (pure_stack lft1 stk1) (pure_stack lft2 stk2) cuniv
+    let stack1 = pure_stack lft1 stk1 in
+    let stack2 = pure_stack lft2 stk2 in
+    let compared, cuniv = match stack1, stack2 with
+    | Zlapp a1 :: _, Zlapp a2 :: _ when constructor_first ->
+      (* Try mismatched constructors among direct arguments before later eliminations. *)
+      let symbolic_infos = infos_with_reds infos.cnv_inf RedFlags.betazeta in
+      let constructor tab (_, term) =
+        let head, _ = whd_stack symbolic_infos tab term empty_stack in
+        match fterm_of head with FConstruct _ | FPeanoNat _ -> true | _ -> false
+      in
+      let priority = Array.init (Array.length a1) (fun i ->
+        relevant nargs i &&
+        constructor infos.lft_tab a1.(i) <> constructor infos.rgt_tab a2.(i))
+      in
+      priority, fold_arguments (fun i -> priority.(i)) nargs a1 a2 cuniv
+    | _ -> [||], cuniv
+    in
+    cmp_rec compared nargs stack1 stack2 cuniv
   else raise NotConvertible
 
 and convert_vect l2r infos lft1 lft2 v1 v2 cuniv =
@@ -1453,7 +2391,9 @@ and convert_list l2r infos lft1 lft2 v1 v2 cuniv = match v1, v2 with
   convert_list l2r infos lft1 lft2 v1 v2 cuniv
 | _, _ -> raise NotConvertible
 
-let clos_gen_conv (type err) ~typed trans cv_pb l2r evars env graph univs t1 t2 =
+let clos_gen_conv (type err) ~typed ~constructor_relevance
+    ~projection_congruence ~dependency_preference trans cv_pb l2r evars env
+    graph univs t1 t2 =
   NewProfile.profile "Conversion" begin fun () ->
       let reds = RedFlags.red_add_transparent RedFlags.betaiotazeta trans in
       let infos = create_conv_infos ~univs:graph ~evars reds env in
@@ -1461,12 +2401,28 @@ let clos_gen_conv (type err) ~typed trans cv_pb l2r evars env graph univs t1 t2 
       let box e = Error.Error e in
       let infos = {
         cnv_inf = infos;
-        cnv_typ = typed; cnv_rel_types = Range.empty;
+        cnv_typ = typed;
+        cnv_rel_types = Range.empty;
+        cnv_probe_budget = None;
+        cnv_projection_conversions = ref [];
+        cnv_successful_conversions =
+          make_successful_conversion_cache successful_conversion_limit;
+        cnv_memoize_successful_conversions =
+          typed &&
+          (Environ.typing_flags env).unfold_dep_heuristic;
+        cnv_projection_congruence = projection_congruence;
+        cnv_dependency_preference = dependency_preference;
+        cnv_constructor_relevance = constructor_relevance;
+        cnv_constructor_masks = ConstructorMasks.create 17;
         lft_tab = create_tab ();
         rgt_tab = create_tab ();
         err_ret = box;
       } in
-      try Result.Ok (ccnv cv_pb l2r infos el_id el_id (inject t1) (inject t2) univs)
+      try
+        let result =
+          ccnv cv_pb l2r infos el_id el_id (inject t1) (inject t2) univs
+        in
+        Result.Ok result
       with
       | NotConvertible -> Result.Error None
       | NotConvertibleTrace (Error.Error e) -> Result.Error (Some e)
@@ -1513,7 +2469,22 @@ let () =
       let box = Empty.abort in
       let state = info_univs infos in
       let qual_equal q1 q2 = CClosure.eq_quality infos q1 q2 in
-      let infos = { cnv_inf = infos; cnv_typ = true; cnv_rel_types = Range.empty; lft_tab = tab; rgt_tab = tab; err_ret = box; } in
+      let infos = {
+        cnv_inf = infos;
+        cnv_typ = true;
+        cnv_rel_types = Range.empty;
+        cnv_probe_budget = None;
+        cnv_projection_conversions = ref [];
+        cnv_successful_conversions = make_successful_conversion_cache 0;
+        cnv_memoize_successful_conversions = false;
+        cnv_projection_congruence = false;
+        cnv_dependency_preference = false;
+        cnv_constructor_relevance = false;
+        cnv_constructor_masks = ConstructorMasks.create 17;
+        lft_tab = tab;
+        rgt_tab = tab;
+        err_ret = box;
+      } in
       let state', _ = ccnv CONV false infos el_id el_id a b (state, checked_universes_gen qual_equal) in
       assert (state==state');
       true
@@ -1531,17 +2502,51 @@ let gen_conv ~typed cv_pb ?(l2r=false) ?(reds=TransparentState.full) env ?(evars
     else eq_constr_univs univs t1 t2
   in
     if b then Result.Ok ()
-    else match clos_gen_conv ~typed reds cv_pb l2r evars env univs (state, checked_universes) t1 t2 with
-    | Result.Ok (_ : 'a * ('a, Empty.t) universe_compare)-> Result.Ok ()
-    | Result.Error None -> Result.Error ()
-    | Result.Error (Some e) -> Empty.abort e
+    else
+      let convert constructor_relevance projection_congruence
+          dependency_preference =
+        clos_gen_conv ~typed ~constructor_relevance ~projection_congruence
+          ~dependency_preference reds cv_pb l2r evars env univs
+          (state, checked_universes) t1 t2
+      in
+      let conversion () =
+        match convert false false false with
+        | Result.Ok (_ : 'a * ('a, Empty.t) universe_compare) -> Result.Ok ()
+        | Result.Error None when typed -> begin
+          match convert true false false with
+          | Result.Ok (_ : 'a * ('a, Empty.t) universe_compare) -> Result.Ok ()
+          | Result.Error None -> begin
+            match convert true true false with
+            | Result.Ok (_ : 'a * ('a, Empty.t) universe_compare) -> Result.Ok ()
+            | Result.Error None -> begin
+              match convert true true true with
+              | Result.Ok (_ : 'a * ('a, Empty.t) universe_compare) -> Result.Ok ()
+              | Result.Error None -> Result.Error ()
+              | Result.Error (Some e) -> Empty.abort e
+              end
+            | Result.Error (Some e) -> Empty.abort e
+            end
+          | Result.Error (Some e) -> Empty.abort e
+          end
+        | Result.Error None -> Result.Error ()
+        | Result.Error (Some e) -> Empty.abort e
+      in
+      if typed && (Environ.typing_flags env).unfold_dep_heuristic then
+        (* Prefer dependencies first, retaining the other strategies as fallbacks. *)
+        match convert false false true with
+        | Result.Ok (_ : 'a * ('a, Empty.t) universe_compare) -> Result.Ok ()
+        | Result.Error None -> conversion ()
+        | Result.Error (Some e) -> Empty.abort e
+      else conversion ()
 
 let conv = gen_conv ~typed:false CONV
 let conv_leq = gen_conv ~typed:false CUMUL
 
 let generic_conv cv_pb ~l2r reds env ?(evars=default_evar_handler env) state t1 t2 =
   let graph = Environ.universes env in
-  match clos_gen_conv ~typed:false reds cv_pb l2r evars env graph state t1 t2 with
+  match clos_gen_conv ~typed:false ~constructor_relevance:false
+    ~projection_congruence:false ~dependency_preference:false
+    reds cv_pb l2r evars env graph state t1 t2 with
   | Result.Ok (s, _) -> Result.Ok s
   | Result.Error e -> Result.Error e
 
