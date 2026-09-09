@@ -357,13 +357,28 @@ let fold_kind_relevance f acc c =
   | CoFix (_,data) ->
     fold_rec_declaration_relevance f acc data
 
+module PhysicalConstrTbl = Hashtbl.Make (struct
+  type t = Constr.t
+
+  let equal = ( == )
+  let hash term = Hashtbl.hash_param 4 16 term
+end)
+
 let subst_univs_level_constr subst c =
   if UVars.is_empty_sort_subst subst then c
   else
     let f = UVars.subst_sort_level_instance subst in
+    let cache = PhysicalConstrTbl.create 251 in
     (* XXX shouldn't Constr.map return the pointer equal term when unchanged instead? *)
     let changed = ref false in
     let rec aux t =
+      match PhysicalConstrTbl.find_opt cache t with
+      | Some output -> output
+      | None ->
+        let output = aux_uncached t in
+        PhysicalConstrTbl.add cache t output;
+        output
+    and aux_uncached t =
       let t' = map_constr_relevance (UVars.subst_sort_level_relevance subst) t in
       let t = if t' == t then t else (changed := true; t') in
       match kind t with
@@ -531,9 +546,14 @@ let visit_kind_univs visit acc c =
   | _ -> acc
 
 let sort_and_universes_of_constr ?(init=Sorts.Quality.Set.empty,Univ.Level.Set.empty) c =
+  let visited = PhysicalConstrTbl.create 251 in
   let rec aux s c =
-    let s = visit_kind_univs univs_and_qvars_visitor s (kind c) in
-    Constr.fold aux s c
+    if PhysicalConstrTbl.mem visited c then s
+    else begin
+      PhysicalConstrTbl.add visited c c;
+      let s = visit_kind_univs univs_and_qvars_visitor s (kind c) in
+      Constr.fold aux s c
+    end
   in
   aux init c
 

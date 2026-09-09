@@ -168,6 +168,15 @@ module Tbl = struct
 
 end
 
+module PhysicalTbl = Hashtbl.Make (struct
+  type t = constr * int Range.t
+
+  let equal (term1, rels1) (term2, rels2) =
+    term1 == term2 && rels1 == rels2
+
+  let hash key = Hashtbl.hash_param 4 16 key
+end)
+
 type henv = {
   (* only used for globals, rel context is not correct *)
   globals : Environ.env;
@@ -184,6 +193,7 @@ type henv = {
   assum_uids : int Tbl.t;
   (* the surrounding table is for the body, the inner table for the type *)
   letin_uids : int Tbl.t Tbl.t;
+  physical : t PhysicalTbl.t;
 }
 
 let empty_env env = {
@@ -195,6 +205,7 @@ let empty_env env = {
   unknown_cnt = ref 0;
   assum_uids = Tbl.create ();
   letin_uids = Tbl.create ();
+  physical = PhysicalTbl.create 251;
 }
 
 (* still used in fixpoint *)
@@ -343,6 +354,17 @@ let nonrel_leaf tbl c = match kind c with
 
 let rec of_constr henv c =
   incr henv.steps;
+  let key = (c, henv.rels) in
+  match PhysicalTbl.find_opt henv.physical key with
+  | Some c' ->
+    c'.refcount <- c'.refcount + 1;
+    c'
+  | None ->
+    let c' = of_constr_uncached henv c in
+    PhysicalTbl.add henv.physical key c';
+    c'
+
+and of_constr_uncached henv c =
   match nonrel_leaf henv.tbl c with
   | Some v -> v
   | None ->
