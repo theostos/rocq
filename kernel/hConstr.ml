@@ -168,6 +168,16 @@ module Tbl = struct
 
 end
 
+module PhysicalDepthTbl = Hashtbl.Make (struct
+  type t = int * constr
+
+  let equal (left_depth, left) (right_depth, right) =
+    Int.equal left_depth right_depth && left == right
+
+  let hash (depth, term) =
+    Hashtbl.hash (depth, Hashtbl.hash_param 10 100 term)
+end)
+
 type henv = {
   (* only used for globals, rel context is not correct *)
   globals : Environ.env;
@@ -184,6 +194,8 @@ type henv = {
   assum_uids : int Tbl.t;
   (* the surrounding table is for the body, the inner table for the type *)
   letin_uids : int Tbl.t Tbl.t;
+  closed_cache : bool PhysicalDepthTbl.t;
+  physical_cache : (int Range.t * constr * t * bool) list ref;
 }
 
 let empty_env env = {
@@ -195,7 +207,36 @@ let empty_env env = {
   unknown_cnt = ref 0;
   assum_uids = Tbl.create ();
   letin_uids = Tbl.create ();
+  closed_cache = PhysicalDepthTbl.create 251;
+  physical_cache = ref [];
 }
+
+let physically_closed henv root =
+  let exception Open in
+  let rec closed depth term =
+    match PhysicalDepthTbl.find_opt henv.closed_cache (depth, term) with
+    | Some result -> result
+    | None ->
+      let result =
+        match kind term with
+        | Rel index -> index <= depth
+        | _ ->
+          (try
+             Constr.iter_with_binders succ
+               (fun depth child -> if not (closed depth child) then raise Open)
+               depth term;
+             true
+           with Open -> false)
+      in
+      PhysicalDepthTbl.add henv.closed_cache (depth, term) result;
+      result
+  in
+  closed 0 root
+
+let rec firstn_up_to count = function
+  | _ when count = 0 -> []
+  | [] -> []
+  | value :: rest -> value :: firstn_up_to (count - 1) rest
 
 (* still used in fixpoint *)
 let push_unknown_rel env =
@@ -345,7 +386,17 @@ let rec of_constr henv c =
   incr henv.steps;
   match nonrel_leaf henv.tbl c with
   | Some v -> v
-  | None ->
+  | None -> begin match
+      List.find_opt
+        (fun (rels, source, _, closed) ->
+          source == c && (closed || rels == henv.rels))
+        !(henv.physical_cache)
+    with
+    | Some (_, _, cached, _) ->
+      cached.refcount <- cached.refcount + 1;
+      cached
+    | None ->
+    let started_at = !(henv.steps) in
     let kind = of_constr_aux henv c in
     let hash = hash_kind kind in
     let isRel, hash = match kind with
@@ -355,15 +406,24 @@ let rec of_constr henv c =
         uid, Hashset.Combine.combine uid hash
       | _ -> 0, hash
     in
-    match Tbl.raw_find henv.tbl hash (fun c' -> raw_equal c' ~isRel ~kind) with
-    | Some c' -> c'.refcount <- c'.refcount + 1; c'
-    | None ->
-      let c =
+    let converted =
+      match Tbl.raw_find henv.tbl hash (fun c' -> raw_equal c' ~isRel ~kind) with
+      | Some c' -> c'.refcount <- c'.refcount + 1; c'
+      | None ->
+        let c =
         let self = kind_to_constr kind in
         let self = if hasheq_kind (Constr.kind self) (Constr.kind c) then c else self in
         { self; kind; hash; isRel; refcount = 1 }
-      in
-    Tbl.add henv.tbl c c; c
+        in
+        Tbl.add henv.tbl c c;
+        c
+    in
+    if !(henv.steps) - started_at >= 64 then
+      henv.physical_cache :=
+        (henv.rels, c, converted, physically_closed henv c)
+        :: firstn_up_to 15 !(henv.physical_cache);
+    converted
+  end
 
 and of_constr_aux henv c =
   match kind c with

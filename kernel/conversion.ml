@@ -300,10 +300,112 @@ let eq_universes (_,e1) (_,e2) u1 u2 =
   let subst e u = if UVars.Instance.is_empty e then u else UVars.subst_instance_instance e u in
   UVars.Instance.equal (subst e1 u1) (subst e2 u2)
 
-let rec compare_under e1 c1 e2 c2 =
-  match Constr.kind c1, Constr.kind c2 with
-  | Cast (c1, _, _), _ -> compare_under e1 c1 e2 c2
-  | _, Cast (c2, _, _) -> compare_under e1 c1 e2 c2
+let direct_head_reduct_fast env term =
+  let rebuild head arguments =
+    if Array.is_empty arguments then head else mkApp (head, arguments)
+  in
+  let reduce_case term =
+    match kind term with
+    | Case (info, _instance, params, _, _, scrutinee, branches) ->
+      let constructor, constructor_arguments = decompose_app scrutinee in
+      (match kind constructor with
+      | Construct ((inductive, index), constructor_instance) ->
+        let _, packet = Inductive.lookup_mind_specif env inductive in
+        let real_count = Array.length constructor_arguments - info.ci_npar in
+        if
+          real_count < 0
+          || real_count <> packet.mind_consnrealargs.(index - 1)
+        then None
+        else
+          let contexts =
+            Inductive.expand_branch_contexts
+              (Inductive.lookup_mind_specif env inductive)
+              constructor_instance params branches
+          in
+          let branch = branches.(index - 1) in
+          let branch =
+            Term.it_mkLambda_or_LetIn (snd branch) contexts.(index - 1)
+          in
+          let arguments =
+            Array.sub constructor_arguments info.ci_npar real_count
+          in
+          Some (rebuild branch arguments)
+      | _ -> None)
+    | _ -> None
+  in
+  match kind term with
+  | LetIn (_, value, _, body) -> Some (Vars.subst1 value body)
+  | Cast (value, _, _) -> Some value
+  | Const constant -> (
+    try Some (Environ.constant_value_in env constant)
+    with Environ.NotEvaluableConst _ -> None)
+  | Case _ -> reduce_case term
+  | App (head, arguments) -> (
+    match kind head with
+    | Lambda (_, _, body) when not (Array.is_empty arguments) ->
+      let remaining =
+        Array.sub arguments 1 (Array.length arguments - 1)
+      in
+      Some (rebuild (Vars.subst1 arguments.(0) body) remaining)
+    | LetIn (_, value, _, body) ->
+      Some (rebuild (Vars.subst1 value body) arguments)
+    | Const constant -> (
+      try
+        Some
+          (rebuild (Environ.constant_value_in env constant) arguments)
+      with Environ.NotEvaluableConst _ -> None)
+    | Case _ ->
+      Option.map (fun head -> rebuild head arguments) (reduce_case head)
+    | _ -> None)
+  | _ -> None
+
+let compare_under env e1 c1 e2 c2 =
+  let profile_started = Unix.gettimeofday () in
+  let module Closed = Hashtbl.Make (struct
+    type t = int * constr
+
+    let equal (left_depth, left) (right_depth, right) =
+      Int.equal left_depth right_depth && left == right
+
+    let hash (depth, term) =
+      Hashtbl.hash (depth, Hashtbl.hash_param 10 100 term)
+  end)
+  in
+  let closed_cache = Closed.create 251 in
+  let exception Open in
+  let rec closed depth term =
+    match Closed.find_opt closed_cache (depth, term) with
+    | Some result -> result
+    | None ->
+      let result =
+        match Constr.kind term with
+        | Rel index -> index <= depth
+        | _ ->
+          (try
+             Constr.iter_with_binders succ
+               (fun depth child -> if not (closed depth child) then raise Open)
+               depth term;
+             true
+           with Open -> false)
+      in
+      Closed.add closed_cache (depth, term) result;
+      result
+  in
+  let rec compare e1 c1 e2 c2 =
+  if
+    fst e1 == fst e2
+    && UVars.Instance.equal (snd e1) (snd e2)
+    && (c1 == c2 || eq_constr_univs (Environ.universes env) c1 c2)
+  then true
+  else if
+    c1 == c2
+    && UVars.Instance.equal (snd e1) (snd e2)
+    && closed 0 c1
+  then true
+  else
+  let structural = match Constr.kind c1, Constr.kind c2 with
+  | Cast (c1, _, _), _ -> compare e1 c1 e2 c2
+  | _, Cast (c2, _, _) -> compare e1 c1 e2 c2
   | Rel i, Rel j -> begin match Esubst.expand_rel i (fst e1) with
       | Inl _ -> false
       | Inr (k, _) -> begin match Esubst.expand_rel j (fst e2) with
@@ -324,22 +426,22 @@ let rec compare_under e1 c1 e2 c2 =
     and s2 = subst_instance_sort (snd e2) s2 in
     Sorts.equal s1 s2
   | Prod (_,t1,c1), Prod (_,t2,c2) ->
-    compare_under e1 t1 e2 t2
-    && compare_under (usubs_lift e1) c1 (usubs_lift e2) c2
+    compare e1 t1 e2 t2
+    && compare (usubs_lift e1) c1 (usubs_lift e2) c2
   | Lambda (_,t1,c1), Lambda (_,t2,c2) ->
-    compare_under e1 t1 e2 t2
-    && compare_under (usubs_lift e1) c1 (usubs_lift e2) c2
+    compare e1 t1 e2 t2
+    && compare (usubs_lift e1) c1 (usubs_lift e2) c2
   | LetIn (_,b1,_,c1), LetIn (_,b2,_,c2) ->
     (* don't care about types when bodies are equal *)
-    compare_under e1 b1 e2 b2
-    && compare_under (usubs_lift e1) c1 (usubs_lift e2) c2
+    compare e1 b1 e2 b2
+    && compare (usubs_lift e1) c1 (usubs_lift e2) c2
   | App (c1, l1), App (c2, l2) ->
     let len = Array.length l1 in
     Int.equal len (Array.length l2)
-    && compare_under e1 c1 e2 c2
-    && Array.equal_norefl (fun c1 c2 -> compare_under e1 c1 e2 c2) l1 l2
+    && compare e1 c1 e2 c2
+    && Array.equal_norefl (fun c1 c2 -> compare e1 c1 e2 c2) l1 l2
   | Proj (p1,_,c1), Proj (p2,_,c2) ->
-    Projection.UserOrd.equal p1 p2 && compare_under e1 c1 e2 c2
+    Projection.UserOrd.equal p1 p2 && compare e1 c1 e2 c2
   | Evar _, Evar _ -> false
   | Const (c1,u1), Const (c2,u2) ->
     (* The args length currently isn't used but may as well pass it. *)
@@ -349,20 +451,38 @@ let rec compare_under e1 c1 e2 c2 =
     Construct.UserOrd.equal c1 c2 && eq_universes e1 e2 u1 u2
   | Case _, Case _ | Fix _, Fix _ | CoFix _, CoFix _ -> false (* todo some other time *)
   | Array(_,t1,def1,ty1), Array(_,t2,def2,ty2) ->
-    Array.equal_norefl (fun c1 c2 -> compare_under e1 c1 e2 c2) t1 t2
-    && compare_under e1 def1 e2 def2
-    && compare_under e1 ty1 e2 ty2
+    Array.equal_norefl (fun c1 c2 -> compare e1 c1 e2 c2) t1 t2
+    && compare e1 def1 e2 def2
+    && compare e1 ty1 e2 ty2
   | (Rel _ | Meta _ | Var _ | Sort _ | Prod _ | Lambda _ | LetIn _ | App _
     | Proj _ | Evar _ | Const _ | Ind _ | Construct _ | Case _ | Fix _
-    | CoFix _ | Int _ | Float _ | String _ | Array _), _ -> false
+  | CoFix _ | Int _ | Float _ | String _ | Array _), _ -> false
+  in
+  if structural then true
+  else
+    match direct_head_reduct_fast env c1 with
+    | Some c1 -> compare e1 c1 e2 c2
+    | None -> (
+      match direct_head_reduct_fast env c2 with
+      | Some c2 -> compare e1 c1 e2 c2
+      | None -> false)
+  in
+  let result = compare e1 c1 e2 c2 in
+  let elapsed = Unix.gettimeofday () -. profile_started in
+  if
+    elapsed >= 0.05
+    && Option.has_some (Sys.getenv_opt "ROCQ_TYPEOPS_PROFILE")
+  then Printf.eprintf "[conversion-profile] compare_under=%.3f result=%b\n%!"
+    elapsed result;
+  result
 
 
-let rec fast_test lft1 term1 lft2 term2 = match fterm_of term1, fterm_of term2 with
-  | FLIFT (i, term1), (FLIFT _ | FCLOS _) -> fast_test (el_shft i lft1) term1 lft2 term2
-  | FCLOS _, FLIFT (j, term2) -> fast_test lft1 term1 (el_shft j lft2) term2
+let rec fast_test env lft1 term1 lft2 term2 = match fterm_of term1, fterm_of term2 with
+  | FLIFT (i, term1), (FLIFT _ | FCLOS _) -> fast_test env (el_shft i lft1) term1 lft2 term2
+  | FCLOS _, FLIFT (j, term2) -> fast_test env lft1 term1 (el_shft j lft2) term2
   | FCLOS (c1, (e1,u1)), FCLOS (c2, (e2,u2)) ->
     eq_lift lft1 lft2 &&
-    compare_under (e1, u1) c1 (e2, u2) c2
+    compare_under env (e1, u1) c1 (e2, u2) c2
   | _ -> false
 
 let assert_reduced_constructor s =
@@ -371,7 +491,17 @@ let assert_reduced_constructor s =
 
 (* Conversion between  [lft1]term1 and [lft2]term2 *)
 let rec ccnv cv_pb l2r infos lft1 lft2 term1 term2 cuniv =
-  let fast = fast_test lft1 term1 lft2 term2 in
+  let env = info_env infos.cnv_inf in
+  let fast = fast_test env lft1 term1 lft2 term2 in
+  let fast =
+    if fast || not (eq_lift lft1 lft2) then fast
+    else
+      match fterm_of term1, fterm_of term2 with
+      | FFlex _, _ | _, FFlex _ ->
+        fast_test env lft1 (inject (term_of_fconstr term1)) lft2
+          (inject (term_of_fconstr term2))
+      | _ -> false
+  in
   if fast then cuniv
   else
     eqappr cv_pb l2r infos (lft1, (term1,[])) (lft2, (term2,[])) cuniv
@@ -1019,15 +1149,108 @@ let () =
   in
   CClosure.set_conv conv
 
+(** Try the exposed delta/beta/zeta spine before asking the closure machine
+    for full weak-head normal forms.  This is useful when one side is an
+    explicit intermediate reduct such as a blocked fixpoint application:
+    forcing that fixpoint's recursive argument would step past the term we
+    are trying to compare.  Every candidate below is an ordinary kernel
+    reduct, so this is only a sound fast path for the existing conversion
+    relation. *)
+let direct_head_reduct = direct_head_reduct_fast
+
+let direct_head_convertible compare env left right =
+  let rec reduce_left fuel candidate =
+    if fuel = 0 then false
+    else
+      match direct_head_reduct env candidate with
+      | None -> false
+      | Some candidate ->
+        compare candidate right || reduce_left (fuel - 1) candidate
+  in
+  let rec reduce_right fuel candidate =
+    if fuel = 0 then false
+    else
+      match direct_head_reduct env candidate with
+      | None -> false
+      | Some candidate ->
+        compare left candidate || reduce_right (fuel - 1) candidate
+  in
+  reduce_left 256 left || reduce_right 256 right
+
+let direct_structural_convertible env left right =
+  let graph = Environ.universes env in
+  let rec compare fuel left right =
+    if eq_constr_univs graph left right then true
+    else
+      let structural =
+        match kind left, kind right with
+        | App (left_head, left_args), App (right_head, right_args) ->
+          Int.equal (Array.length left_args) (Array.length right_args)
+          && compare fuel left_head right_head
+          && Array.for_all2 (compare fuel) left_args right_args
+        | Prod (_, left_domain, left_body),
+          Prod (_, right_domain, right_body)
+        | Lambda (_, left_domain, left_body),
+          Lambda (_, right_domain, right_body) ->
+          compare fuel left_domain right_domain
+          && compare fuel left_body right_body
+        | LetIn (_, left_value, left_type, left_body),
+          LetIn (_, right_value, right_type, right_body) ->
+          compare fuel left_value right_value
+          && compare fuel left_type right_type
+          && compare fuel left_body right_body
+        | Proj (left_projection, _, left_scrutinee),
+          Proj (right_projection, _, right_scrutinee) ->
+          Projection.UserOrd.equal left_projection right_projection
+          && compare fuel left_scrutinee right_scrutinee
+        | _ -> false
+      in
+      if structural || fuel = 0 then structural
+      else
+        match direct_head_reduct env left with
+        | Some left -> compare (fuel - 1) left right
+        | None -> (
+          match direct_head_reduct env right with
+          | Some right -> compare (fuel - 1) left right
+          | None -> false)
+  in
+  compare 256 left right
+
 let gen_conv ~typed cv_pb ?(l2r=false) ?(reds=TransparentState.full) env ?(evars=default_evar_handler env) t1 t2 =
   let univs = Environ.universes env in
   let state = univs in
+  let quick_started = Unix.gettimeofday () in
   let b =
     if cv_pb = CUMUL then leq_constr_univs univs t1 t2
     else eq_constr_univs univs t1 t2
   in
+  let quick_elapsed = Unix.gettimeofday () -. quick_started in
+  let () =
+    if
+      quick_elapsed >= 0.05
+      && Option.has_some (Sys.getenv_opt "ROCQ_TYPEOPS_PROFILE")
+    then Printf.eprintf "[conversion-profile] quick=%.3f result=%b\n%!"
+      quick_elapsed b
+  in
     if b then Result.Ok ()
-    else match clos_gen_conv ~typed reds cv_pb l2r evars env univs (state, checked_universes) t1 t2 with
+    else
+      let direct_compare =
+        if cv_pb = CUMUL then leq_constr_univs univs
+        else eq_constr_univs univs
+      in
+      if direct_head_convertible direct_compare env t1 t2 then Result.Ok ()
+      else if direct_structural_convertible env t1 t2 then Result.Ok ()
+    else
+      let clos_started = Unix.gettimeofday () in
+      match clos_gen_conv ~typed reds cv_pb l2r evars env univs (state, checked_universes) t1 t2 with
+    | result when Option.has_some (Sys.getenv_opt "ROCQ_TYPEOPS_PROFILE") ->
+      let elapsed = Unix.gettimeofday () -. clos_started in
+      if elapsed >= 0.05 then
+        Printf.eprintf "[conversion-profile] closure=%.3f\n%!" elapsed;
+      (match result with
+      | Result.Ok (_ : 'a * ('a, Empty.t) universe_compare)-> Result.Ok ()
+      | Result.Error None -> Result.Error ()
+      | Result.Error (Some e) -> Empty.abort e)
     | Result.Ok (_ : 'a * ('a, Empty.t) universe_compare)-> Result.Ok ()
     | Result.Error None -> Result.Error ()
     | Result.Error (Some e) -> Empty.abort e

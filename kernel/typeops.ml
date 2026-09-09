@@ -28,7 +28,15 @@ module RelDecl = Context.Rel.Declaration
 exception NotConvertible
 exception NotConvertibleVect of int
 
-let conv_leq env x y = default_conv CUMUL env x y
+let conv_leq env x y =
+  let started = Unix.gettimeofday () in
+  let result = default_conv CUMUL env x y in
+  let elapsed = Unix.gettimeofday () -. started in
+  if
+    elapsed >= 0.05
+    && Option.has_some (Sys.getenv_opt "ROCQ_TYPEOPS_PROFILE")
+  then Printf.eprintf "[typeops-profile] conv_leq=%.3f\n%!" elapsed;
+  result
 
 let conv_leq_vecti env v1 v2 =
   Array.fold_left2_i
@@ -223,7 +231,22 @@ let type_of_apply env func funt argsv argstv =
         let arg = argsv.(i) in
         let argt = argstv.(i) in
         let c1 = term_of_fconstr c1 in
-        begin match conv_leq env argt c1 with
+        let started = Unix.gettimeofday () in
+        let converted = conv_leq env argt c1 in
+        let elapsed = Unix.gettimeofday () -. started in
+        (if
+           elapsed >= 0.05
+           && Option.has_some (Sys.getenv_opt "ROCQ_TYPEOPS_PROFILE")
+         then
+           let function_name =
+             match kind func with
+             | Const (constant, _) -> Constant.to_string constant
+             | _ -> "<non-constant>"
+           in
+           Printf.eprintf
+             "[typeops-profile] apply function=%s argument=%d elapsed=%.3f\n%!"
+             function_name i elapsed);
+        begin match converted with
         | Result.Ok () -> apply_rec (i+1) (mk_clos (CClosure.usubs_cons (inject arg) e) c2)
         | Result.Error () ->
           error_cant_apply_bad_type env
@@ -332,6 +355,7 @@ let type_of_product env _name s1 s2 =
 *)
 
 let check_cast env c ct k expected_type =
+  let started = Unix.gettimeofday () in
   let ans = match k with
     | VMcast ->
       Vconv.vm_conv CUMUL env ct expected_type
@@ -341,6 +365,11 @@ let check_cast env c ct k expected_type =
       let sigma = Genlambda.empty_evars env in
       Nativeconv.native_conv CUMUL sigma env ct expected_type
   in
+  let elapsed = Unix.gettimeofday () -. started in
+  if
+    elapsed >= 0.05
+    && Option.has_some (Sys.getenv_opt "ROCQ_TYPEOPS_PROFILE")
+  then Printf.eprintf "[typeops-profile] check_cast=%.3f\n%!" elapsed;
   match ans with
   | Result.Ok () -> ()
   | Result.Error () ->
@@ -851,7 +880,11 @@ let infer_hconstr env hconstr =
   make_judge constr t
 
 let infer env c =
+  let started = Unix.gettimeofday () in
   let c = HConstr.of_constr env c in
+  if Option.has_some (Sys.getenv_opt "ROCQ_HCONSTR_PROFILE") then
+    Printf.eprintf "[hconstr-profile] construction=%.3f\n%!"
+      (Unix.gettimeofday () -. started);
   infer_hconstr env c
 
 let assumption_of_judgment env {uj_val=c; uj_type=t} =
