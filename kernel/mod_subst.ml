@@ -395,12 +395,77 @@ let subst_proj subst p =
 let subst_retro_action subst action =
   let open Retroknowledge in
   match action with
+  | Register_peano_nat ind ->
+    let ind' = subst_ind subst ind in
+    if ind == ind' then action else Register_peano_nat ind'
   | Register_ind(prim,ind) ->
     let ind' = subst_ind subst ind in
     if ind == ind' then action else Register_ind(prim, ind')
   | Register_type(prim,c) ->
     let c' = subst_constant subst c in
     if c == c' then action else Register_type(prim, c')
+  | Register_peano_nat_double (ind, c) ->
+    let ind' = subst_ind subst ind in
+    let c' = subst_constant subst c in
+    if ind == ind' && c == c' then action
+    else Register_peano_nat_double (ind', c')
+  | Register_peano_nat_of_N (ind, n_ind, pos_ind, c) ->
+    let ind' = subst_ind subst ind in
+    let n_ind' = subst_ind subst n_ind in
+    let pos_ind' = subst_ind subst pos_ind in
+    let c' = subst_constant subst c in
+    if ind == ind' && n_ind == n_ind' && pos_ind == pos_ind' && c == c'
+    then action
+    else Register_peano_nat_of_N (ind', n_ind', pos_ind', c')
+  | Register_peano_nat_add (ind, c) ->
+    let ind' = subst_ind subst ind in
+    let c' = subst_constant subst c in
+    if ind == ind' && c == c' then action
+    else Register_peano_nat_add (ind', c')
+  | Register_peano_nat_mul (ind, c) ->
+    let ind' = subst_ind subst ind in
+    let c' = subst_constant subst c in
+    if ind == ind' && c == c' then action
+    else Register_peano_nat_mul (ind', c')
+  | Register_peano_nat_pow (ind, c) ->
+    let ind' = subst_ind subst ind in
+    let c' = subst_constant subst c in
+    if ind == ind' && c == c' then action
+    else Register_peano_nat_pow (ind', c')
+  | Register_peano_nat_beq (ind, c, false_ctor, true_ctor) ->
+    let ind' = subst_ind subst ind in
+    let c' = subst_constant subst c in
+    let false_ctor' = subst_constructor subst false_ctor in
+    let true_ctor' = subst_constructor subst true_ctor in
+    if ind == ind' && c == c' && false_ctor == false_ctor' &&
+       true_ctor == true_ctor' then action
+    else Register_peano_nat_beq (ind', c', false_ctor', true_ctor')
+  | Register_unit_like ind ->
+    let ind' = subst_ind subst ind in
+    if ind == ind' then action else Register_unit_like ind'
+  | Register_peano_nat_ble (ind, c, false_ctor, true_ctor) ->
+    let ind' = subst_ind subst ind in
+    let c' = subst_constant subst c in
+    let false_ctor' = subst_constructor subst false_ctor in
+    let true_ctor' = subst_constructor subst true_ctor in
+    if ind == ind' && c == c' && false_ctor == false_ctor' &&
+       true_ctor == true_ctor' then action
+    else Register_peano_nat_ble (ind', c', false_ctor', true_ctor')
+  | Register_peano_nat_sub (ind, c) ->
+    let ind' = subst_ind subst ind in
+    let c' = subst_constant subst c in
+    if ind == ind' && c == c' then action
+    else Register_peano_nat_sub (ind', c')
+  | Register_peano_nat_div_go (ind, worker) ->
+    let ind' = subst_ind subst ind in
+    let worker' = subst_constant subst worker in
+    if ind == ind' && worker == worker' then action
+    else Register_peano_nat_div_go (ind', worker')
+  | Register_peano_nat_mod_go (ind, worker) ->
+    let ind' = subst_ind subst ind in
+    let worker' = subst_constant subst worker in
+    if ind == ind' && worker == worker' then action
+    else Register_peano_nat_mod_go (ind', worker')
 
 let rec map_kn f f' c =
   let func = map_kn f f' in

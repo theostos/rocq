@@ -75,8 +75,158 @@ type table_key = Constant.t UVars.puniverses tableKey
 
 type evar_repack = Evar.t * constr list -> constr
 
+module PeanoNatValue = struct
+  (** Little-endian binary digits, with no trailing zero.  This representation
+      is arbitrary precision and keeps the cost of imported binary numerals
+      proportional to their bit size. *)
+  type t = bool list
+
+  let zero = []
+  let one = [true]
+  let is_zero = List.is_empty
+  let equal = List.equal Bool.equal
+
+  let rec succ = function
+    | [] -> [true]
+    | false :: bits -> true :: bits
+    | true :: bits -> false :: succ bits
+
+  let pred = function
+    | [] -> None
+    | bits ->
+      let rec go = function
+        | [true] -> []
+        | true :: bits -> false :: bits
+        | false :: bits -> true :: go bits
+        | [] -> assert false
+      in
+      Some (go bits)
+
+  let double = function
+    | [] -> []
+    | bits -> false :: bits
+
+  let rec add_with_carry carry a b =
+    match a, b with
+    | [], [] -> if carry then [true] else []
+    | abit :: a, [] ->
+      let bit = abit <> carry in
+      let carry = abit && carry in
+      bit :: add_with_carry carry a []
+    | [], bbit :: b ->
+      let bit = bbit <> carry in
+      let carry = bbit && carry in
+      bit :: add_with_carry carry [] b
+    | abit :: a, bbit :: b ->
+      let bit = abit <> bbit <> carry in
+      let carry = (abit && bbit) || (carry && (abit || bbit)) in
+      bit :: add_with_carry carry a b
+
+  let add a b = add_with_carry false a b
+
+  let rec mul a = function
+    | [] -> zero
+    | bit :: bits ->
+      let higher = double (mul a bits) in
+      if bit then add a higher else higher
+
+  let max_pow_bits = 1_000_000
+
+  let pow base exponent =
+    let within_limit value = List.length value <= max_pow_bits in
+    let mul_limited a b =
+      let value = mul a b in
+      if within_limit value then Some value else None
+    in
+    let rec loop result factor = function
+      | [] -> Some result
+      | bit :: bits ->
+        let result = if bit then mul_limited result factor else Some result in
+        Option.bind result (fun result ->
+          match bits with
+          | [] -> Some result
+          | _ -> Option.bind (mul_limited factor factor) (fun factor ->
+              loop result factor bits))
+    in
+    loop one base exponent
+
+  let bit ~one bits =
+    if one then true :: bits else false :: bits
+
+  let compare a b =
+    let by_length = Int.compare (List.length a) (List.length b) in
+    if not (Int.equal by_length 0) then by_length
+    else
+      let rec from_most_significant a b =
+        match a, b with
+        | [], [] -> 0
+        | abit :: a, bbit :: b ->
+          let higher = from_most_significant a b in
+          if Int.equal higher 0 then Bool.compare abit bbit else higher
+        | _ -> assert false
+      in
+      from_most_significant a b
+
+  let le a b = compare a b <= 0
+
+  let sub a b =
+    if compare a b < 0 then zero
+    else
+      let rec subtract borrow a b =
+        match a, b with
+        | [], [] ->
+          if borrow then assert false else []
+        | abit :: a, [] ->
+          let bit = abit <> borrow in
+          let borrow = (not abit) && borrow in
+          bit :: subtract borrow a []
+        | abit :: a, bbit :: b ->
+          let bit = abit <> bbit <> borrow in
+          let borrow =
+            ((not abit) && (bbit || borrow)) || (bbit && borrow)
+          in
+          bit :: subtract borrow a b
+        | [], _ :: _ -> assert false
+      in
+      let rec drop_high_zeros = function
+        | false :: bits -> drop_high_zeros bits
+        | bits -> bits
+      in
+      subtract false a b |> List.rev |> drop_high_zeros |> List.rev
+
+  let div_mod dividend divisor =
+    if is_zero divisor then zero, zero
+    else
+      let step (remainder, quotient) bit =
+        let remainder = double remainder in
+        let remainder = if bit then succ remainder else remainder in
+        if compare remainder divisor < 0 then remainder, false :: quotient
+        else sub remainder divisor, true :: quotient
+      in
+      let remainder, quotient =
+        List.fold_left step (zero, []) (List.rev dividend) in
+      let rec drop_high_zeros = function
+        | false :: bits -> drop_high_zeros bits
+        | bits -> bits
+      in
+      let quotient = quotient |> List.rev |> drop_high_zeros |> List.rev in
+      quotient, remainder
+
+  let div dividend divisor = fst (div_mod dividend divisor)
+  let rem dividend divisor = snd (div_mod dividend divisor)
+
+end
+
+type compact_peano = {
+  peano_ind : inductive;
+  peano_zero : constructor;
+  peano_succ : constructor;
+  peano_double : Constant.t;
+  peano_value : PeanoNatValue.t;
+}
+
 type fconstr = {
-  mutable mark : red_state;
+  mutable state : int;
   mutable term: fterm;
 }
 
@@ -100,6 +250,7 @@ and fterm =
   | FFloat of Float64.t
   | FString of Pstring.t
   | FArray of UVars.Instance.t * fconstr Parray.t * fconstr
+  | FPeanoNat of compact_peano
   | FLIFT of int * fconstr
   | FCLOS of constr * usubs
   | FIrrelevant
@@ -113,15 +264,66 @@ and usubs = subs_content subs UVars.puniverses
 
 and finvert = fconstr array
 
+let next_fconstr_uid = Atomic.make 0
+
+let red_state_code = function
+  | Ntrl -> 0
+  | Cstr -> 1
+  | Red -> 2
+
+let red_state_of_code = function
+  | 0 -> Ntrl
+  | 1 -> Cstr
+  | 2 -> Red
+  | _ -> assert false
+
+let make_fconstr mark term =
+  let uid = Atomic.fetch_and_add next_fconstr_uid 1 in
+  { state = (uid lsl 2) lor red_state_code mark; term }
+
+let fconstr_hash term = term.state lsr 2
+let fconstr_mark term = red_state_of_code (term.state land 3)
+let set_fconstr_mark term mark =
+  term.state <- (term.state land (lnot 3)) lor red_state_code mark
+
 let get_invert fiv = fiv
 
 let fterm_of v = v.term
-let set_ntrl v = v.mark <- Ntrl
+let set_ntrl v = set_fconstr_mark v Ntrl
+
+let rec equal_compact_peano_fconstr t1 t2 =
+  match [@ocaml.warning "-4"] t1.term, t2.term with
+  | FLIFT (_, t1), _ -> equal_compact_peano_fconstr t1 t2
+  | _, FLIFT (_, t2) -> equal_compact_peano_fconstr t1 t2
+  | FPeanoNat n1, FPeanoNat n2 ->
+    Ind.UserOrd.equal n1.peano_ind n2.peano_ind &&
+    PeanoNatValue.equal n1.peano_value n2.peano_value
+  | _ -> false
+
+let equal_compact_peano_rel (s1, _) i (s2, _) j =
+  match expand_rel i s1, expand_rel j s2 with
+  | Inl (_, Regular t1), Inl (_, Regular t2) ->
+    equal_compact_peano_fconstr t1 t2
+  | (Inl (_, HigherOrder _) | Inl (_, Regular _) | Inr _), _ -> false
+
+let peano_constructor_view n =
+  if PeanoNatValue.is_zero n.peano_value then
+    make_fconstr Cstr
+      (FConstruct ((n.peano_zero, UVars.Instance.empty), [||]))
+  else
+    let pred =
+      { n with
+        peano_value = Option.get (PeanoNatValue.pred n.peano_value) }
+    in
+    make_fconstr Cstr
+      (FConstruct
+        ((n.peano_succ, UVars.Instance.empty),
+         [|make_fconstr Cstr (FPeanoNat pred)|]))
 
 (* Could issue a warning if no is still Red, pointing out that we loose
    sharing. *)
 let update v1 mark t =
-  v1.mark <- mark; v1.term <- t
+  set_fconstr_mark v1 mark; v1.term <- t
 
 type 'a evar_expansion =
 | EvarDefined of 'a
@@ -239,18 +441,21 @@ let usubs_shft (n,(e,u)) = subs_shft (n, e), u
    when the lift is 0. *)
 let rec lft_fconstr n ft =
   match ft.term with
-    | (FInd _|FConstruct (_,[||])|FFlex(ConstKey _|VarKey _)|FInt _|FFloat _|FString _|FIrrelevant) -> ft
-    | FRel i -> {mark=ft.mark;term=FRel(i+n)}
-    | FLambda(k,tys,f,e) -> {mark=Cstr; term=FLambda(k,tys,f,usubs_shft(n,e))}
+    | (FInd _|FConstruct (_,[||])|FFlex(ConstKey _|VarKey _)|FInt _|FFloat _|FString _|FPeanoNat _|FIrrelevant) -> ft
+    | FRel i -> make_fconstr (fconstr_mark ft) (FRel (i + n))
+    | FLambda(k,tys,f,e) ->
+      make_fconstr Cstr (FLambda (k, tys, f, usubs_shft (n, e)))
     | FFix(fx,e) ->
-      {mark=Cstr; term=FFix(fx,usubs_shft(n,e))}
+      make_fconstr Cstr (FFix (fx, usubs_shft (n, e)))
     | FCoFix(cfx,e) ->
-      {mark=Cstr; term=FCoFix(cfx,usubs_shft(n,e))}
+      make_fconstr Cstr (FCoFix (cfx, usubs_shft (n, e)))
     | FLIFT(k,m) -> lft_fconstr (n+k) m
-    | FConstruct (c,args) -> {mark=Cstr; term=FConstruct(c,Array.Fun1.map lft_fconstr n args)}
+    | FConstruct (c,args) ->
+      make_fconstr Cstr (FConstruct (c, Array.Fun1.map lft_fconstr n args))
     | FLOCKED -> assert false
     | FFlex (RelKey _) | FAtom _ | FApp _ | FProj _ | FCaseT _ | FCaseInvert _ | FProd _
-    | FLetIn _ | FEvar _ | FCLOS _ | FArray _ -> {mark=ft.mark; term=FLIFT(n,ft)}
+    | FLetIn _ | FEvar _ | FCLOS _ | FArray _ ->
+      make_fconstr (fconstr_mark ft) (FLIFT (n, ft))
 let lift_fconstr k f =
   if Int.equal k 0 then f else lft_fconstr k f
 
@@ -259,9 +464,14 @@ let clos_rel e i =
     | Inl (n, Regular mt) -> Regular (lift_fconstr n mt)
     | Inl (_, HigherOrder (0, mt)) -> Regular mt
     | Inl (_, HigherOrder (nargs, mt)) -> HigherOrder (nargs, mt)
-    | Inr (k, None) -> Regular {mark=Ntrl; term= FRel k}
+    | Inr (k, None) -> Regular (make_fconstr Ntrl (FRel k))
     | Inr (k, Some p) ->
-      Regular (lift_fconstr (k-p) {mark=Red;term=FFlex(RelKey p)})
+      Regular (lift_fconstr (k-p) (make_fconstr Red (FFlex (RelKey p))))
+
+let inspect_substituted_rel (e, _) i =
+  match expand_rel i e with
+  | Inl (_, Regular term) | Inl (_, HigherOrder (0, term)) -> Some term
+  | Inl (_, HigherOrder _) | Inr _ -> None
 
 (* since the head may be reducible, we might introduce lifts of 0 *)
 let compact_stack head stk =
@@ -272,7 +482,7 @@ let compact_stack head stk =
            lost by the update operation *)
         let h' = lft_fconstr depth head in
         (** The stack contains [Zupdate] marks only if in sharing mode *)
-        let () = update m h'.mark h'.term in
+        let () = update m (fconstr_mark h') h'.term in
         strip_rec depth s
     | ((ZcaseT _ | Zproj _ | Zfix _ | Zapp _ | Zprimitive _) :: _ | []) as stk -> zshift depth stk
   in
@@ -281,7 +491,7 @@ let compact_stack head stk =
 (* Put an update mark in the stack, only if needed *)
 let zupdate info m s =
   let share = info.i_cache.i_share in
-  if share && is_red m.mark then
+  if share && is_red (fconstr_mark m) then
     let s' = compact_stack m s in
     let _ = m.term <- FLOCKED in
     Zupdate(m)::s'
@@ -324,7 +534,8 @@ let destFLambda clos_fun t =
   | FLambda(_,[(na,ty)],b,e) ->
     (usubst_binder e na,clos_fun e ty,clos_fun (usubs_lift e) b)
   | FLambda(n,(na,ty)::tys,b,e) ->
-    (usubst_binder e na,clos_fun e ty,{mark=t.mark;term=FLambda(n-1,tys,b,usubs_lift e)})
+    (usubst_binder e na, clos_fun e ty,
+     make_fconstr (fconstr_mark t) (FLambda (n - 1, tys, b, usubs_lift e)))
   | _ -> assert false
 
 (* Optimization: do not enclose variables in a closure.
@@ -336,26 +547,27 @@ let mk_clos (e:usubs) t =
       | Regular v -> v
       | HigherOrder _ -> CErrors.anomaly Pp.(str "Uncaught pattern variable")
       end
-    | Var x -> {mark = Red; term = FFlex (VarKey x) }
-    | Const c -> {mark = Red; term = FFlex (ConstKey (usubst_punivs e c)) }
+    | Var x -> make_fconstr Red (FFlex (VarKey x))
+    | Const c -> make_fconstr Red (FFlex (ConstKey (usubst_punivs e c)))
     | Sort s ->
       let s = usubst_sort e s in
-      {mark = Ntrl; term = FAtom (mkSort s) }
-    | Meta _ -> {mark = Ntrl; term = FAtom t }
-    | Ind kn -> {mark = Ntrl; term = FInd (usubst_punivs e kn) }
-    | Construct kn -> {mark = Cstr; term = FConstruct (usubst_punivs e kn,[||]) }
-    | Int i -> {mark = Cstr; term = FInt i}
-    | Float f -> {mark = Cstr; term = FFloat f}
-    | String s -> {mark = Cstr; term = FString s}
+      make_fconstr Ntrl (FAtom (mkSort s))
+    | Meta _ -> make_fconstr Ntrl (FAtom t)
+    | Ind kn -> make_fconstr Ntrl (FInd (usubst_punivs e kn))
+    | Construct kn ->
+      make_fconstr Cstr (FConstruct (usubst_punivs e kn, [||]))
+    | Int i -> make_fconstr Cstr (FInt i)
+    | Float f -> make_fconstr Cstr (FFloat f)
+    | String s -> make_fconstr Cstr (FString s)
     | (CoFix _|Lambda _|Fix _|Prod _|Evar _|App _|Case _|Cast _|LetIn _|Proj _|Array _) ->
-        {mark = Red; term = FCLOS(t,e)}
+        make_fconstr Red (FCLOS (t, e))
   (* Invariant, pattern variables under apps are deferred to knht by being wrapped in FCLOS *)
 
 let injectu c u = mk_clos (subs_id 0, u) c
 
 let inject c = injectu c UVars.Instance.empty
 
-let mk_irrelevant = { mark = Cstr; term = FIrrelevant }
+let mk_irrelevant = make_fconstr Cstr FIrrelevant
 
 let is_irrelevant info r = match info.i_cache.i_mode with
 | Reduction -> false
@@ -395,6 +607,24 @@ end = struct
     match d with
     | NamedDecl.LocalDef (_, c, _) -> inject c
     | NamedDecl.LocalAssum (_, _) -> raise Not_found
+
+  let relevance_mask info instance typ =
+    let binders, _ = Term.decompose_prod typ in
+    binders
+    |> List.rev
+    |> List.map (fun (binder, _) ->
+         let relevance =
+           UVars.subst_instance_relevance instance
+             binder.binder_relevance
+         in
+         not (is_irrelevant info relevance))
+    |> Array.of_list
+
+  let merge_masks first second =
+    let length = max (Array.length first) (Array.length second) in
+    Array.init length (fun index ->
+      (index >= Array.length first || first.(index)) &&
+      (index >= Array.length second || second.(index)))
 
   let constant_value_in u = function
     | Def b -> injectu b u
@@ -438,6 +668,9 @@ end = struct
           let mask = match cb.const_body_code with
           | (Vmemitcodes.BCalias _ | Vmemitcodes.BCconstant | BCuncompiled) -> [||]
           | (Vmemitcodes.BCdefined (mask, _, _)) -> mask
+          in
+          let mask =
+            merge_masks mask (relevance_mask info u cb.const_type)
           in
           Def (constant_value_in u cb.const_body, mask)
         | Symbol b ->
@@ -614,6 +847,21 @@ let rec to_constr lfts v =
       let ty = to_constr lfts ty in
       mkArray(u, t, def,ty)
 
+    | FPeanoNat n ->
+      let rec quote value =
+        match value with
+        | [] ->
+          Constr.UnsafeMonomorphic.mkConstruct n.peano_zero
+        | bit :: higher ->
+          let doubled = mkApp
+              (Constr.UnsafeMonomorphic.mkConst n.peano_double,
+               [|quote higher|]) in
+          if not bit then doubled
+          else mkApp
+              (Constr.UnsafeMonomorphic.mkConstruct n.peano_succ, [|doubled|])
+      in
+      quote n.peano_value
+
     | FCLOS (t,env) ->
       if is_subs_id (fst env) && is_lift_id lfts then
         subst_instance_constr (snd env) t
@@ -672,64 +920,62 @@ let rec resubst subs v =
     | FRel i ->
       let args = Array.Fun1.map resubst subs ve in
       begin match clos_rel subs i with
-      | Regular t -> { v with term = FApp (t, args) }
+      | Regular t -> make_fconstr (fconstr_mark v) (FApp (t, args))
       | HigherOrder (nargs, term) ->
         let subs', args = Array.chop nargs args in
         let subs' = Array.fold_left (fun s v -> subs_cons (Regular v) s) (subs_id 0) subs' in
         let head = resubst subs' term in
-        { v with term = FApp (head, args) }
+        make_fconstr (fconstr_mark v) (FApp (head, args))
       end
     | _ ->
-      { v with term =
-          FApp (resubst subs f,
-                Array.Fun1.map resubst subs ve) }
+      make_fconstr (fconstr_mark v)
+        (FApp (resubst subs f,
+               Array.Fun1.map resubst subs ve))
     end
   | FCaseT (ci, u, pms, p, c, ve, env) ->
     let env = comp_subs subs env in
-    { v with term = FCaseT (ci, u, pms, p, resubst subs c, ve, env) }
+    make_fconstr (fconstr_mark v)
+      (FCaseT (ci, u, pms, p, resubst subs c, ve, env))
   | FCaseInvert (ci, u, pms, p, indices, c, ve, env) ->
     let env = comp_subs subs env in
     let indices = Array.Fun1.map resubst subs indices in
-    { v with term = FCaseInvert (ci, u, pms, p, indices, resubst subs c, ve, env) }
+    make_fconstr (fconstr_mark v)
+      (FCaseInvert (ci, u, pms, p, indices, resubst subs c, ve, env))
   | FFix (fx, e) ->
     let e = comp_subs subs e in
-    { v with term = FFix (fx, e) }
+    make_fconstr (fconstr_mark v) (FFix (fx, e))
   | FCoFix (cfx, e) ->
     let e = comp_subs subs e in
-    { v with term = FCoFix (cfx, e) }
+    make_fconstr (fconstr_mark v) (FCoFix (cfx, e))
   | FProj (p, r, c) ->
-    { v with term =
-      FProj (p, r, resubst subs c) }
+    make_fconstr (fconstr_mark v) (FProj (p, r, resubst subs c))
   | FLambda (len, tys, f, e) ->
     let e = comp_subs subs e in
-    { v with term = FLambda (len, tys, f, e) }
+    make_fconstr (fconstr_mark v) (FLambda (len, tys, f, e))
   | FProd (n, t, c, e) ->
     let e = comp_subs subs e in
-    { v with term = FProd (n, resubst subs t, c, e) }
+    make_fconstr (fconstr_mark v) (FProd (n, resubst subs t, c, e))
   | FLetIn (n, b, t, f, e) ->
     let e = comp_subs subs e in
-    { v with term =
-      FLetIn (n, resubst subs b, resubst subs t, f, e) }
+    make_fconstr (fconstr_mark v)
+      (FLetIn (n, resubst subs b, resubst subs t, f, e))
   | FEvar (ev, args, env, repack) ->
     let env = comp_subs subs env in
-    { v with term =
-      FEvar (ev, args, env, repack) }
+    make_fconstr (fconstr_mark v) (FEvar (ev, args, env, repack))
   | FLIFT (k, a) ->
     resubst (subs_popn k subs) a
 
   | FArray (u, t, ty) ->
     let t = Parray.map (resubst subs) t in
     let ty = resubst subs ty in
-    { v with term =
-      FArray (u, t, ty) }
+    make_fconstr (fconstr_mark v) (FArray (u, t, ty))
 
   | FCLOS (t,env) ->
     let env = comp_subs subs env in
-    { v with term =
-      FCLOS (t, env) }
+    make_fconstr (fconstr_mark v) (FCLOS (t, env))
 
   | FFlex (RelKey _) -> v (* outside the substitution *)
-  | FFlex (ConstKey _ | VarKey _) | FInd _ | FConstruct _ | FAtom _ | FInt _ | FFloat _ | FString _ -> v
+  | FFlex (ConstKey _ | VarKey _) | FInd _ | FConstruct _ | FAtom _ | FInt _ | FFloat _ | FString _ | FPeanoNat _ -> v
 
   | FIrrelevant -> v (* Stable under substitution and lifts *)
   | FLOCKED -> assert (!Flags.in_debugger); v
@@ -753,10 +999,10 @@ let mkFApp h args =
   else match[@warning "-4"] h.term with
     | FConstruct (c, args0) ->
       let args = if CArray.is_empty args0 then args else Array.append args0 args in
-      {mark=Cstr; term=FConstruct(c, args)}
+      make_fconstr Cstr (FConstruct (c, args))
     | _ ->
       (* don't bother collapsing FApp nodes *)
-      {mark=neutr h.mark; term=FApp(h,args)}
+      make_fconstr (neutr (fconstr_mark h)) (FApp (h, args))
 
 let rec zip m stk =
   match stk with
@@ -764,24 +1010,25 @@ let rec zip m stk =
     | Zapp args :: s -> zip (mkFApp m args) s
     | ZcaseT(ci, u, pms, p, br, e)::s ->
         let t = FCaseT(ci, u, pms, p, m, br, e) in
-        let mark = (neutr m.mark) in
-        zip {mark; term=t} s
+        let mark = neutr (fconstr_mark m) in
+        zip (make_fconstr mark t) s
     | Zproj (p,r) :: s ->
-        let mark = (neutr m.mark) in
-        zip {mark; term=FProj(Projection.make p true,r,m)} s
+        let mark = neutr (fconstr_mark m) in
+        zip (make_fconstr mark (FProj (Projection.make p true, r, m))) s
     | Zfix(fx,par)::s ->
         zip fx (par @ append_stack [|m|] s)
     | Zshift(n)::s ->
         zip (lift_fconstr n m) s
     | Zupdate(rf)::s ->
       (** The stack contains [Zupdate] marks only if in sharing mode *)
-        let () = update rf m.mark m.term in
+        let () = update rf (fconstr_mark m) m.term in
         zip rf s
     | Zprimitive(_op,c,rargs,kargs)::s ->
       let args = List.rev_append rargs (m::List.map snd kargs) in
-      let f = {mark = Red; term = FFlex (ConstKey c)} in
+      let f = make_fconstr Red (FFlex (ConstKey c)) in
       (* don't need to mkFApp because not a constructor *)
-      zip {mark=(neutr m.mark); term = FApp (f, Array.of_list args)} s
+      zip (make_fconstr (neutr (fconstr_mark m))
+             (FApp (f, Array.of_list args))) s
 
 let fapp_stack (m,stk) = zip m stk
 
@@ -805,7 +1052,7 @@ let strip_update_shift_absorb_app head stk =
         strip_rec (mkFApp h args) s
     | Zupdate(m)::s ->
       (** The stack contains [Zupdate] marks only if in sharing mode *)
-        let () = update m h.mark h.term in
+        let () = update m (fconstr_mark h) h.term in
         strip_rec m s
     | ((ZcaseT _ | Zproj _ | Zfix _ | Zprimitive _) :: _ | []) as stk ->
       (* depth and rstk only matter for cofix *)
@@ -822,7 +1069,7 @@ let strip_update_shift_app_red head stk =
         strip_rec (Zapp args :: rstk) (mkFApp h args) depth s
     | Zupdate(m)::s ->
       (** The stack contains [Zupdate] marks only if in sharing mode *)
-        let () = update m h.mark h.term in
+        let () = update m (fconstr_mark h) h.term in
         strip_rec rstk m depth s
     | ((ZcaseT _ | Zproj _ | Zfix _ | Zprimitive _) :: _ | []) as stk ->
       (* depth and rstk only matter for cofix *)
@@ -831,11 +1078,11 @@ let strip_update_shift_app_red head stk =
   strip_rec [] head 0 stk
 
 let strip_update_shift_app head stack =
-  assert (not (is_red head.mark));
+  assert (not (is_red (fconstr_mark head)));
   strip_update_shift_app_red head stack
 
 let get_nth_arg head n stk =
-  assert (not (is_red head.mark));
+  assert (not (is_red (fconstr_mark head)));
   let rec strip_rec rstk h n = function
     | Zshift(k) as e :: s ->
         strip_rec (e::rstk) (lift_fconstr k h) n s
@@ -852,7 +1099,7 @@ let get_nth_arg head n stk =
           (Some (stk', args.(n)), append_stack aft s')
     | Zupdate(m)::s ->
         (** The stack contains [Zupdate] mark only if in sharing mode *)
-        let () = update m h.mark h.term in
+        let () = update m (fconstr_mark h) h.term in
         strip_rec rstk m n s
     | ((ZcaseT _ | Zproj _ | Zfix _ | Zprimitive _) :: _ | []) as s -> (None, List.rev rstk @ s) in
   strip_rec [] head n stk
@@ -887,7 +1134,7 @@ let rec get_args n tys f e = function
           let etys = List.skipn na tys in
           get_args (n-na) etys f (usubs_consn l 0 na e) s
     | ((ZcaseT _ | Zproj _ | Zfix _ | Zprimitive _) :: _ | []) as stk ->
-      (Inr {mark=Cstr; term=FLambda(n,tys,f,e)}, stk)
+      (Inr (make_fconstr Cstr (FLambda (n, tys, f, e))), stk)
 
 (* Eta expansion: add a reference to implicit surrounding lambda at end of stack *)
 let rec eta_expand_stack info na = function
@@ -897,7 +1144,7 @@ let rec eta_expand_stack info na = function
   | [] ->
     let arg =
       if is_irrelevant info na.binder_relevance then mk_irrelevant
-      else {mark = Ntrl; term = FRel 1}
+      else make_fconstr Ntrl (FRel 1)
     in
     [Zshift 1; Zapp [|arg|]]
 
@@ -928,13 +1175,15 @@ let get_native_args op c stk =
            Zapp (Array.of_list eargs) :: s')
         | rnargs, kargs, _ ->
           (* head of h is not constructor -> no need to mkFApp *)
-          strip_rec rnargs {mark = h.mark;term=FApp(h, args)} depth kargs s'
+          strip_rec rnargs
+            (make_fconstr (fconstr_mark h) (FApp (h, args)))
+            depth kargs s'
       end
     | Zupdate(m) :: s ->
-      let () = update m h.mark h.term in
+      let () = update m (fconstr_mark h) h.term in
       strip_rec rnargs m depth  kargs s
     | (Zprimitive _ | ZcaseT _ | Zproj _ | Zfix _) :: _ | [] -> assert false
-  in strip_rec [] {mark = Red; term = FFlex(ConstKey c)} 0 kargs stk
+  in strip_rec [] (make_fconstr Red (FFlex (ConstKey c))) 0 kargs stk
 
 let get_native_args1 op c stk =
   match get_native_args op c stk with
@@ -1048,8 +1297,9 @@ let eta_expand_ind_stack env (ind,u) args m' =
       then raise Not_found (* partially applied constructor (missing non-param arguments) *)
     in
     let hstack = Array.map (fun (p,r) ->
-        { mark = Red; (* right can't be a constructor though *)
-          term = FProj (Projection.make p true, UVars.subst_instance_relevance u r, right) })
+        make_fconstr Red (* right can't be a constructor though *)
+          (FProj (Projection.make p true,
+             UVars.subst_instance_relevance u r, right)))
         projs
     in
     [Zapp argss], [Zapp hstack]
@@ -1068,13 +1318,11 @@ let contract_fix_vect fix =
     match [@ocaml.warning "-4"] fix with
       | FFix (((reci,i),(_,_,bds as rdcl)),env) ->
           (bds.(i),
-           (fun j -> { mark = Cstr;
-                       term = FFix (((reci,j),rdcl),env) }),
+           (fun j -> make_fconstr Cstr (FFix (((reci, j), rdcl), env))),
            env, Array.length bds)
       | FCoFix ((i,(_,_,bds as rdcl)),env) ->
           (bds.(i),
-           (fun j -> { mark = Cstr;
-                       term = FCoFix ((j,rdcl),env) }),
+           (fun j -> make_fconstr Cstr (FCoFix ((j, rdcl), env))),
            env, Array.length bds)
       | _ -> assert false
   in
@@ -1104,7 +1352,7 @@ module FNativeEntries =
 
     let mk_construct c =
       (* All constructors used in primitive functions are relevant *)
-      { mark = Cstr; term = FConstruct (UVars.in_punivs c, [||]) }
+      make_fconstr Cstr (FConstruct (UVars.in_punivs c, [||]))
 
     let get = Array.get
 
@@ -1128,7 +1376,7 @@ module FNativeEntries =
       | FArray (_u,t,_ty) -> t
       | _ -> assert false
 
-    let dummy = {mark = Ntrl; term = FRel 0}
+    let dummy = make_fconstr Ntrl (FRel 0)
 
     let current_retro = ref Retroknowledge.empty
     let defined_int = ref false
@@ -1138,7 +1386,7 @@ module FNativeEntries =
       match retro.Retroknowledge.retro_int63 with
       | Some c ->
         defined_int := true;
-        fint := { mark = Ntrl; term = FFlex (ConstKey (UVars.in_punivs c)) }
+        fint := make_fconstr Ntrl (FFlex (ConstKey (UVars.in_punivs c)))
       | None -> defined_int := false
 
     let defined_float = ref false
@@ -1148,7 +1396,7 @@ module FNativeEntries =
       match retro.Retroknowledge.retro_float64 with
       | Some c ->
         defined_float := true;
-        ffloat := { mark = Ntrl; term = FFlex (ConstKey (UVars.in_punivs c)) }
+        ffloat := make_fconstr Ntrl (FFlex (ConstKey (UVars.in_punivs c)))
       | None -> defined_float := false
 
     let defined_string = ref false
@@ -1158,7 +1406,7 @@ module FNativeEntries =
       match retro.Retroknowledge.retro_string with
       | Some c ->
         defined_string := true;
-        fstring := { mark = Ntrl; term = FFlex (ConstKey (UVars.in_punivs c)) }
+        fstring := make_fconstr Ntrl (FFlex (ConstKey (UVars.in_punivs c)))
       | None -> defined_string := false
 
     let defined_bool = ref false
@@ -1209,7 +1457,7 @@ module FNativeEntries =
         fLt := mk_construct cLt;
         fGt := mk_construct cGt;
         let (icmp, _) = cEq in
-        fcmp := { mark = Ntrl; term = FInd (UVars.in_punivs icmp) }
+        fcmp := make_fconstr Ntrl (FInd (UVars.in_punivs icmp))
       | None -> defined_cmp := false
 
     let defined_f_cmp = ref false
@@ -1318,15 +1566,15 @@ module FNativeEntries =
 
     let mkInt env i =
       check_int env;
-      { mark = Cstr; term = FInt i }
+      make_fconstr Cstr (FInt i)
 
     let mkFloat env f =
       check_float env;
-      { mark = Cstr; term = FFloat f }
+      make_fconstr Cstr (FFloat f)
 
     let mkString env s =
       check_string env;
-      { mark = Cstr; term = FString s }
+      make_fconstr Cstr (FString s)
 
     let mkBool env b =
       check_bool env;
@@ -1411,11 +1659,540 @@ module FNativeEntries =
 
     let mkArray env u t ty =
       check_array env;
-      { mark = Cstr; term = FArray (u,t,ty)}
+      make_fconstr Cstr (FArray (u, t, ty))
 
   end
 
 module FredNative = RedNative(FNativeEntries)
+
+(** Compact constructor view for registered monomorphic Peano naturals. *)
+let compact_peano_schemes info =
+  (Environ.retroknowledge (info_env info)).Retroknowledge.retro_peano_nat
+
+let compact_peano_beq_schemes info =
+  (Environ.retroknowledge (info_env info)).Retroknowledge.retro_peano_nat_beq
+
+let compact_peano_ble_schemes info =
+  (Environ.retroknowledge (info_env info)).Retroknowledge.retro_peano_nat_ble
+
+let compact_peano_of_scheme scheme peano_value =
+  Option.map (fun peano_double ->
+      { peano_ind = scheme.Retroknowledge.peano_inductive;
+        peano_zero = scheme.peano_zero;
+        peano_succ = scheme.peano_succ;
+        peano_double;
+        peano_value }) scheme.peano_double
+
+let same_peano_scheme a b = Ind.UserOrd.equal a.peano_ind b.peano_ind
+
+let peano_set_value n peano_value = { n with peano_value }
+
+let peano_succ_value v = PeanoNatValue.succ v
+let peano_double_value v = PeanoNatValue.double v
+let peano_bit_value ~one v = PeanoNatValue.bit ~one v
+
+type compact_peano_binary_operation = PeanoAdd | PeanoMul | PeanoPow | PeanoSub
+
+let compact_peano_binary_operation info c =
+  List.find_map (fun scheme ->
+      let matches = function
+        | Some operation when Constant.UserOrd.equal c operation -> true
+        | Some _ | None -> false
+      in
+      if matches scheme.Retroknowledge.peano_add then Some (scheme, PeanoAdd)
+      else if matches scheme.peano_mul then Some (scheme, PeanoMul)
+      else if matches scheme.peano_pow then Some (scheme, PeanoPow)
+      else if matches scheme.peano_sub then Some (scheme, PeanoSub)
+      else None)
+    (compact_peano_schemes info)
+
+type compact_peano_fueled_operation = PeanoDivGo | PeanoModGo
+
+let compact_peano_fueled_operation info c =
+  List.find_map (fun scheme ->
+      match List.find_opt (fun operation ->
+          Constant.UserOrd.equal c operation)
+          scheme.Retroknowledge.peano_div_go with
+      | Some _ -> Some (scheme, PeanoDivGo)
+      | None ->
+        Option.map (fun _ -> scheme, PeanoModGo)
+          (List.find_opt (fun operation ->
+            Constant.UserOrd.equal c operation)
+            scheme.Retroknowledge.peano_mod_go))
+    (compact_peano_schemes info)
+
+let rec compact_positive_of_fconstr pos_ind t =
+  match [@ocaml.warning "-4"] t.term with
+  | FCLOS (t, e) -> compact_positive_of_constr pos_ind e t
+  | FLIFT (_, t) -> compact_positive_of_fconstr pos_ind t
+  | FConstruct (((ind, ctor), u), args)
+    when Ind.UserOrd.equal ind pos_ind && UVars.Instance.is_empty u ->
+    begin match ctor, Array.length args with
+    | 1, 1 ->
+      Option.map (peano_bit_value ~one:true)
+        (compact_positive_of_fconstr pos_ind args.(0))
+    | 2, 1 ->
+      Option.map (peano_bit_value ~one:false)
+        (compact_positive_of_fconstr pos_ind args.(0))
+    | 3, 0 -> Some PeanoNatValue.one
+    | _ -> None
+    end
+  | FApp (head, args) when Int.equal (Array.length args) 1 ->
+    begin match [@ocaml.warning "-4"] head.term with
+    | FConstruct (c, noargs) when Array.is_empty noargs ->
+      compact_positive_of_fconstr pos_ind
+        (make_fconstr Red (FConstruct (c, args)))
+    | _ -> None
+    end
+  | _ -> None
+
+and compact_positive_of_constr pos_ind e t =
+  match [@ocaml.warning "-4"] kind t with
+  | Rel n -> begin
+    match clos_rel (fst e) n with
+    | Regular v -> compact_positive_of_fconstr pos_ind v
+    | HigherOrder _ -> None
+    end
+  | Cast (t, _, _) -> compact_positive_of_constr pos_ind e t
+  | Construct (c, u) ->
+    compact_positive_of_fconstr pos_ind
+      (make_fconstr Cstr
+         (FConstruct ((c, usubst_instance e u), [||])))
+  | App (head, args) ->
+    compact_positive_of_fconstr pos_ind
+      (make_fconstr Red (FApp (mk_clos e head, mk_clos_vect e args)))
+  | _ -> None
+
+let rec compact_N_of_fconstr n_ind pos_ind t =
+  match [@ocaml.warning "-4"] t.term with
+  | FCLOS (t, e) -> compact_N_of_constr n_ind pos_ind e t
+  | FLIFT (_, t) -> compact_N_of_fconstr n_ind pos_ind t
+  | FConstruct (((ind, ctor), u), args)
+    when Ind.UserOrd.equal ind n_ind && UVars.Instance.is_empty u ->
+    begin match ctor, Array.length args with
+    | 1, 0 -> Some PeanoNatValue.zero
+    | 2, 1 -> compact_positive_of_fconstr pos_ind args.(0)
+    | _ -> None
+    end
+  | FApp (head, args) when Int.equal (Array.length args) 1 ->
+    begin match [@ocaml.warning "-4"] head.term with
+    | FConstruct (c, noargs) when Array.is_empty noargs ->
+      compact_N_of_fconstr n_ind pos_ind
+        (make_fconstr Red (FConstruct (c, args)))
+    | _ -> None
+    end
+  | _ -> None
+
+and compact_N_of_constr n_ind pos_ind e t =
+  match [@ocaml.warning "-4"] kind t with
+  | Rel n -> begin
+    match clos_rel (fst e) n with
+    | Regular v -> compact_N_of_fconstr n_ind pos_ind v
+    | HigherOrder _ -> None
+    end
+  | Cast (t, _, _) -> compact_N_of_constr n_ind pos_ind e t
+  | Construct (c, u) ->
+    compact_N_of_fconstr n_ind pos_ind
+      (make_fconstr Cstr
+         (FConstruct ((c, usubst_instance e u), [||])))
+  | App (head, args) ->
+    compact_N_of_fconstr n_ind pos_ind
+      (make_fconstr Red (FApp (mk_clos e head, mk_clos_vect e args)))
+  | _ -> None
+
+let compact_peano_may_unfold_constant info c =
+  TransparentState.is_transparent_constant
+    (RedFlags.red_transparent info.i_flags) c &&
+  match info.i_cache.i_mode with
+  | Conversion -> true
+  | Reduction -> red_set info.i_flags fDELTA
+
+let rec compact_peano_of_fconstr info t =
+  match [@ocaml.warning "-4"] t.term with
+  | FPeanoNat n -> Some n
+  | FCLOS (t, e) -> compact_peano_of_constr info e t
+  | FLIFT (_, t) -> compact_peano_of_fconstr info t
+  | FConstruct ((c, u), args) when UVars.Instance.is_empty u ->
+    begin match Array.length args with
+    | 0 ->
+      List.find_map (fun scheme ->
+          if Construct.UserOrd.equal c scheme.Retroknowledge.peano_zero
+          then compact_peano_of_scheme scheme PeanoNatValue.zero
+          else None)
+        (compact_peano_schemes info)
+    | 1 ->
+      begin match [@ocaml.warning "-4"] args.(0).term with
+      | FPeanoNat arg when Construct.UserOrd.equal c arg.peano_succ ->
+        Some (peano_set_value arg (peano_succ_value arg.peano_value))
+      | _ -> None
+      end
+    | _ -> None
+    end
+  | FApp (head, args) when Int.equal (Array.length args) 5 ->
+    begin match [@ocaml.warning "-4"] head.term with
+    | FFlex (ConstKey (c, u)) when UVars.Instance.is_empty u ->
+      compact_peano_fueled_arguments info c args.(0) args.(2) args.(3)
+    | _ -> None
+    end
+  | FApp (head, args) when Int.equal (Array.length args) 2 ->
+    begin match [@ocaml.warning "-4"] head.term with
+    | FFlex (ConstKey (c, u)) when UVars.Instance.is_empty u ->
+      compact_peano_binary_arguments info c args.(0) args.(1)
+    | _ -> None
+    end
+  | FApp (head, args) when Int.equal (Array.length args) 1 ->
+    begin match [@ocaml.warning "-4"] head.term with
+    | FFlex (ConstKey (c, u)) when UVars.Instance.is_empty u ->
+      compact_peano_unary_constant info c args.(0)
+    | FConstruct (c, noargs) when Array.is_empty noargs ->
+      compact_peano_of_fconstr info
+        (make_fconstr Red (FConstruct (c, args)))
+    | _ -> None
+    end
+  | _ -> None
+
+and compact_peano_of_constr info e t =
+  match [@ocaml.warning "-4"] kind t with
+  | Rel n -> begin
+    match clos_rel (fst e) n with
+    | Regular v -> compact_peano_of_fconstr info v
+    | HigherOrder _ -> None
+    end
+  | Cast (t, _, _) -> compact_peano_of_constr info e t
+  | Construct (c, u) ->
+    let u = usubst_instance e u in
+    if not (UVars.Instance.is_empty u) then None
+    else
+      List.find_map (fun scheme ->
+          if Construct.UserOrd.equal c scheme.Retroknowledge.peano_zero
+          then compact_peano_of_scheme scheme PeanoNatValue.zero
+          else None)
+        (compact_peano_schemes info)
+  | App (head, args) when Int.equal (Array.length args) 5 ->
+    begin match [@ocaml.warning "-4"] kind head with
+    | Const (c, u) ->
+      let u = usubst_instance e u in
+      if not (UVars.Instance.is_empty u) ||
+         Option.is_empty (compact_peano_fueled_operation info c)
+      then None
+      else
+        compact_peano_fueled_arguments info c
+          (mk_clos e args.(0)) (mk_clos e args.(2)) (mk_clos e args.(3))
+    | _ -> None
+    end
+  | App (head, args) when Int.equal (Array.length args) 2 ->
+    begin match [@ocaml.warning "-4"] kind head with
+    | Const (c, u) ->
+      let u = usubst_instance e u in
+      if not (UVars.Instance.is_empty u) ||
+         Option.is_empty (compact_peano_binary_operation info c)
+      then None
+      else
+        compact_peano_binary_arguments info c
+          (mk_clos e args.(0)) (mk_clos e args.(1))
+    | _ -> None
+    end
+  | App (head, args) when Int.equal (Array.length args) 1 ->
+    begin match [@ocaml.warning "-4"] kind head with
+    | Construct (c, u) ->
+      let u = usubst_instance e u in
+      if not (UVars.Instance.is_empty u) then None
+      else
+        List.find_map (fun scheme ->
+            if Construct.UserOrd.equal c scheme.Retroknowledge.peano_succ
+            then Option.map
+              (fun arg ->
+                peano_set_value arg (peano_succ_value arg.peano_value))
+              (compact_peano_of_constr info e args.(0))
+            else None)
+          (compact_peano_schemes info)
+    | Const (c, u) ->
+      let u = usubst_instance e u in
+      if not (UVars.Instance.is_empty u) then None
+      else compact_peano_unary_constant info c (mk_clos e args.(0))
+    | _ -> None
+    end
+  | _ -> None
+
+and compact_peano_unary_constant info c arg =
+  if not (compact_peano_may_unfold_constant info c) then None
+  else compact_peano_unary_constant_unchecked info c arg
+
+and compact_peano_is_predecessor info scheme c =
+  let env = info_env info in
+  try
+    let body =
+      Environ.constant_value_in env (c, UVars.Instance.empty) in
+    match [@ocaml.warning "-4"] Constr.kind body with
+    | Lambda (_, domain, body) -> begin
+      match [@ocaml.warning "-4"] Constr.kind domain, Constr.kind body with
+      | Ind (ind, u),
+        Case (ci, case_u, params, _, NoInvert, scrutinee, branches)
+        when Ind.UserOrd.equal ind scheme.Retroknowledge.peano_inductive &&
+             UVars.Instance.is_empty u &&
+             Ind.UserOrd.equal ci.ci_ind scheme.peano_inductive &&
+             UVars.Instance.is_empty case_u &&
+             Int.equal ci.ci_npar 0 &&
+             Array.is_empty params &&
+             Int.equal (Array.length branches) 2 ->
+        let zero_binders, zero_body = branches.(0) in
+        let succ_binders, succ_body = branches.(1) in
+        begin match [@ocaml.warning "-4"] Constr.kind scrutinee,
+                    Constr.kind zero_body, Constr.kind succ_body with
+        | Rel 1, Construct (zero, zero_u), Rel 1 ->
+          Array.is_empty zero_binders &&
+          Int.equal (Array.length succ_binders) 1 &&
+          Construct.UserOrd.equal zero scheme.peano_zero &&
+          UVars.Instance.is_empty zero_u
+        | _ -> false
+        end
+      | _ -> false
+      end
+    | _ -> false
+  with Environ.NotEvaluableConst _ -> false
+
+and compact_peano_unary_constant_unchecked info c arg =
+  match compact_peano_of_fconstr info arg with
+  | Some arg when Constant.UserOrd.equal c arg.peano_double ->
+    Some (peano_set_value arg (peano_double_value arg.peano_value))
+  | Some arg ->
+    List.find_map (fun scheme ->
+        if Ind.UserOrd.equal arg.peano_ind
+             scheme.Retroknowledge.peano_inductive &&
+           compact_peano_is_predecessor info scheme c
+        then
+          let value = Option.default PeanoNatValue.zero
+            (PeanoNatValue.pred arg.peano_value) in
+          Some (peano_set_value arg value)
+        else None)
+      (compact_peano_schemes info)
+  | None ->
+    List.find_map (fun scheme ->
+        List.find_map (fun decoder ->
+            if Constant.UserOrd.equal c decoder.Retroknowledge.decoder_constant
+            then
+              Option.bind
+                (compact_N_of_fconstr decoder.binary_nat
+                  decoder.binary_positive arg)
+                (compact_peano_of_scheme scheme)
+            else None)
+          scheme.Retroknowledge.peano_decoders)
+      (compact_peano_schemes info)
+
+and compact_peano_binary_arguments info c left right =
+  if not (compact_peano_may_unfold_constant info c) then None
+  else compact_peano_binary_arguments_unchecked info c left right
+
+and compact_peano_binary_arguments_unchecked info c left right =
+  Option.bind (compact_peano_binary_operation info c)
+      (fun (scheme, operation) ->
+        Option.bind (compact_peano_of_fconstr info left) (fun left ->
+          Option.bind (compact_peano_of_fconstr info right) (fun right ->
+            if not (Ind.UserOrd.equal left.peano_ind scheme.peano_inductive) ||
+               not (same_peano_scheme left right)
+            then None
+            else
+              let value = match operation with
+              | PeanoAdd ->
+                Some (PeanoNatValue.add left.peano_value right.peano_value)
+              | PeanoMul ->
+                Some (PeanoNatValue.mul left.peano_value right.peano_value)
+              | PeanoPow ->
+                PeanoNatValue.pow left.peano_value right.peano_value
+              | PeanoSub ->
+                Some (PeanoNatValue.sub left.peano_value right.peano_value)
+              in
+              Option.map (peano_set_value left) value)))
+
+and compact_peano_fueled_arguments info c divisor fuel dividend =
+  if not (compact_peano_may_unfold_constant info c) then None
+  else compact_peano_fueled_arguments_unchecked info c divisor fuel dividend
+
+and compact_peano_fueled_arguments_unchecked info c divisor fuel dividend =
+  Option.bind (compact_peano_fueled_operation info c)
+    (fun (scheme, operation) ->
+      Option.bind (compact_peano_of_fconstr info divisor) (fun divisor ->
+        Option.bind (compact_peano_of_fconstr info fuel) (fun fuel ->
+          Option.bind (compact_peano_of_fconstr info dividend) (fun dividend ->
+            if not (Ind.UserOrd.equal divisor.peano_ind
+                      scheme.peano_inductive) ||
+               not (same_peano_scheme divisor fuel) ||
+               not (same_peano_scheme divisor dividend) ||
+               PeanoNatValue.is_zero divisor.peano_value ||
+               PeanoNatValue.compare dividend.peano_value fuel.peano_value >= 0
+            then None
+            else
+              let result = match operation with
+              | PeanoDivGo ->
+                PeanoNatValue.div dividend.peano_value divisor.peano_value
+              | PeanoModGo ->
+                PeanoNatValue.rem dividend.peano_value divisor.peano_value
+              in
+              Some (peano_set_value dividend result)))))
+
+let compact_peano_nat_constant info c args =
+  match compact_peano_fueled_operation info c with
+  | Some _ when Array.length args >= 5 ->
+    Option.map
+      (fun result ->
+        (make_fconstr Cstr (FPeanoNat result),
+         Array.sub args 5 (Array.length args - 5)))
+      (compact_peano_fueled_arguments_unchecked info c
+        args.(0) args.(2) args.(3))
+  | Some _ -> None
+  | None when Array.length args < 2 -> None
+  | None ->
+    Option.map
+      (fun result ->
+        (make_fconstr Cstr (FPeanoNat result),
+         Array.sub args 2 (Array.length args - 2)))
+      (compact_peano_binary_arguments_unchecked info c args.(0) args.(1))
+
+(** A closed unary numeral is exposed one constructor at a time by ordinary
+    weak-head reduction.  Repackage that spine as a compact value so that an
+    operation can combine a small eagerly decoded literal with a large compact
+    one.  Only constructors from the registered Peano scheme are accepted. *)
+let rec compact_peano_after_reducing info reduce arg =
+  Control.check_for_interrupt ();
+  let arg = reduce arg in
+  match compact_peano_of_fconstr info arg with
+  | Some result -> Some result
+  | None -> begin
+    match [@ocaml.warning "-4"] arg.term with
+    | FConstruct ((succ, u), args)
+      when UVars.Instance.is_empty u && Int.equal (Array.length args) 1 ->
+      Option.bind (compact_peano_after_reducing info reduce args.(0))
+        (fun pred ->
+          if Construct.UserOrd.equal succ pred.peano_succ then
+            Some (peano_set_value pred (peano_succ_value pred.peano_value))
+          else None)
+    | _ -> None
+    end
+
+let compact_peano_reduced_fconstr info reduce arg =
+  Option.map
+    (fun result -> make_fconstr Cstr (FPeanoNat result))
+    (compact_peano_after_reducing info reduce arg)
+
+let compact_peano_nat_constant_after_reducing_args info reduce c args =
+  if Array.length args < 2 then None
+  else match compact_peano_binary_operation info c with
+  | Some (_, PeanoSub) ->
+    begin match compact_peano_after_reducing info reduce args.(1) with
+    | Some right when not (PeanoNatValue.is_zero right.peano_value) ->
+      let reduced_args = Array.copy args in
+      begin match compact_peano_after_reducing info reduce args.(0) with
+      | Some left ->
+        reduced_args.(0) <- make_fconstr Cstr (FPeanoNat left);
+        reduced_args.(1) <- make_fconstr Cstr (FPeanoNat right);
+        compact_peano_nat_constant info c reduced_args
+      | None -> None
+      end
+    | Some _ | None -> None
+    end
+  | Some (_, (PeanoAdd | PeanoMul | PeanoPow)) ->
+    begin match compact_peano_reduced_fconstr info reduce args.(0) with
+    | None -> None
+    | Some left ->
+      begin match compact_peano_reduced_fconstr info reduce args.(1) with
+      | None -> None
+      | Some right ->
+        let reduced_args = Array.copy args in
+        reduced_args.(0) <- left;
+        reduced_args.(1) <- right;
+        compact_peano_nat_constant info c reduced_args
+      end
+    end
+  | None -> None
+
+let compact_peano_nat_unary_constant info c args =
+  if Array.is_empty args then None
+  else
+    Option.map
+      (fun result ->
+        (make_fconstr Cstr (FPeanoNat result),
+         Array.sub args 1 (Array.length args - 1)))
+      (compact_peano_unary_constant_unchecked info c args.(0))
+
+let compact_peano_bool_operation info c =
+  let find entries compare =
+    Option.map
+      (fun op ->
+        op.Retroknowledge.bool_op_inductive,
+        op.bool_op_false, op.bool_op_true, compare)
+      (List.find_opt
+        (fun op -> Constant.UserOrd.equal c
+          op.Retroknowledge.bool_op_constant)
+        entries)
+  in
+  match find (compact_peano_beq_schemes info) PeanoNatValue.equal with
+  | Some _ as operation -> operation
+  | None -> find (compact_peano_ble_schemes info) PeanoNatValue.le
+
+let compact_peano_bool_constant info c args =
+  if Array.length args < 2 then None
+  else
+    let operation = compact_peano_bool_operation info c in
+    Option.bind operation (fun (ind, false_ctor, true_ctor, compare) ->
+      let left = compact_peano_of_fconstr info args.(0) in
+      let right = compact_peano_of_fconstr info args.(1) in
+      Option.bind left (fun left ->
+        Option.bind right (fun right ->
+          if not (Ind.UserOrd.equal ind left.peano_ind) ||
+             not (same_peano_scheme left right)
+          then None
+          else
+            let ctor =
+              if compare left.peano_value right.peano_value
+              then true_ctor else false_ctor
+            in
+            Some
+              (make_fconstr Cstr
+                 (FConstruct ((ctor, UVars.Instance.empty), [||])),
+               Array.sub args 2 (Array.length args - 2)))))
+
+let registered_peano_bool_fix info fx =
+  let env = info_env info in
+  (* [fx] may close over irrelevant proof arguments.  Reifying such a closure
+     is both unnecessary and invalid: conversion deliberately represents
+     those arguments by [FIrrelevant], which is not a kernel term.  Registered
+     Peano operations are monomorphic, so their original fixpoint syntax is
+     sufficient to identify the validated definition independently of the
+     closure substitution. *)
+  match [@ocaml.warning "-4"] fterm_of fx with
+  | FFix (fixpoint, _) ->
+    let body = Constr.mkFix fixpoint in
+    let find entries =
+      List.find_map
+        (fun op ->
+          try
+            let registered =
+              Environ.constant_value_in env
+                (op.Retroknowledge.bool_op_constant, UVars.Instance.empty)
+            in
+            if Constr.equal body registered then
+              Some op.Retroknowledge.bool_op_constant
+            else None
+          with Environ.NotEvaluableConst _ -> None)
+        entries
+    in
+    (match find (compact_peano_beq_schemes info) with
+    | Some _ as operation -> operation
+    | None -> find (compact_peano_ble_schemes info))
+  | _ -> None
+
+let compact_peano_bool_fix info fx =
+  Option.bind (registered_peano_bool_fix info fx) (fun c ->
+    compact_peano_bool_operation info c)
+
+let rec compact_peano_application_stack = function
+  | ((Zupdate _ | Zshift _) as frame) :: rest ->
+    Option.map
+      (fun (args, rebuild) -> args, fun remaining -> frame :: rebuild remaining)
+      (compact_peano_application_stack rest)
+  | Zapp args :: rest ->
+    Some (args, fun remaining -> append_stack remaining rest)
+  | (ZcaseT _ | Zproj _ | Zfix _ | Zprimitive _) :: _ | [] -> None
 
 let rec skip_irrelevant_stack info stk = match stk with
 | [] -> []
@@ -1430,7 +2207,7 @@ let rec skip_irrelevant_stack info stk = match stk with
 | Zprimitive _ :: _ -> assert false (* no irrelevant primitives so far *)
 | Zupdate m :: s ->
   (** The stack contains [Zupdate] marks only if in sharing mode *)
-  let () = update m mk_irrelevant.mark mk_irrelevant.term in
+  let () = update m (fconstr_mark mk_irrelevant) mk_irrelevant.term in
   skip_irrelevant_stack info s
 
 let is_irrelevant_constructor infos ((ind,_),u) =
@@ -1467,7 +2244,12 @@ let rec knh info m stk =
       (match unfold_projection info p r with
        | None -> (m, stk)
        | Some s -> knh info c (s :: zupdate info m stk))
-    | FConstruct _ -> strip_update_shift_absorb_app m stk
+    | FPeanoNat n when not (Int.equal (stack_args_size stk) 0) ->
+      (** [FConstruct] can absorb application frames, whereas a compact value
+          already represents a saturated constructor spine.  Expose one
+          constructor before ordinary reduction rebuilds such an application. *)
+      knh info (peano_constructor_view n) stk
+    | FConstruct _ | FPeanoNat _ -> strip_update_shift_absorb_app m stk
 
 (* cases where knh stops *)
     | (FFlex _|FLetIn _|FEvar _|FCaseInvert _|FIrrelevant|
@@ -1477,7 +2259,10 @@ let rec knh info m stk =
 
 (* The same for pure terms *)
 and knht info e t stk =
-  match kind t with
+  match compact_peano_of_constr info e t with
+  | Some n ->
+    knh info (make_fconstr Cstr (FPeanoNat n)) stk
+  | None -> match kind t with
   | Rel n ->
     begin match clos_rel (fst e) n with
     | Regular v -> knh info v stk
@@ -1508,30 +2293,30 @@ and knht info e t stk =
         (mk_irrelevant, skip_irrelevant_stack info stk)
       else
         let term = FCaseInvert (ci, u, pms, p, (Array.map (mk_clos e) indices), mk_clos e t, br, e) in
-        { mark = Red; term }, stk
+        make_fconstr Red term, stk
     | Fix (((_, n), (lna, _, _)) as fx) ->
       if is_irrelevant info (usubst_relevance e (lna.(n)).binder_relevance) then
         (mk_irrelevant, skip_irrelevant_stack info stk)
       else
-        knh info { mark = Cstr; term = FFix (fx, e) } stk
+        knh info (make_fconstr Cstr (FFix (fx, e))) stk
     | Cast(a,_,_) -> knht info e a stk
     | Proj (p, r, c) ->
       let r = usubst_relevance e r in
       if is_irrelevant info r then
         (mk_irrelevant, skip_irrelevant_stack info stk)
       else begin match unfold_projection info p r with
-      | None -> ({ mark = Red; term = FProj (p, r, mk_clos e c) }, stk)
+      | None -> (make_fconstr Red (FProj (p, r, mk_clos e c)), stk)
       | Some s -> knht info e c (s :: stk)
       end
     | Construct _ -> knh info (mk_clos e t) stk
     | (Ind _|Const _|Var _|Meta _ | Sort _ | Int _|Float _|String _) -> (mk_clos e t, stk)
     | CoFix cfx ->
-      { mark = Cstr; term = FCoFix (cfx,e) }, stk
-    | Lambda _ -> { mark = Cstr ; term = mk_lambda e t }, stk
+      make_fconstr Cstr (FCoFix (cfx, e)), stk
+    | Lambda _ -> make_fconstr Cstr (mk_lambda e t), stk
     | Prod (n, t, c) ->
-      { mark = Ntrl; term = FProd (n, mk_clos e t, c, e) }, stk
+      make_fconstr Ntrl (FProd (n, mk_clos e t, c, e)), stk
     | LetIn (n,b,t,c) ->
-      { mark = Red; term = FLetIn (n, mk_clos e b, mk_clos e t, c, e) }, stk
+      make_fconstr Red (FLetIn (n, mk_clos e b, mk_clos e t, c, e)), stk
     | Evar ev ->
       begin match info.i_cache.i_sigma.evar_expand ev with
       | EvarDefined c -> knht info e c stk
@@ -1541,7 +2326,7 @@ and knht info e t stk =
           (mk_irrelevant, skip_irrelevant_stack info stk)
         else
           let repack = info.i_cache.i_sigma.evar_repack in
-          { mark = Ntrl; term = FEvar (evk, args, e, repack) }, stk
+          make_fconstr Ntrl (FEvar (evk, args, e, repack)), stk
       end
     | Array(u,t,def,ty) ->
       let u = usubst_instance e u in
@@ -1549,7 +2334,7 @@ and knht info e t stk =
       let ty = mk_clos e ty in
       let t = Parray.init (Uint63.of_int len) (fun i -> mk_clos e t.(i)) (mk_clos e def) in
       let term = FArray (u,t,ty) in
-      knh info { mark = Cstr; term } stk
+      knh info (make_fconstr Cstr term) stk
 
 (************************************************************************)
 
@@ -1752,12 +2537,12 @@ and match_elim : 'a. ('a, 'a depth) reduction -> _ -> _ -> pat_state:'a depth ->
       match_main red info tab ~pat_state states loc
   | Zshift k :: s -> match_elim red info tab ~pat_state next depth states elims (lift_fconstr k head) s
   | Zupdate m :: s ->
-      let () = update m head.mark head.term in
+      let () = update m (fconstr_mark head) head.term in
       match_elim red info tab ~pat_state next depth states elims head s
   | ZcaseT (ci, u, pms, ((pctx, p), _ as pred), brs, e) :: s ->
       let t = FCaseT (ci, u, pms, pred, head, brs, e) in
-      let mark = neutr head.mark in
-      let head = {mark; term=t} in
+      let mark = neutr (fconstr_mark head) in
+      let head = make_fconstr mark t in
       let prets, pbrss, elims, states = extract_or_kill4 (function [@ocaml.warning "-4"]
       | PECase (pind, pret, pbrs) :: es, subst ->
         if not @@ QInd.equal (info_env info) pind ci.ci_ind then None else
@@ -1796,8 +2581,10 @@ and match_elim : 'a. ('a, 'a depth) reduction -> _ -> _ -> pat_state:'a depth ->
       let loc = LocArg { patterns = prets; depth = pdepth + depth; arg = mk_clos pred_e p; next = loc } in
       match_main red info tab ~pat_state states loc
   | Zproj (proj', r) :: s ->
-      let mark = (neutr head.mark) in
-      let head = {mark; term=FProj(Projection.make proj' true, r, head)} in
+      let mark = neutr (fconstr_mark head) in
+      let head =
+        make_fconstr mark (FProj (Projection.make proj' true, r, head))
+      in
       let elims, states = extract_or_kill2 (function [@ocaml.warning "-4"]
       | PEProj proj :: es, subst ->
         if not @@ QProjection.Repr.equal (info_env info) proj proj' then None else
@@ -1967,7 +2754,7 @@ let match_symbol red info tab ~pat_state fl (u, b, r) stk =
       | None -> Dead, Ignore
     ) (Array.of_list r)
   in
-  let m = { mark = Red; term = FFlex fl } in
+  let m = make_fconstr Red (FFlex fl) in
   let loc = LocStart { elims; depth=0; head = m; stack = stk; next = Return (unfold_fix, m, stk) } in
   match_main red info tab ~pat_state states loc
 
@@ -1979,7 +2766,8 @@ end
 type 'a depth = 'a RedPattern.depth
 
 (* Computes a weak head normal form from the result of knh. *)
-let rec knr info tab ~pat_state m stk =
+let rec knr : type a. _ -> _ -> pat_state:a depth -> _ -> _ -> a =
+  fun info tab ~pat_state m stk ->
   match m.term with
   | FLambda(n,tys,f,e) when red_set info.i_flags fBETA ->
       (match get_args n tys f e stk with
@@ -1987,7 +2775,99 @@ let rec knr info tab ~pat_state m stk =
         | Inr lam, s -> knr_ret info tab ~pat_state (lam,s))
   | FFlex fl when red_set info.i_flags fDELTA ->
       (match Table.lookup info tab fl with
-        | Def (v, _) -> kni info tab ~pat_state v stk
+        | Def (v, _) -> begin
+          match [@ocaml.warning "-4"] fl,
+                compact_peano_application_stack stk with
+          | ConstKey (c, _), Some (args, rebuild) -> begin
+            let compact_nat =
+              match compact_peano_nat_constant info c args with
+              | Some _ as result -> result
+              | None when Array.length args >= 5 &&
+                  not (Option.is_empty (compact_peano_fueled_operation info c)) ->
+                let reds = RedFlags.(red_add_transparent all
+                    (red_transparent (info_flags info))) in
+                let reduction_info = { info with i_flags = reds } in
+                let reduce arg =
+                  fapp_stack
+                    (kni reduction_info tab
+                      ~pat_state:(RedPattern.Nil No) arg [])
+                in
+                begin match
+                  compact_peano_reduced_fconstr info reduce args.(0),
+                  compact_peano_reduced_fconstr info reduce args.(2),
+                  compact_peano_reduced_fconstr info reduce args.(3)
+                with
+                | Some divisor, Some fuel, Some dividend ->
+                  let reduced_args = Array.copy args in
+                  reduced_args.(0) <- divisor;
+                  reduced_args.(2) <- fuel;
+                  reduced_args.(3) <- dividend;
+                  compact_peano_nat_constant info c reduced_args
+                | _ -> None
+                end
+              | None when Array.length args >= 2 -> begin
+                let reds = RedFlags.(red_add_transparent all
+                    (red_transparent (info_flags info))) in
+                let reduction_info = { info with i_flags = reds } in
+                let reduce arg =
+                  fapp_stack
+                    (kni reduction_info tab
+                      ~pat_state:(RedPattern.Nil No) arg [])
+                in
+                compact_peano_nat_constant_after_reducing_args
+                  info reduce c args
+                end
+              | None -> None
+            in
+            match compact_nat with
+            | Some (result, remaining) ->
+              kni info tab ~pat_state result (rebuild remaining)
+            | None -> begin
+              match compact_peano_nat_unary_constant info c args with
+              | Some (result, remaining) ->
+                kni info tab ~pat_state result (rebuild remaining)
+              | None -> begin
+                let compact_bool =
+                  match compact_peano_bool_constant info c args with
+                  | Some _ as result -> result
+                  | None when Array.length args >= 2 &&
+                      not (Option.is_empty
+                        (compact_peano_bool_operation info c)) ->
+                    let reds = RedFlags.(red_add_transparent all
+                        (red_transparent (info_flags info))) in
+                    let reduction_info = { info with i_flags = reds } in
+                    let reduce arg =
+                      fapp_stack
+                        (kni reduction_info tab
+                          ~pat_state:(RedPattern.Nil No) arg [])
+                    in
+                    begin match
+                      compact_peano_reduced_fconstr info reduce args.(0)
+                    with
+                    | None -> None
+                    | Some left ->
+                      begin match
+                        compact_peano_reduced_fconstr info reduce args.(1)
+                      with
+                      | None -> None
+                      | Some right ->
+                        let reduced_args = Array.copy args in
+                        reduced_args.(0) <- left;
+                        reduced_args.(1) <- right;
+                        compact_peano_bool_constant info c reduced_args
+                      end
+                    end
+                  | None -> None
+                in
+                match compact_bool with
+                | Some (result, remaining) ->
+                  kni info tab ~pat_state result (rebuild remaining)
+                | None -> kni info tab ~pat_state v stk
+                end
+              end
+            end
+          | _ -> kni info tab ~pat_state v stk
+          end
         | Primitive op ->
           if check_native_args op stk then
             let c = match fl with ConstKey c -> c | RelKey _ | VarKey _ -> assert false in
@@ -2021,6 +2901,47 @@ let rec knr info tab ~pat_state m stk =
         knr_ret info tab ~pat_state (mk_irrelevant, skip_irrelevant_stack info stk)
       else
         knr_ret info tab ~pat_state (m, stk)
+    end
+  | FPeanoNat n ->
+    let use_match = red_set info.i_flags fMATCH in
+    let use_fix = red_set info.i_flags fFIX in
+    let expose () =
+      kni info tab ~pat_state (peano_constructor_view n) stk
+    in
+    let fast_registered_bool_fix () =
+      match [@ocaml.warning "-4"] stk with
+      | Zfix (fx, []) :: Zapp args :: s when not (Array.is_empty args) ->
+        let other = compact_peano_of_fconstr info args.(0) in
+        let operation = compact_peano_bool_fix info fx in
+        Option.bind other (fun other ->
+          Option.bind operation
+            (fun (ind, false_ctor, true_ctor, compare) ->
+              if not (Ind.UserOrd.equal ind n.peano_ind) ||
+                 not (same_peano_scheme n other)
+              then None
+              else
+                let ctor =
+                  if compare n.peano_value other.peano_value
+                  then true_ctor else false_ctor
+                in
+                let remaining =
+                  Array.sub args 1 (Array.length args - 1)
+                in
+                Some (kni info tab ~pat_state
+                  (make_fconstr Cstr
+                    (FConstruct
+                      ((ctor, UVars.Instance.empty), [||])))
+                  (append_stack remaining s))))
+      | _ -> None
+    in
+    begin match [@ocaml.warning "-4"] stk with
+    | ZcaseT _ :: _ when use_match -> expose ()
+    | Zfix _ :: _ when use_fix -> begin
+      match fast_registered_bool_fix () with
+      | Some result -> result
+      | None -> expose ()
+      end
+    | _ -> knr_ret info tab ~pat_state (m, stk)
     end
   | FCoFix ((i, (lna, _, _)), e) ->
     if is_irrelevant info (usubst_relevance e (lna.(i)).binder_relevance) then
@@ -2085,10 +3006,12 @@ and knr_ret : type a. _ -> _ -> pat_state: a depth -> ?failed: _ -> _ -> a =
       match b with No -> i | Yes -> if failed then None else Some i
 
 (* Computes the weak head normal form of a term *)
-and kni info tab ~pat_state m stk =
+and kni : type a. _ -> _ -> pat_state:a depth -> _ -> _ -> a =
+  fun info tab ~pat_state m stk ->
   let (hm,s) = knh info m stk in
   knr info tab ~pat_state hm s
-and knit info tab ~pat_state e t stk =
+and knit : type a. _ -> _ -> pat_state:a depth -> _ -> _ -> _ -> a =
+  fun info tab ~pat_state e t stk ->
   let (ht,s) = knht info e t stk in
   knr info tab ~pat_state ht s
 
@@ -2139,8 +3062,8 @@ let kh info tab v stk = fapp_stack(kni info tab v stk)
       calls itself recursively. *)
 
 let is_val v = match v.term with
-| FAtom _ | FRel _   | FInd _ | FConstruct (_,[||]) | FInt _ | FFloat _ | FString _ -> true
-| FFlex _ -> v.mark == Ntrl
+| FAtom _ | FRel _   | FInd _ | FConstruct (_,[||]) | FInt _ | FFloat _ | FString _ | FPeanoNat _ -> true
+| FFlex _ -> fconstr_mark v == Ntrl
 | FConstruct _ | FApp _ | FProj _ | FFix _ | FCoFix _ | FCaseT _ | FCaseInvert _ | FLambda _
 | FProd _ | FLetIn _ | FEvar _ | FArray _ | FLIFT _ | FCLOS _ -> false
 | FIrrelevant | FLOCKED -> assert false
@@ -2159,7 +3082,9 @@ and klt info tab e t = match kind t with
   | Inl (n, Regular mt) -> kl info tab @@ lift_fconstr n mt
   | Inl (_, HigherOrder (nargs, term)) -> assert (Int.equal nargs 0); kl info tab term
   | Inr (k, None) -> if Int.equal k i then t else mkRel k
-  | Inr (k, Some p) -> kl info tab @@ lift_fconstr (k-p) {mark=Red;term=FFlex(RelKey p)}
+  | Inr (k, Some p) ->
+    kl info tab @@
+      lift_fconstr (k - p) (make_fconstr Red (FFlex (RelKey p)))
   end
 | App (hd, args) ->
   let is_stuck = match kind hd with
@@ -2255,7 +3180,7 @@ and norm_head info tab m =
       | FConstruct (c,args) -> mkApp (mkConstructU c, Array.map (kl info tab) args)
       | FLOCKED | FRel _ | FAtom _ | FFlex _ | FInd _
       | FApp _ | FCaseT _ | FCaseInvert _ | FLIFT _ | FCLOS _ | FInt _
-      | FFloat _ | FString _ -> term_of_fconstr m
+      | FFloat _ | FString _ | FPeanoNat _ -> term_of_fconstr m
       | FIrrelevant -> assert false (* only introduced when converting *)
 
 and zip_term info tab m stk = match stk with
@@ -2299,7 +3224,7 @@ let whd_val info tab v = term_of_fconstr (kh info tab v [])
 let norm_val info tab v = kl info tab v
 let norm_term info tab e t = klt info tab e t
 
-let whd_stack infos tab m stk = match m.mark with
+let whd_stack infos tab m stk = match fconstr_mark m with
 | Ntrl ->
   (** No need to perform [kni] nor to unlock updates because
       every head subterm of [m] is [Ntrl] *)
@@ -2331,7 +3256,85 @@ let infos_with_reds infos reds =
 
 let unfold_ref_with_args infos tab fl v =
   match Table.lookup infos tab fl with
-  | Def (def, _) -> Some (def, v)
+  | Def (def, _) -> begin
+    match [@ocaml.warning "-4"] fl, compact_peano_application_stack v with
+    | ConstKey (c, u), Some (args, rebuild) when UVars.Instance.is_empty u ->
+      let compact_nat =
+        match compact_peano_nat_constant infos c args with
+        | Some _ as result -> result
+        | None when Array.length args >= 5 &&
+            not (Option.is_empty (compact_peano_fueled_operation infos c)) ->
+          let reds = RedFlags.(red_add_transparent all
+              (red_transparent (info_flags infos))) in
+          let reduction_infos = infos_with_reds infos reds in
+          let reduce arg = kh reduction_infos tab arg [] in
+          (* Fuel is commonly [S dividend]. Head reduction alone leaves its
+             predecessor unevaluated, so use the same compact numeral probe
+             as the reduction machine before deciding to unfold the worker. *)
+          begin match
+            compact_peano_reduced_fconstr infos reduce args.(0),
+            compact_peano_reduced_fconstr infos reduce args.(2),
+            compact_peano_reduced_fconstr infos reduce args.(3)
+          with
+          | Some divisor, Some fuel, Some dividend ->
+            let reduced_args = Array.copy args in
+            reduced_args.(0) <- divisor;
+            reduced_args.(2) <- fuel;
+            reduced_args.(3) <- dividend;
+            compact_peano_nat_constant infos c reduced_args
+          | _ -> None
+          end
+        | None when Array.length args >= 2 ->
+          let reds = RedFlags.(red_add_transparent all
+              (red_transparent (info_flags infos))) in
+          let reduction_infos = infos_with_reds infos reds in
+          let reduce arg = kh reduction_infos tab arg [] in
+          compact_peano_nat_constant_after_reducing_args infos
+            reduce c args
+        | None -> None
+      in
+      begin match compact_nat with
+      | Some (result, remaining) -> Some (result, rebuild remaining)
+      | None -> begin
+        match compact_peano_nat_unary_constant infos c args with
+        | Some (result, remaining) -> Some (result, rebuild remaining)
+        | None -> begin
+          let compact_bool =
+            match compact_peano_bool_constant infos c args with
+            | Some _ as result -> result
+            | None when Array.length args >= 2 &&
+                not (Option.is_empty
+                  (compact_peano_bool_operation infos c)) ->
+              let reds = RedFlags.(red_add_transparent all
+                  (red_transparent (info_flags infos))) in
+              let reduction_infos = infos_with_reds infos reds in
+              let reduce arg = kh reduction_infos tab arg [] in
+              begin match
+                compact_peano_reduced_fconstr infos reduce args.(0)
+              with
+              | None -> None
+              | Some left ->
+                begin match
+                  compact_peano_reduced_fconstr infos reduce args.(1)
+                with
+                | None -> None
+                | Some right ->
+                  let reduced_args = Array.copy args in
+                  reduced_args.(0) <- left;
+                  reduced_args.(1) <- right;
+                  compact_peano_bool_constant infos c reduced_args
+                end
+              end
+            | None -> None
+          in
+          match compact_bool with
+          | Some (result, remaining) -> Some (result, rebuild remaining)
+          | None -> Some (def, v)
+          end
+        end
+      end
+    | _ -> Some (def, v)
+    end
   | Primitive op when check_native_args op v ->
     let c = match [@ocaml.warning "-4"] fl with ConstKey c -> c | _ -> assert false in
     let rargs, a, nargs, v = get_native_args1 op c v in
