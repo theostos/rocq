@@ -561,6 +561,17 @@ which reduction engine to use.  See :ref:`type-cast`.)  For example:
       affects the reduction procedure used by the kernel when
       typechecking. By default sharing is activated.
 
+   .. flag:: Kernel Binary Peano
+
+      Enables experimental binary evaluation of registered Peano arithmetic
+      in lazy reduction and kernel conversion. This flag is off by default;
+      registering an operation does not enable it.
+
+      The evaluator uses Zarith and preserves zero/successor elimination.
+      Unrecognized computations use ordinary reduction. Zarith and the
+      registration checks are part of the trusted implementation when enabled.
+      The standalone checker requires its own ``-binary-peano`` opt-in.
+
    .. flag:: Kernel Conversion Dep Heuristic
 
       This flag controls a heuristic used during conversion when comparing

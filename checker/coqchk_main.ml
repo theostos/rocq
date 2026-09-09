@@ -155,6 +155,8 @@ let indices_matter = ref false
 
 let enable_vm = ref false
 
+let binary_peano = ref false
+
 let output_context = ref false
 
 let warn_no_bytecode =
@@ -167,6 +169,7 @@ let make_senv () =
   let senv = Safe_typing.empty_environment in
   let senv = Safe_typing.set_impredicative_set !impredicative_set senv in
   let senv = Safe_typing.set_indices_matter !indices_matter senv in
+  let senv = Safe_typing.set_binary_peano !binary_peano senv in
   let senv =
     if !enable_vm && not Coq_config.bytecode_compiler then begin
       warn_no_bytecode ();
@@ -234,6 +237,7 @@ let print_usage_channel co command =
 \n  -indices-matter             levels of indices (and nonuniform parameters)\
 \n                              contribute to the level of inductives\
 \n  -bytecode-compiler (yes|no) enable the vm_compute reduction machine (default is no)\
+\n  -binary-peano               enable experimental binary Peano reduction (default is off)\
 \n\
 \n  -h, --help                  print this list of options\
 \n"
@@ -385,6 +389,8 @@ let parse_args argv =
       enable_vm := true; parse rem
     | "-bytecode-compiler" :: "no" :: rem ->
       enable_vm := false; parse rem
+    | "-binary-peano" :: rem ->
+      binary_peano := true; parse rem
 
     | "-coqlib" :: s :: rem ->
       if not (exists_dir s) then

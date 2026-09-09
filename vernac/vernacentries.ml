@@ -1948,6 +1948,14 @@ let () =
       optwrite = Global.set_unfold_dep_heuristic }
 
 let () =
+  declare_bool_option
+    { optstage = Summary.Stage.Interp;
+      optdepr  = None;
+      optkey   = ["Kernel"; "Binary"; "Peano"];
+      optread  = (fun () -> (Global.typing_flags ()).Declarations.binary_peano);
+      optwrite = Global.set_binary_peano }
+
+let () =
   declare_int_option
     { optstage = Summary.Stage.Interp;
       optdepr  = None;

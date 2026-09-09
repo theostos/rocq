@@ -310,6 +310,7 @@ let set_typing_flags flags senv =
             {(Environ.typing_flags senv.env) with
              conv_oracle = flags.conv_oracle;
              share_reduction = flags.share_reduction;
+             binary_peano = flags.binary_peano;
             })
   then CErrors.user_err Pp.(str "Changing typing flags inside sections is not allowed.");
   set_typing_flags flags senv
@@ -340,6 +341,10 @@ let set_share_reduction b senv =
 let set_unfold_dep_heuristic b senv =
   let flags = Environ.typing_flags senv.env in
   set_typing_flags { flags with unfold_dep_heuristic = b } senv
+
+let set_binary_peano b senv =
+  let flags = Environ.typing_flags senv.env in
+  set_typing_flags { flags with binary_peano = b } senv
 
 let set_VM b senv =
   let flags = Environ.typing_flags senv.env in
@@ -380,6 +385,7 @@ let stricter_flags f1 f2 =
     conv_oracle = _;
     share_reduction = _;
     unfold_dep_heuristic = _;
+    binary_peano = _;
     enable_VM = _;
     enable_native_compiler = _;
   } = f1
@@ -397,6 +403,7 @@ let stricter_flags f1 f2 =
     conv_oracle = _;
     share_reduction = _;
     unfold_dep_heuristic = _;
+    binary_peano = _;
     enable_VM = _;
     enable_native_compiler = _;
   } = f2

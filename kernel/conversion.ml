@@ -304,12 +304,12 @@ let rec compare_under e1 c1 e2 c2 =
   match Constr.kind c1, Constr.kind c2 with
   | Cast (c1, _, _), _ -> compare_under e1 c1 e2 c2
   | _, Cast (c2, _, _) -> compare_under e1 c1 e2 c2
-  | Rel i, Rel j -> begin match Esubst.expand_rel i (fst e1) with
-      | Inl _ -> false
-      | Inr (k, _) -> begin match Esubst.expand_rel j (fst e2) with
-          | Inl _ -> false
-          | Inr (k', _) -> Int.equal k k'
-        end
+  | Rel i, Rel j -> begin
+      match Esubst.expand_rel i (fst e1), Esubst.expand_rel j (fst e2) with
+      | Inl _, Inl _ ->
+        CClosure.equal_binary_peano_rel e1 i e2 j
+      | Inr (k, _), Inr (k', _) -> Int.equal k k'
+      | (Inl _ | Inr _), _ -> false
     end
   | Meta m1, Meta m2 -> Int.equal m1 m2
   | Var id1, Var id2 -> Id.equal id1 id2
@@ -651,6 +651,20 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
             let hd2 = eta_expand_ind env pind2 in
             eqappr cv_pb l2r infos (lft1,(hd1,v1)) (lft2,(hd2,v2)) cuniv
       else raise NotConvertible
+
+    | FPeanoNat n1, FPeanoNat n2 ->
+       if Ind.UserOrd.equal n1.peano_ind n2.peano_ind &&
+          CClosure.PeanoNatValue.equal n1.peano_value n2.peano_value
+       then convert_stacks l2r infos lft1 lft2 v1 v2 cuniv
+       else raise NotConvertible
+
+    | FPeanoNat n1, _ ->
+       eqwhnf cv_pb l2r infos
+         (lft1, (CClosure.peano_constructor_view n1, v1)) appr2 cuniv
+
+    | _, FPeanoNat n2 ->
+       eqwhnf cv_pb l2r infos
+         appr1 (lft2, (CClosure.peano_constructor_view n2, v2)) cuniv
 
     | (FConstruct (((ind1,j1),u1 as pctor1,args1)), FConstruct (((ind2,j2),u2 as pctor2),args2)) ->
       let () = assert_reduced_constructor v1 in
