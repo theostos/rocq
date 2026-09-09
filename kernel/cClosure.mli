@@ -114,6 +114,15 @@ val zip : fconstr -> stack -> fconstr
 val fterm_of : fconstr -> fterm
 val term_of_fconstr : fconstr -> constr
 val term_of_process : fconstr -> stack -> constr
+
+(** Disposable profiling hooks used only by the eager-reduction diagnostic
+    worktree. *)
+val gate_e_begin : unit -> unit
+val gate_e_end : string -> unit
+val gate_e_with_ccnv : (unit -> 'a) -> 'a
+val gate_e_note_pair : fconstr -> fconstr -> unit
+val gate_e_note_eqappr : stack -> stack -> unit
+val gate_e_note_eqwhnf : unit -> unit
 val destFLambda :
   (usubs -> constr -> fconstr) -> fconstr -> Name.t binder_annot * fconstr * fconstr
 

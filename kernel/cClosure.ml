@@ -113,6 +113,220 @@ and usubs = subs_content subs UVars.puniverses
 
 and finvert = fconstr array
 
+(** Disposable instrumentation for the eager-reduction diagnostic gates.  It is
+    deliberately dormant unless [gate_e_begin] is called by the diagnostic
+    cast in [Typeops]. *)
+let gate_e_active = ref false
+let gate_e_whd_calls = ref 0
+let gate_e_reduction_steps = ref 0
+let gate_e_repeated_whd_roots = ref 0
+let gate_e_last_whd_root : fconstr option ref = ref None
+let gate_e_seen_whd_processes : (fconstr * Obj.t) list ref = ref []
+let gate_e_repeated_whd_processes = ref 0
+let gate_e_max_machine_stack = ref 0
+let gate_e_closure_constructions = ref 0
+let gate_e_updates = ref 0
+let gate_e_update_frames = ref 0
+let gate_e_zip_calls = ref 0
+let gate_e_term_readbacks = ref 0
+let gate_e_process_readbacks = ref 0
+let gate_e_table_lookups = ref 0
+let gate_e_table_misses = ref 0
+let gate_e_ccnv_calls = ref 0
+let gate_e_ccnv_depth = ref 0
+let gate_e_max_ccnv_depth = ref 0
+let gate_e_eqappr_calls = ref 0
+let gate_e_eqwhnf_calls = ref 0
+let gate_e_seen_pairs : (fconstr * fconstr) list ref = ref []
+let gate_e_repeated_pairs = ref 0
+let gate_e_recent_processes : (fconstr * Obj.t) option array = Array.make 128 None
+let gate_e_recent_process_pos = ref 0
+let gate_e_process_samples = ref 0
+let gate_e_repeated_recent_processes = ref 0
+let gate_e_recent_closures : (constr * Obj.t * Obj.t) option array = Array.make 128 None
+let gate_e_recent_closure_pos = ref 0
+let gate_e_closure_samples = ref 0
+let gate_e_repeated_recent_closures = ref 0
+let gate_e_closure_cache_hits = ref 0
+let gate_e_closure_cache_misses = ref 0
+let gate_e_head_cache_hits = ref 0
+let gate_e_head_cache_misses = ref 0
+let gate_e_whnf_cache_hits = ref 0
+let gate_e_whnf_cache_misses = ref 0
+let gate_e_active_head_reentries = ref 0
+let gate_e_alloc_start = ref 0.
+let gate_e_next_progress = ref 100_000
+let gate_e_next_reduction_progress = ref 100_000
+
+let gate_e_allocated_words () =
+  let s = Gc.quick_stat () in
+  s.Gc.minor_words +. s.Gc.major_words
+
+let gate_e_begin () =
+  gate_e_active := true;
+  gate_e_whd_calls := 0;
+  gate_e_reduction_steps := 0;
+  gate_e_repeated_whd_roots := 0;
+  gate_e_last_whd_root := None;
+  gate_e_seen_whd_processes := [];
+  gate_e_repeated_whd_processes := 0;
+  gate_e_max_machine_stack := 0;
+  gate_e_closure_constructions := 0;
+  gate_e_updates := 0;
+  gate_e_update_frames := 0;
+  gate_e_zip_calls := 0;
+  gate_e_term_readbacks := 0;
+  gate_e_process_readbacks := 0;
+  gate_e_table_lookups := 0;
+  gate_e_table_misses := 0;
+  gate_e_ccnv_calls := 0;
+  gate_e_ccnv_depth := 0;
+  gate_e_max_ccnv_depth := 0;
+  gate_e_eqappr_calls := 0;
+  gate_e_eqwhnf_calls := 0;
+  gate_e_seen_pairs := [];
+  gate_e_repeated_pairs := 0;
+  Array.fill gate_e_recent_processes 0 (Array.length gate_e_recent_processes) None;
+  gate_e_recent_process_pos := 0;
+  gate_e_process_samples := 0;
+  gate_e_repeated_recent_processes := 0;
+  Array.fill gate_e_recent_closures 0 (Array.length gate_e_recent_closures) None;
+  gate_e_recent_closure_pos := 0;
+  gate_e_closure_samples := 0;
+  gate_e_repeated_recent_closures := 0;
+  gate_e_closure_cache_hits := 0;
+  gate_e_closure_cache_misses := 0;
+  gate_e_head_cache_hits := 0;
+  gate_e_head_cache_misses := 0;
+  gate_e_whnf_cache_hits := 0;
+  gate_e_whnf_cache_misses := 0;
+  gate_e_active_head_reentries := 0;
+  gate_e_alloc_start := gate_e_allocated_words ();
+  gate_e_next_progress := 100_000;
+  gate_e_next_reduction_progress := 100_000
+
+let gate_e_report label =
+  if !gate_e_active then
+    Printf.eprintf
+      ("[eager-gate-e] %s whd=%d reduction-steps=%d repeated-consecutive-root=%d " ^^ 
+       "whd-process-repeats=%d closures=%d recent-closure-repeats=%d/%d " ^^
+       "updates=%d update-frames=%d zip=%d " ^^
+       "term-readbacks=%d process-readbacks=%d table-lookups=%d " ^^
+       "table-misses=%d ccnv=%d eqappr=%d eqwhnf=%d " ^^
+       "pair-repeats=%d recent-process-repeats=%d/%d " ^^
+       "closure-cache=%d/%d head-cache=%d/%d whnf-cache=%d/%d active-head=%d " ^^
+       "max-ccnv-depth=%d max-machine-stack=%d allocated-words=%.0f\n%!")
+      label !gate_e_whd_calls !gate_e_reduction_steps
+      !gate_e_repeated_whd_roots
+      !gate_e_repeated_whd_processes !gate_e_closure_constructions
+      !gate_e_repeated_recent_closures !gate_e_closure_samples
+      !gate_e_updates !gate_e_update_frames
+      !gate_e_zip_calls !gate_e_term_readbacks !gate_e_process_readbacks
+      !gate_e_table_lookups !gate_e_table_misses !gate_e_ccnv_calls
+      !gate_e_eqappr_calls !gate_e_eqwhnf_calls !gate_e_repeated_pairs
+      !gate_e_repeated_recent_processes !gate_e_process_samples
+      !gate_e_closure_cache_hits !gate_e_closure_cache_misses
+      !gate_e_head_cache_hits !gate_e_head_cache_misses
+      !gate_e_whnf_cache_hits !gate_e_whnf_cache_misses
+      !gate_e_active_head_reentries
+      !gate_e_max_ccnv_depth
+      !gate_e_max_machine_stack
+      (gate_e_allocated_words () -. !gate_e_alloc_start)
+
+let gate_e_end label =
+  gate_e_report label;
+  gate_e_active := false;
+  gate_e_last_whd_root := None
+
+let gate_e_note_closure () =
+  if !gate_e_active then incr gate_e_closure_constructions
+
+let gate_e_note_closure_state (e : usubs) t =
+  if !gate_e_active && !gate_e_closure_samples < 100_000 then begin
+    let subs, univs = e in
+    let subs = Obj.repr subs and univs = Obj.repr univs in
+    if Array.exists (function
+        | Some (old_t, old_subs, old_univs) ->
+          old_t == t && old_subs == subs && old_univs == univs
+        | None -> false) gate_e_recent_closures
+    then incr gate_e_repeated_recent_closures;
+    gate_e_recent_closures.(!gate_e_recent_closure_pos) <- Some (t, subs, univs);
+    gate_e_recent_closure_pos :=
+      (!gate_e_recent_closure_pos + 1) mod Array.length gate_e_recent_closures;
+    incr gate_e_closure_samples
+  end
+
+let gate_e_note_update () =
+  if !gate_e_active then incr gate_e_updates
+
+let gate_e_note_update_frame () =
+  if !gate_e_active then incr gate_e_update_frames
+
+let gate_e_note_zip () =
+  if !gate_e_active then incr gate_e_zip_calls
+
+let gate_e_note_reduction_step () =
+  if !gate_e_active then begin
+    incr gate_e_reduction_steps;
+    if !gate_e_reduction_steps >= !gate_e_next_reduction_progress then begin
+      gate_e_report "reduction-progress";
+      gate_e_next_reduction_progress := !gate_e_next_reduction_progress * 10
+    end
+  end
+
+let gate_e_note_process m stk =
+  if !gate_e_active && !gate_e_process_samples < 100_000 then begin
+    let stk = Obj.repr stk in
+    if Array.exists (function
+        | Some (old_m, old_stk) -> old_m == m && old_stk == stk
+        | None -> false) gate_e_recent_processes
+    then incr gate_e_repeated_recent_processes;
+    gate_e_recent_processes.(!gate_e_recent_process_pos) <- Some (m, stk);
+    gate_e_recent_process_pos :=
+      (!gate_e_recent_process_pos + 1) mod Array.length gate_e_recent_processes;
+    incr gate_e_process_samples
+  end
+
+let gate_e_note_term_readback () =
+  if !gate_e_active then incr gate_e_term_readbacks
+
+let gate_e_note_process_readback () =
+  if !gate_e_active then incr gate_e_process_readbacks
+
+let gate_e_note_table_lookup ~miss =
+  if !gate_e_active then begin
+    incr gate_e_table_lookups;
+    if miss then incr gate_e_table_misses
+  end
+
+let gate_e_with_ccnv f =
+  if not !gate_e_active then f ()
+  else begin
+    incr gate_e_ccnv_calls;
+    incr gate_e_ccnv_depth;
+    gate_e_max_ccnv_depth := max !gate_e_max_ccnv_depth !gate_e_ccnv_depth;
+    Fun.protect f ~finally:(fun () -> decr gate_e_ccnv_depth)
+  end
+
+let gate_e_note_pair left right =
+  if !gate_e_active then begin
+    if List.exists (fun (old_left, old_right) ->
+        old_left == left && old_right == right) !gate_e_seen_pairs
+    then incr gate_e_repeated_pairs
+    else gate_e_seen_pairs := (left, right) :: !gate_e_seen_pairs
+  end
+
+let gate_e_note_eqappr left_stack right_stack =
+  if !gate_e_active then begin
+    incr gate_e_eqappr_calls;
+    gate_e_max_machine_stack :=
+      max !gate_e_max_machine_stack
+        (max (List.length left_stack) (List.length right_stack))
+  end
+
+let gate_e_note_eqwhnf () =
+  if !gate_e_active then incr gate_e_eqwhnf_calls
+
 let get_invert fiv = fiv
 
 let fterm_of v = v.term
@@ -121,6 +335,7 @@ let set_ntrl v = v.mark <- Ntrl
 (* Could issue a warning if no is still Red, pointing out that we loose
    sharing. *)
 let update v1 mark t =
+  gate_e_note_update ();
   v1.mark <- mark; v1.term <- t
 
 type 'a evar_expansion =
@@ -284,6 +499,7 @@ let zupdate info m s =
   if share && is_red m.mark then
     let s' = compact_stack m s in
     let _ = m.term <- FLOCKED in
+    let () = gate_e_note_update_frame () in
     Zupdate(m)::s'
   else s
 
@@ -330,6 +546,8 @@ let destFLambda clos_fun t =
 (* Optimization: do not enclose variables in a closure.
    Makes variable access much faster *)
 let mk_clos (e:usubs) t =
+  gate_e_note_closure ();
+  gate_e_note_closure_state e t;
   match kind t with
     | Rel i ->
       begin match clos_rel (fst e) i with
@@ -456,14 +674,168 @@ end = struct
     | NotEvaluableConst _ (* Const *) -> Undef None
 
   let lookup info tab ref =
-    try Table.find tab ref with Not_found ->
-    let v = value_of info ref in
-    Table.add tab ref v; v
+    try
+      let v = Table.find tab ref in
+      gate_e_note_table_lookup ~miss:false;
+      v
+    with Not_found ->
+      gate_e_note_table_lookup ~miss:true;
+      let v = value_of info ref in
+      Table.add tab ref v; v
 end
 
-type clos_tab = Table.t
+module ClosureTable = Hashtbl.Make(struct
+  type t = constr * usubs
 
-let create_tab = Table.create
+  let equal_subs left right =
+    left == right
+    ||
+    let left_entries, left_shift = Esubst.Internal.repr left in
+    let right_entries, right_shift = Esubst.Internal.repr right in
+    Int.equal left_shift right_shift
+    && List.equal
+         (fun left_entry right_entry ->
+           match left_entry, right_entry with
+           | Esubst.Internal.REL left, Esubst.Internal.REL right ->
+             Int.equal left right
+           | Esubst.Internal.VAL (left_lift, left_value),
+             Esubst.Internal.VAL (right_lift, right_value) ->
+             Int.equal left_lift right_lift && left_value == right_value
+           | Esubst.Internal.REL _, Esubst.Internal.VAL _
+           | Esubst.Internal.VAL _, Esubst.Internal.REL _ -> false)
+         left_entries right_entries
+
+  let hash_subs subs =
+    let entries, shift = Esubst.Internal.repr subs in
+    List.fold_left
+      (fun hash entry ->
+        match entry with
+        | Esubst.Internal.REL relocation ->
+          Hashset.Combine.combine3 hash 1 relocation
+        | Esubst.Internal.VAL (lift, _) ->
+          (* The closure identity participates in equality but is omitted from
+             the hash because [fconstr] is mutable. *)
+          Hashset.Combine.combine3 hash 2 lift)
+      shift entries
+
+  let equal (left_term, (left_subs, left_univs))
+      (right_term, (right_subs, right_univs)) =
+    left_term == right_term
+    && equal_subs left_subs right_subs
+    && UVars.Instance.equal left_univs right_univs
+
+  let hash (term, (subs, univs)) =
+    Hashset.Combine.combine
+      (Hashtbl.seeded_hash_param 4 8 0 term)
+      (Hashset.Combine.combine
+         (hash_subs subs)
+         (UVars.Instance.hash univs))
+end)
+
+let hash_fconstr_state closure =
+  let open Hashset.Combine in
+  match closure.term with
+  | FRel index -> combine 1 index
+  | FAtom term -> combine 2 (Hashtbl.seeded_hash_param 3 6 2 term)
+  | FFlex (RelKey index) -> combine 3 index
+  | FFlex (VarKey id) -> combine 4 (Id.hash id)
+  | FFlex (ConstKey (constant, instance)) ->
+    combine3 5 (Constant.UserOrd.hash constant) (UVars.Instance.hash instance)
+  | FInd (inductive, instance) ->
+    combine3 6 (Ind.UserOrd.hash inductive) (UVars.Instance.hash instance)
+  | FConstruct ((constructor, instance), arguments) ->
+    combine4 7 (Construct.UserOrd.hash constructor)
+      (UVars.Instance.hash instance) (Array.length arguments)
+  | FApp (_, arguments) -> combine 8 (Array.length arguments)
+  | FProj _ -> 9
+  | FFix _ -> 10
+  | FCoFix _ -> 11
+  | FCaseT _ -> 12
+  | FCaseInvert _ -> 13
+  | FLambda (count, _, _, _) -> combine 14 count
+  | FProd _ -> 15
+  | FLetIn _ -> 16
+  | FEvar (evar, _, _, _) -> combine 17 (Evar.hash evar)
+  | FInt value -> combine 18 (Uint63.hash value)
+  | FFloat value -> combine 19 (Float64.hash value)
+  | FString value -> combine 20 (Pstring.hash value)
+  | FArray (_, values, _) -> combine 21 (Uint63.hash (Parray.length values))
+  | FLIFT (lift, _) -> combine 22 lift
+  | FCLOS (term, _) -> combine 23 (Hashtbl.seeded_hash_param 4 8 3 term)
+  | FIrrelevant -> 24
+  | FLOCKED -> 25
+
+let rec hash_process_stack =
+  let open Hashset.Combine in
+  function
+  | [] -> 0
+  | frame :: rest ->
+    let frame_hash = match frame with
+    | Zapp arguments -> combine 1 (Array.length arguments)
+    | ZcaseT (_, _, parameters, _, branches, _) ->
+      combine3 2 (Array.length parameters) (Array.length branches)
+    | Zproj _ -> 3
+    | Zfix (_, parameters) -> combine 4 (hash_process_stack parameters)
+    | Zprimitive (_, _, reduced, remaining) ->
+      combine3 5 (List.length reduced) (List.length remaining)
+    | Zshift shift -> combine 6 shift
+    | Zupdate _ -> 7
+    in
+    combine frame_hash (hash_process_stack rest)
+
+module ProcessTable = Hashtbl.Make(struct
+  type t = fconstr * fterm * stack
+  let equal
+      (left_term, left_snapshot, left_stack)
+      (right_term, right_snapshot, right_stack) =
+    left_term == right_term
+    && left_snapshot == right_snapshot
+    && left_stack == right_stack
+  let hash (_term, snapshot, stack) =
+    (* [fconstr.term] is replaced in place during reduction.  Keep the exact
+       pre-reduction [fterm] value in the key: it is an immutable version
+       token for that closure state. *)
+    Hashset.Combine.combine
+      (match snapshot with
+       | FRel index -> Hashset.Combine.combine 1 index
+       | FAtom _ -> 2 | FFlex _ -> 3 | FInd _ -> 4 | FConstruct _ -> 5
+       | FApp _ -> 6 | FProj _ -> 7 | FFix _ -> 8 | FCoFix _ -> 9
+       | FCaseT _ -> 10 | FCaseInvert _ -> 11 | FLambda _ -> 12
+       | FProd _ -> 13 | FLetIn _ -> 14 | FEvar _ -> 15 | FInt _ -> 16
+       | FFloat _ -> 17 | FString _ -> 18 | FArray _ -> 19 | FLIFT _ -> 20
+       | FCLOS _ -> 21 | FIrrelevant -> 22 | FLOCKED -> 23)
+      (hash_process_stack stack)
+end)
+
+type clos_tab = {
+  constants : Table.t;
+  closures : fconstr ClosureTable.t;
+  head_processes : (fconstr * stack) ProcessTable.t;
+  whnf_processes : (fconstr * stack) ProcessTable.t;
+  active_head_processes : unit ProcessTable.t;
+}
+
+let create_tab () = {
+  constants = Table.create ();
+  closures = ClosureTable.create 251;
+  head_processes = ProcessTable.create 251;
+  whnf_processes = ProcessTable.create 251;
+  active_head_processes = ProcessTable.create 251;
+}
+
+let mk_clos_cached tab env term =
+  match ClosureTable.find_opt tab.closures (term, env) with
+  | Some closure ->
+    if !gate_e_active then incr gate_e_closure_cache_hits;
+    closure
+  | None ->
+    if !gate_e_active then incr gate_e_closure_cache_misses;
+    let closure = mk_clos env term in
+    ClosureTable.add tab.closures (term, env) closure;
+    closure
+
+let mk_clos_vect_cached tab env terms =
+  Array.map (mk_clos_cached tab env) terms
 
 (************************************************************************)
 
@@ -654,7 +1026,9 @@ and comp_subs el (s,u') =
    fconstr. When we find a closure whose substitution is the identity,
    then we directly return the constr to avoid possibly huge
    reallocation. *)
-let term_of_fconstr c = to_constr el_id c
+let term_of_fconstr c =
+  gate_e_note_term_readback ();
+  to_constr el_id c
 
 let lift_union k = function
   | Regular v -> Regular (lift_fconstr k v)
@@ -759,6 +1133,7 @@ let mkFApp h args =
       {mark=neutr h.mark; term=FApp(h,args)}
 
 let rec zip m stk =
+  gate_e_note_zip ();
   match stk with
     | [] -> m
     | Zapp args :: s -> zip (mkFApp m args) s
@@ -785,7 +1160,9 @@ let rec zip m stk =
 
 let fapp_stack (m,stk) = zip m stk
 
-let term_of_process c stk = term_of_fconstr (zip c stk)
+let term_of_process c stk =
+  gate_e_note_process_readback ();
+  term_of_fconstr (zip c stk)
 
 (*********************************************************************)
 
@@ -1441,24 +1818,48 @@ let is_irrelevant_constructor infos ((ind,_),u) =
    atom or a subterm that may produce a redex (abstraction,
    constructor, cofix, letin, constant), or a neutral term (product,
    inductive) *)
-let rec knh info m stk =
+let rec knh info tab m stk =
+  if not (Option.has_some (Sys.getenv_opt "ROCQ_EAGER_GATE_PROCESS_CACHE")) then
+    knh_impl info tab m stk
+  else
+  let key = m, m.term, stk in
+  match ProcessTable.find_opt tab.head_processes key with
+  | Some result ->
+    if !gate_e_active then incr gate_e_head_cache_hits;
+    result
+  | None ->
+    if !gate_e_active then incr gate_e_head_cache_misses;
+    if ProcessTable.mem tab.active_head_processes key && !gate_e_active then
+      incr gate_e_active_head_reentries;
+    ProcessTable.replace tab.active_head_processes key ();
+    let result =
+      Fun.protect
+        (fun () -> knh_impl info tab m stk)
+        ~finally:(fun () -> ProcessTable.remove tab.active_head_processes key)
+    in
+    ProcessTable.replace tab.head_processes key result;
+    result
+
+and knh_impl info tab m stk =
+  gate_e_note_reduction_step ();
+  gate_e_note_process m stk;
   match m.term with
-    | FLIFT(k,a) -> knh info a (zshift k stk)
-    | FCLOS(t,e) -> knht info e t (zupdate info m stk)
+    | FLIFT(k,a) -> knh info tab a (zshift k stk)
+    | FCLOS(t,e) -> knht info tab e t (zupdate info m stk)
     | FLOCKED -> assert false
-    | FApp(a,b) -> knh info a (append_stack b (zupdate info m stk))
+    | FApp(a,b) -> knh info tab a (append_stack b (zupdate info m stk))
     | FCaseT(ci,u,pms,(_,r as p),t,br,e) ->
       let r' = usubst_relevance e r in
       if is_irrelevant info r' then
         (mk_irrelevant, skip_irrelevant_stack info stk)
       else
-        knh info t (ZcaseT(ci,u,pms,p,br,e)::zupdate info m stk)
+        knh info tab t (ZcaseT(ci,u,pms,p,br,e)::zupdate info m stk)
     | FFix (((ri, n), (lna, _, _)), e) ->
       if is_irrelevant info (usubst_relevance e (lna.(n)).binder_relevance) then
         (mk_irrelevant, skip_irrelevant_stack info stk)
       else
         (match get_nth_arg m ri.(n) stk with
-             (Some(pars,arg),stk') -> knh info arg (Zfix(m,pars)::stk')
+             (Some(pars,arg),stk') -> knh info tab arg (Zfix(m,pars)::stk')
            | (None, stk') -> (m,stk'))
     | FProj (p,r,c) ->
       if is_irrelevant info r then
@@ -1466,7 +1867,7 @@ let rec knh info m stk =
       else
       (match unfold_projection info p r with
        | None -> (m, stk)
-       | Some s -> knh info c (s :: zupdate info m stk))
+       | Some s -> knh info tab c (s :: zupdate info m stk))
     | FConstruct _ -> strip_update_shift_absorb_app m stk
 
 (* cases where knh stops *)
@@ -1476,65 +1877,76 @@ let rec knh info m stk =
         (m, stk)
 
 (* The same for pure terms *)
-and knht info e t stk =
+and knht info tab e t stk =
+  gate_e_note_reduction_step ();
   match kind t with
   | Rel n ->
     begin match clos_rel (fst e) n with
-    | Regular v -> knh info v stk
+    | Regular v -> knh info tab v stk
     | HigherOrder _ -> CErrors.anomaly Pp.(str "Uncaught pattern variable")
     end
   | App (f, args) ->
     begin match [@ocaml.warning "-4"] kind f with
     | Rel n ->
-      let args = mk_clos_vect e args in
+      let args = mk_clos_vect_cached tab e args in
       begin match clos_rel (fst e) n with
-      | Regular t -> knh info t (append_stack args stk)
+      | Regular t -> knh info tab t (append_stack args stk)
       | HigherOrder (nargs, term) ->
         let subs', args = Array.chop nargs args in
         let id = subs_id (Range.length info.i_relevances) in
         let subs' = Array.fold_left (fun s v -> subs_cons (Regular v) s) id subs' in
         let head = resubst subs' term in
-        knh info head (append_stack args stk)
+        knh info tab head (append_stack args stk)
       end
-    | _ -> knht info e f (append_stack (mk_clos_vect e args) stk)
+    | _ -> knht info tab e f
+             (append_stack (mk_clos_vect_cached tab e args) stk)
     end
     | Case(ci,u,pms,(_,r as p),NoInvert,t,br) ->
       if is_irrelevant info (usubst_relevance e r) then
         (mk_irrelevant, skip_irrelevant_stack info stk)
       else
-        knht info e t (ZcaseT(ci, u, pms, p, br, e)::stk)
+        knht info tab e t (ZcaseT(ci, u, pms, p, br, e)::stk)
     | Case(ci,u,pms,(_,r as p),CaseInvert{indices},t,br) ->
       if is_irrelevant info (usubst_relevance e r) then
         (mk_irrelevant, skip_irrelevant_stack info stk)
       else
-        let term = FCaseInvert (ci, u, pms, p, (Array.map (mk_clos e) indices), mk_clos e t, br, e) in
+        let term =
+          FCaseInvert
+            (ci, u, pms, p,
+             Array.map (mk_clos_cached tab e) indices,
+             mk_clos_cached tab e t, br, e)
+        in
         { mark = Red; term }, stk
     | Fix (((_, n), (lna, _, _)) as fx) ->
       if is_irrelevant info (usubst_relevance e (lna.(n)).binder_relevance) then
         (mk_irrelevant, skip_irrelevant_stack info stk)
       else
-        knh info { mark = Cstr; term = FFix (fx, e) } stk
-    | Cast(a,_,_) -> knht info e a stk
+        knh info tab { mark = Cstr; term = FFix (fx, e) } stk
+    | Cast(a,_,_) -> knht info tab e a stk
     | Proj (p, r, c) ->
       let r = usubst_relevance e r in
       if is_irrelevant info r then
         (mk_irrelevant, skip_irrelevant_stack info stk)
       else begin match unfold_projection info p r with
-      | None -> ({ mark = Red; term = FProj (p, r, mk_clos e c) }, stk)
-      | Some s -> knht info e c (s :: stk)
+      | None ->
+        ({ mark = Red; term = FProj (p, r, mk_clos_cached tab e c) }, stk)
+      | Some s -> knht info tab e c (s :: stk)
       end
-    | Construct _ -> knh info (mk_clos e t) stk
-    | (Ind _|Const _|Var _|Meta _ | Sort _ | Int _|Float _|String _) -> (mk_clos e t, stk)
+    | Construct _ -> knh info tab (mk_clos_cached tab e t) stk
+    | (Ind _|Const _|Var _|Meta _ | Sort _ | Int _|Float _|String _) ->
+      (mk_clos_cached tab e t, stk)
     | CoFix cfx ->
       { mark = Cstr; term = FCoFix (cfx,e) }, stk
     | Lambda _ -> { mark = Cstr ; term = mk_lambda e t }, stk
     | Prod (n, t, c) ->
-      { mark = Ntrl; term = FProd (n, mk_clos e t, c, e) }, stk
+      { mark = Ntrl; term = FProd (n, mk_clos_cached tab e t, c, e) }, stk
     | LetIn (n,b,t,c) ->
-      { mark = Red; term = FLetIn (n, mk_clos e b, mk_clos e t, c, e) }, stk
+      { mark = Red;
+        term = FLetIn
+          (n, mk_clos_cached tab e b, mk_clos_cached tab e t, c, e) }, stk
     | Evar ev ->
       begin match info.i_cache.i_sigma.evar_expand ev with
-      | EvarDefined c -> knht info e c stk
+      | EvarDefined c -> knht info tab e c stk
       | EvarUndefined (evk, args) ->
         assert (UVars.Instance.is_empty (snd e));
         if info.i_cache.i_mode = Conversion && info.i_cache.i_sigma.evar_irrelevant ev then
@@ -1546,10 +1958,14 @@ and knht info e t stk =
     | Array(u,t,def,ty) ->
       let u = usubst_instance e u in
       let len = Array.length t in
-      let ty = mk_clos e ty in
-      let t = Parray.init (Uint63.of_int len) (fun i -> mk_clos e t.(i)) (mk_clos e def) in
+      let ty = mk_clos_cached tab e ty in
+      let t =
+        Parray.init (Uint63.of_int len)
+          (fun i -> mk_clos_cached tab e t.(i))
+          (mk_clos_cached tab e def)
+      in
       let term = FArray (u,t,ty) in
-      knh info { mark = Cstr; term } stk
+      knh info tab { mark = Cstr; term } stk
 
 (************************************************************************)
 
@@ -1558,9 +1974,9 @@ let conv : (clos_infos -> clos_tab -> fconstr -> fconstr -> bool) ref
 let set_conv f = conv := f
 
 type ('a, 'b) reduction = {
-  red_ret : clos_infos -> Table.t -> pat_state:'b -> ?failed:bool -> (fconstr * stack) -> 'a;
-  red_kni : clos_infos -> Table.t -> pat_state:'b -> fconstr -> stack -> 'a;
-  red_knit : clos_infos -> Table.t -> pat_state:'b -> usubs -> Constr.t -> stack -> 'a;
+  red_ret : clos_infos -> clos_tab -> pat_state:'b -> ?failed:bool -> (fconstr * stack) -> 'a;
+  red_kni : clos_infos -> clos_tab -> pat_state:'b -> fconstr -> stack -> 'a;
+  red_knit : clos_infos -> clos_tab -> pat_state:'b -> usubs -> Constr.t -> stack -> 'a;
 }
 
 type (_, _) escape =
@@ -1576,10 +1992,10 @@ type _ depth =
   | Nil: (fconstr * stack, 'ret) escape -> 'ret depth
   | Cons: resume_state * 'ret depth -> 'ret depth
 
-val match_symbol : ('a, 'a depth) reduction -> clos_infos -> Table.t ->
+val match_symbol : ('a, 'a depth) reduction -> clos_infos -> clos_tab ->
   pat_state:'a depth -> table_key -> UVars.Instance.t * bool * machine_rewrite_rule list -> stack -> 'a
 
-val match_head : ('a, 'a depth) reduction -> clos_infos -> Table.t ->
+val match_head : ('a, 'a depth) reduction -> clos_infos -> clos_tab ->
   pat_state:'a depth -> resume_state -> fconstr -> stack -> 'a
 
 end =
@@ -1979,14 +2395,18 @@ end
 type 'a depth = 'a RedPattern.depth
 
 (* Computes a weak head normal form from the result of knh. *)
-let rec knr info tab ~pat_state m stk =
+let rec knr : type result.
+    clos_infos -> clos_tab -> pat_state:result depth -> fconstr -> stack -> result =
+  fun info tab ~pat_state m stk ->
+  gate_e_note_reduction_step ();
+  gate_e_note_process m stk;
   match m.term with
   | FLambda(n,tys,f,e) when red_set info.i_flags fBETA ->
       (match get_args n tys f e stk with
           Inl e', s -> knit info tab ~pat_state e' f s
         | Inr lam, s -> knr_ret info tab ~pat_state (lam,s))
   | FFlex fl when red_set info.i_flags fDELTA ->
-      (match Table.lookup info tab fl with
+      (match Table.lookup info tab.constants fl with
         | Def (v, _) -> kni info tab ~pat_state v stk
         | Primitive op ->
           if check_native_args op stk then
@@ -2084,12 +2504,48 @@ and knr_ret : type a. _ -> _ -> pat_state: a depth -> ?failed: _ -> _ -> a =
   | RedPattern.Nil b ->
       match b with No -> i | Yes -> if failed then None else Some i
 
+(* Computes and memoizes the ordinary weak head normal form of a process. *)
+and kni_no_pattern info tab m stk =
+  if not (Option.has_some (Sys.getenv_opt "ROCQ_EAGER_GATE_PROCESS_CACHE")) then begin
+    let hm, stack = knh info tab m stk in
+    knr info tab ~pat_state:(RedPattern.Nil No) hm stack
+  end
+  else
+  let key = m, m.term, stk in
+  match ProcessTable.find_opt tab.whnf_processes key with
+  | Some result ->
+    if !gate_e_active then incr gate_e_whnf_cache_hits;
+    result
+  | None ->
+    if !gate_e_active then incr gate_e_whnf_cache_misses;
+    let hm, stack = knh info tab m stk in
+    let result =
+      knr info tab ~pat_state:(RedPattern.Nil No) hm stack
+    in
+    ProcessTable.replace tab.whnf_processes key result;
+    result
+
 (* Computes the weak head normal form of a term *)
-and kni info tab ~pat_state m stk =
-  let (hm,s) = knh info m stk in
-  knr info tab ~pat_state hm s
-and knit info tab ~pat_state e t stk =
-  let (ht,s) = knht info e t stk in
+and kni : type result.
+    clos_infos -> clos_tab -> pat_state:result depth -> fconstr -> stack -> result =
+  fun info tab ~pat_state m stk ->
+  gate_e_note_reduction_step ();
+  gate_e_note_process m stk;
+  match pat_state with
+  | RedPattern.Nil escape ->
+    (match escape with
+     | No -> kni_no_pattern info tab m stk
+     | Yes ->
+       let hm, stack = knh info tab m stk in
+       knr info tab ~pat_state:(RedPattern.Nil Yes) hm stack)
+  | RedPattern.Cons _ ->
+    let hm, stack = knh info tab m stk in
+    knr info tab ~pat_state hm stack
+and knit : type result.
+    clos_infos -> clos_tab -> pat_state:result depth -> usubs -> constr -> stack -> result =
+  fun info tab ~pat_state e t stk ->
+  gate_e_note_reduction_step ();
+  let (ht,s) = knht info tab e t stk in
   knr info tab ~pat_state ht s
 
 and case_inversion info tab ci u pms p indices brs env = match brs with
@@ -2115,7 +2571,7 @@ and case_inversion info tab ci u pms p indices brs env = match brs with
     let branch_type = mk_clos branch_subs p in
     let external_type = mk_clos external_subs p in
 
-    let tab = if info.i_cache.i_mode == Conversion then tab else Table.create () in
+    let tab = if info.i_cache.i_mode == Conversion then tab else create_tab () in
     let info = {info with i_cache = { info.i_cache with i_mode = Conversion}; i_flags=all} in
     if !conv info tab branch_type external_type
     then Some v else None
@@ -2299,11 +2755,34 @@ let whd_val info tab v = term_of_fconstr (kh info tab v [])
 let norm_val info tab v = kl info tab v
 let norm_term info tab e t = klt info tab e t
 
-let whd_stack infos tab m stk = match m.mark with
+let whd_stack infos tab m stk =
+  let () = if !gate_e_active then begin
+    incr gate_e_whd_calls;
+    (match !gate_e_last_whd_root with
+     | Some previous when previous == m -> incr gate_e_repeated_whd_roots
+     | Some _ | None -> ());
+    gate_e_last_whd_root := Some m;
+    let stk_obj = Obj.repr stk in
+    if List.exists (fun (old_m, old_stk) -> old_m == m && old_stk == stk_obj)
+        !gate_e_seen_whd_processes
+    then incr gate_e_repeated_whd_processes
+    else gate_e_seen_whd_processes := (m, stk_obj) :: !gate_e_seen_whd_processes;
+    gate_e_max_machine_stack := max !gate_e_max_machine_stack (List.length stk);
+    if !gate_e_whd_calls <= 10 then
+      Printf.eprintf
+        "[eager-gate-e] whd-enter=%d stack=%d mark=%s\n%!"
+        !gate_e_whd_calls (List.length stk)
+        (match m.mark with Red -> "Red" | Cstr -> "Cstr" | Ntrl -> "Ntrl");
+    if !gate_e_whd_calls >= !gate_e_next_progress then begin
+      gate_e_report "progress";
+      gate_e_next_progress := !gate_e_next_progress * 10
+    end
+  end in
+  match m.mark with
 | Ntrl ->
   (** No need to perform [kni] nor to unlock updates because
       every head subterm of [m] is [Ntrl] *)
-  knh infos m stk
+  knh infos tab m stk
 | Red | Cstr ->
   let k = kni infos tab m stk in
   let () =
@@ -2330,7 +2809,7 @@ let infos_with_reds infos reds =
   { infos with i_flags = reds }
 
 let unfold_ref_with_args infos tab fl v =
-  match Table.lookup infos tab fl with
+  match Table.lookup infos tab.constants fl with
   | Def (def, _) -> Some (def, v)
   | Primitive op when check_native_args op v ->
     let c = match [@ocaml.warning "-4"] fl with ConstKey c -> c | _ -> assert false in
@@ -2340,6 +2819,6 @@ let unfold_ref_with_args infos tab fl v =
     RedPattern.match_symbol knred (infos_with_reds infos all) tab ~pat_state:(RedPattern.Nil Yes) fl (u, b, r) v
   | Undef _ | OpaqueDef _ | Primitive _ -> None
 
-let get_ref_mask info tab fl = match Table.lookup info tab fl with
+let get_ref_mask info tab fl = match Table.lookup info tab.constants fl with
 | Def (_, mask) -> mask
 | Primitive _ | Symbol _ | Undef _ | OpaqueDef _ -> [||]

@@ -371,6 +371,11 @@ let assert_reduced_constructor s =
 
 (* Conversion between  [lft1]term1 and [lft2]term2 *)
 let rec ccnv cv_pb l2r infos lft1 lft2 term1 term2 cuniv =
+  CClosure.gate_e_note_pair term1 term2;
+  CClosure.gate_e_with_ccnv (fun () ->
+    ccnv_impl cv_pb l2r infos lft1 lft2 term1 term2 cuniv)
+
+and ccnv_impl cv_pb l2r infos lft1 lft2 term1 term2 cuniv =
   let fast = fast_test lft1 term1 lft2 term2 in
   if fast then cuniv
   else
@@ -378,6 +383,7 @@ let rec ccnv cv_pb l2r infos lft1 lft2 term1 term2 cuniv =
 
 (* Conversion between [lft1](hd1 v1) and [lft2](hd2 v2) *)
 and eqappr cv_pb l2r infos (lft1,st1) (lft2,st2) cuniv =
+  CClosure.gate_e_note_eqappr (snd st1) (snd st2);
   Control.check_for_interrupt ();
   (* First head reduce both terms *)
   let ninfos = infos_with_reds infos.cnv_inf RedFlags.betaiotazeta in
@@ -387,6 +393,7 @@ and eqappr cv_pb l2r infos (lft1,st1) (lft2,st2) cuniv =
 
 (* assumes that appr1 and appr2 are in whnf *)
 and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2) cuniv =
+  CClosure.gate_e_note_eqwhnf ();
   (** We delay the computation of the lifts that apply to the head of the term
       with [el_stack] inside the branches where they are actually used. *)
   (** Irrelevant terms are guaranteed to be [FIrrelevant], except for [FFlex],

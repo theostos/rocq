@@ -337,6 +337,29 @@ let check_cast env c ct k expected_type =
       Vconv.vm_conv CUMUL env ct expected_type
     | DEFAULTcast ->
       default_conv CUMUL env ct expected_type
+    | NATIVEcast
+      when Option.has_some (Sys.getenv_opt "ROCQ_EAGER_GATE_MEMO_DEFAULT") ->
+      Printf.eprintf
+        "[eager-gate-memo] checking the isolated pair with memoized default conversion\n%!";
+      default_conv CUMUL env ct expected_type
+    | NATIVEcast
+      when Option.has_some (Sys.getenv_opt "ROCQ_EAGER_GATE_D_WHOLE_VM") ->
+      Printf.eprintf
+        "[eager-gate-d] checking the whole isolated pair with Rocq VM conversion\n%!";
+      Vconv.vm_conv CUMUL env ct expected_type
+    | NATIVEcast
+      when Option.has_some (Sys.getenv_opt "ROCQ_EAGER_GATE_E_PROFILE") ->
+      Printf.eprintf
+        "[eager-gate-e] profiling the isolated conversion with Rocq's default converter\n%!";
+      CClosure.gate_e_begin ();
+      Fun.protect
+        (fun () -> default_conv CUMUL env ct expected_type)
+        ~finally:(fun () -> CClosure.gate_e_end "final")
+    | NATIVEcast
+      when Option.has_some (Sys.getenv_opt "ROCQ_EAGER_GATE_B_BYPASS") ->
+      Printf.eprintf
+        "[eager-gate-b] kernel accepted diagnostic NATIVE cast without conversion\n%!";
+      Result.Ok ()
     | NATIVEcast ->
       let sigma = Genlambda.empty_evars env in
       Nativeconv.native_conv CUMUL sigma env ct expected_type

@@ -1,4 +1,5 @@
 (************************************************************************)
+(* Diagnostic rebuild marker. *)
 (*         *      The Rocq Prover / The Rocq Development Team           *)
 (*  v      *         Copyright INRIA, CNRS and contributors             *)
 (* <O___,, * (see version control and CREDITS file for authors & dates) *)
