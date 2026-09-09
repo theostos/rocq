@@ -197,6 +197,7 @@ let convert_inductives_gen cmp_instances cmp_cumul cv_pb (mind,ind) nargs u1 u2 
 type 'e conv_tab = {
   cnv_inf : clos_infos;
   cnv_typ : bool; (* true if the input terms were well-typed *)
+  cnv_rel_types : fconstr option Range.t;
   lft_tab : clos_tab;
   rgt_tab : clos_tab;
   err_ret : 'e -> payload;
@@ -257,11 +258,77 @@ let same_args_size sk1 sk2 =
 (** The same heap separation invariant must hold for the fconstr arguments
     passed to each respective side of the conversion function below. *)
 
-let push_relevance infos r =
-  { infos with cnv_inf = CClosure.push_relevance infos.cnv_inf r }
+let rec direct_inductive typ =
+  match fterm_of typ with
+  | FInd (ind, _) -> Some ind
+  | FApp (head, _) | FLIFT (_, head) -> direct_inductive head
+  | FCLOS (term, _) ->
+    let head, _ = Constr.decompose_app term in
+    begin match Constr.kind head with
+    | Constr.Ind (ind, _) -> Some ind
+    | _ -> None
+    end
+  | _ -> None
+
+let direct_registered_unit_like infos typ =
+  let env = info_env infos.cnv_inf in
+  match direct_inductive typ with
+  | Some ind when
+      List.exists (Ind.UserOrd.equal ind)
+        (Environ.retroknowledge env).Retroknowledge.retro_unit_like -> Some ind
+  | Some _ | None -> None
+
+(* Unit-like fields need no comparison during record eta. *)
+let record_unit_like_mask infos tab ((ind, _) as pind) args =
+  let env = info_env infos.cnv_inf in
+  let (mib, _ as spec) = Inductive.lookup_mind_specif env ind in
+  let constructor_type =
+    Inductive.type_of_constructor ((ind, 1), snd pind) spec |> inject
+  in
+  let rec fields index typ mask =
+    if Int.equal index (Array.length args) then
+      let mask = Array.of_list (List.rev mask) in
+      if Array.exists (fun compare -> not compare) mask then mask else [||]
+    else
+      let typ, stack = whd_stack infos.cnv_inf tab typ empty_stack in
+      let typ = zip typ stack in
+      match fterm_of typ with
+      | FProd (_, domain, body, subst) ->
+        let domain, stack =
+          whd_stack infos.cnv_inf tab domain empty_stack
+        in
+        let domain = zip domain stack in
+        let mask =
+          if index < mib.Declarations.mind_nparams then mask
+          else Option.is_empty (direct_registered_unit_like infos domain) :: mask
+        in
+        let subst = usubs_cons args.(index) subst in
+        fields (index + 1) (mk_clos subst body) mask
+      | _ -> [||]
+  in
+  fields 0 constructor_type []
+
+let rel_type infos n =
+  let local_depth = Range.length infos.cnv_rel_types in
+  if n <= local_depth then Range.get infos.cnv_rel_types (n - 1)
+  else
+    let env = info_env infos.cnv_inf in
+    try
+      let decl = Environ.lookup_rel (n - local_depth) env in
+      Some (inject (Context.Rel.Declaration.get_type decl))
+    with Not_found -> None
+
+let push_relevance ?(typ = None) infos r =
+  { infos with
+    cnv_inf = CClosure.push_relevance infos.cnv_inf r;
+    cnv_rel_types = Range.cons typ infos.cnv_rel_types }
 
 let push_relevances infos nas =
-  { infos with cnv_inf = CClosure.push_relevances infos.cnv_inf nas }
+  { infos with
+    cnv_inf = CClosure.push_relevances infos.cnv_inf nas;
+    cnv_rel_types =
+      Array.fold_left (fun types _ -> Range.cons None types)
+        infos.cnv_rel_types nas }
 
 let identity_of_ctx (ctx:Constr.rel_context) =
   Context.Rel.instance mkRel 0 ctx
@@ -356,7 +423,6 @@ let rec compare_under e1 c1 e2 c2 =
     | Proj _ | Evar _ | Const _ | Ind _ | Construct _ | Case _ | Fix _
     | CoFix _ | Int _ | Float _ | String _ | Array _), _ -> false
 
-
 let rec fast_test lft1 term1 lft2 term2 = match fterm_of term1, fterm_of term2 with
   | FLIFT (i, term1), (FLIFT _ | FCLOS _) -> fast_test (el_shft i lft1) term1 lft2 term2
   | FCLOS _, FLIFT (j, term2) -> fast_test lft1 term1 (el_shft j lft2) term2
@@ -370,6 +436,301 @@ let assert_reduced_constructor s =
     CErrors.anomaly Pp.(str "conversion was given unreduced term (FConstruct).")
 
 (* Conversion between  [lft1]term1 and [lft2]term2 *)
+let is_registered_unit_like env ind =
+  List.exists (Ind.UserOrd.equal ind)
+    (Environ.retroknowledge env).Retroknowledge.retro_unit_like
+
+let is_eta_record env (ind, u) =
+  Declareops.is_record_with_eta (Inductive.lookup_mind_specif env ind) u
+
+let abbreviation_inductive_type ~fresh infos typ =
+  try
+    (* Inspect local types in fresh closures, without mutating conversion inputs. *)
+    let tab = create_tab () in
+    let typ = if fresh then typ else inject (term_of_fconstr typ) in
+    let oracle = CClosure.oracle_of_infos infos.cnv_inf in
+    let type_infos =
+      infos_with_reds infos.cnv_inf RedFlags.betaiotazeta
+    in
+    let rec inspect typ stack =
+      let typ, stack = whd_stack type_infos tab typ stack in
+      match direct_inductive (zip typ stack) with
+      | Some _ as ind -> ind
+      | None -> begin match fterm_of typ with
+        | FFlex (ConstKey (c, _) as fl) ->
+          begin match Conv_oracle.get_strategy oracle
+            (Conv_oracle.EvalConstRef c) with
+          | Conv_oracle.Expand ->
+            begin match unfold_ref_with_args infos.cnv_inf tab fl stack with
+            | Some (typ, stack) -> inspect typ stack
+            | None -> None
+            end
+          | Conv_oracle.Level _ | Conv_oracle.Opaque -> None
+          end
+        | _ -> None
+        end
+    in
+    inspect typ empty_stack
+  with Not_found | Assert_failure _ -> None
+
+let rec application_args arrays = function
+  | Zapp args :: stack -> application_args (args :: arrays) stack
+  | (Zshift _ | Zupdate _) :: stack -> application_args arrays stack
+  | [] -> Some (Array.concat (List.rev arrays))
+  | (ZcaseT _ | Zproj _ | Zfix _ | Zprimitive _) :: _ -> None
+
+let inductive_after_eliminating ?(expand_aliases = false)
+    ?(allow_dependent_projections = true)
+    reduction_infos tab typ stack =
+  let env = info_env reduction_infos in
+  let rec direct_unit_like_alias fuel (constant, instance) =
+    if Int.equal fuel 0 then None
+    else
+      match Environ.constant_opt_value_in env (constant, instance) with
+      | None -> None
+      | Some body ->
+        let head, _ = Constr.decompose_app body in
+        begin match Constr.kind head with
+        | Constr.Ind (ind, _)
+          when is_registered_unit_like env ind -> Some ind
+        | Constr.Const constant ->
+          direct_unit_like_alias (fuel - 1) constant
+        | _ -> None
+        end
+  in
+  let rec apply_args typ args index =
+    if Int.equal index (Array.length args) then Some typ
+    else
+      let typ, stack = whd_stack reduction_infos tab typ empty_stack in
+      match fterm_of (zip typ stack) with
+      | FProd (_, _, body, subst) ->
+        let subst = usubs_cons args.(index) subst in
+        apply_args (mk_clos subst body) args (index + 1)
+      | _ -> None
+  in
+  let rec final fuel typ =
+    let typ, stack = whd_stack reduction_infos tab typ empty_stack in
+    match direct_inductive (zip typ stack) with
+    | Some _ as inductive -> inductive
+    | None when expand_aliases && fuel > 0 ->
+      begin match fterm_of typ, stack with
+      | FFlex (ConstKey ((constant, _) as puniverses) as flex), [] ->
+          begin match direct_unit_like_alias fuel puniverses with
+          | Some _ as inductive -> inductive
+          | None ->
+            let oracle = CClosure.oracle_of_infos reduction_infos in
+            begin match
+              Conv_oracle.get_strategy oracle
+                (Conv_oracle.EvalConstRef constant)
+            with
+            | Conv_oracle.Expand ->
+              begin match
+                unfold_ref_with_args reduction_infos tab flex stack
+              with
+              | Some (typ, stack) -> final (fuel - 1) (zip typ stack)
+              | None -> None
+              end
+            | Conv_oracle.Level _ | Conv_oracle.Opaque -> None
+            end
+          end
+      | _ -> None
+      end
+    | None -> None
+  in
+  let rec eliminate typ = function
+    | [] ->
+      final 32 typ
+    | (Zshift _ | Zupdate _) :: stack -> eliminate typ stack
+    | Zapp args :: stack ->
+      Option.bind (apply_args typ args 0) (fun typ -> eliminate typ stack)
+    | Zproj (repr, _) :: stack ->
+      let typ, typ_stack =
+        whd_stack reduction_infos tab typ empty_stack
+      in
+      begin match fterm_of typ, application_args [] typ_stack with
+      | FInd ((current, u)), Some args
+        when Environ.QInd.equal env current (Projection.Repr.inductive repr) ->
+        begin match
+          try Some (Environ.lookup_projection (Projection.make repr true) env)
+          with Not_found -> None
+        with
+        | Some (_, projection_type)
+          when allow_dependent_projections || Vars.noccurn 1 projection_type ->
+          (* Substitute lazily: erased proof parameters may be [FIrrelevant]. *)
+          let subst =
+            Array.fold_left (fun subst arg -> usubs_cons arg subst)
+              (subs_id 0, u) args
+          in
+          let subst = usubs_cons (inject (mkRel 1)) subst in
+          eliminate (mk_clos subst projection_type) stack
+        | Some _ | None -> None
+        end
+      | _ -> None
+      end
+    | (ZcaseT _ | Zfix _ | Zprimitive _) :: _ -> None
+  in
+  eliminate typ stack
+
+let inductive_after_applying infos tab typ stack =
+  inductive_after_eliminating infos.cnv_inf tab typ stack
+
+let transparent_inductive_after_applying infos typ stack =
+  try
+  (* Follow transparent type aliases when checking the record-eta guard. *)
+  let type_infos =
+    let all = RedFlags.(red_add_transparent all
+      (red_transparent (info_flags infos.cnv_inf)))
+    in
+    infos_with_reds infos.cnv_inf all
+  in
+  let rec fresh_stack = function
+    | [] -> Some []
+    | (Zshift _ | Zupdate _) :: stack -> fresh_stack stack
+    | Zapp args :: stack ->
+      let rec fresh_args index args' =
+        if Int.equal index (Array.length args) then
+          Some (Array.of_list (List.rev args'))
+        else
+          try
+            let arg = inject (term_of_fconstr args.(index)) in
+            fresh_args (index + 1) (arg :: args')
+          with Assert_failure _ -> None
+      in
+      Option.bind (fresh_args 0 []) (fun args ->
+        Option.map (fun stack -> Zapp args :: stack) (fresh_stack stack))
+    | Zproj _ as projection :: stack ->
+      Option.map (fun stack -> projection :: stack) (fresh_stack stack)
+    | (ZcaseT _ | Zfix _ | Zprimitive _) :: _ -> None
+  in
+  match fresh_stack stack with
+  | Some stack ->
+    (* Isolate type reduction from the main conversion's tables and closures. *)
+    let tab = create_tab () in
+    let typ = inject (term_of_fconstr typ) in
+    inductive_after_eliminating type_infos tab typ stack
+  | None -> None
+  with Not_found | Assert_failure _ -> None
+
+(* Unit eta supports applications and projections, not other eliminations. *)
+let rec unit_like_stack = function
+  | [] -> true
+  | (Zapp _ | Zproj _ | Zshift _ | Zupdate _) :: stack -> unit_like_stack stack
+  | (ZcaseT _ | Zfix _ | Zprimitive _) :: _ -> false
+
+let shallow_unit_like_after_applying infos typ stack =
+  let env = info_env infos.cnv_inf in
+  let substituted_inductive () =
+    if not (unit_like_stack stack) then None
+    else
+      let type_infos =
+        infos_with_reds infos.cnv_inf RedFlags.betaiotazeta
+      in
+      let tab = create_tab () in
+      (* The dummy scrutinee requires a nondependent projection type. *)
+      inductive_after_eliminating ~expand_aliases:true
+        ~allow_dependent_projections:false
+        type_infos tab (inject typ) stack
+  in
+  let rec strip_products count typ =
+    if Int.equal count 0 then
+      let typ = inject typ in
+      begin match direct_registered_unit_like infos typ with
+      | Some _ as ind -> ind
+      | None ->
+        Option.bind (abbreviation_inductive_type ~fresh:true infos typ)
+          (fun ind -> if is_registered_unit_like env ind then Some ind else None)
+      end
+    else
+      match Constr.kind typ with
+      | Constr.Prod (_, _, body) -> strip_products (count - 1) body
+      | Constr.Cast (term, _, _) -> strip_products count term
+      | _ -> None
+  in
+  match substituted_inductive () with
+  | Some ind when is_registered_unit_like env ind -> Some ind
+  | Some _ | None ->
+    match application_args [] stack with
+    | Some arguments -> strip_products (Array.length arguments) typ
+    | None -> None
+
+let unit_like_of_rel infos _tab lft stack n =
+  (* Reject unsupported stacks before reifying a potentially shared local type. *)
+  if not (unit_like_stack stack) then None
+  else
+    let n = reloc_rel n (el_stack lft stack) in
+    Option.bind (rel_type infos n) (fun typ ->
+      try shallow_unit_like_after_applying infos (term_of_fconstr typ) stack
+      with Assert_failure _ -> None)
+
+let rel_has_unit_like infos tab lft (hd, stack) ind =
+  match fterm_of hd with
+  | FRel n -> begin match unit_like_of_rel infos tab lft stack n with
+    | Some rel_ind -> Ind.UserOrd.equal ind rel_ind
+    | None -> false
+    end
+  | _ -> false
+
+let unit_like_of_flex infos _tab lft stack fl =
+  (* Reject unsupported stacks before reifying a potentially shared local type. *)
+  if not (unit_like_stack stack) then None
+  else
+    let env = info_env infos.cnv_inf in
+    let typ = match fl with
+    | RelKey n ->
+      let n = reloc_rel n (el_stack lft stack) in
+      Option.bind (rel_type infos n) (fun typ ->
+        try Some (term_of_fconstr typ) with Assert_failure _ -> None)
+    | VarKey id ->
+      Some (Context.Named.Declaration.get_type (Environ.lookup_named id env))
+    | ConstKey (c, u) ->
+      Some (Environ.constant_type_in env (c, u))
+    in
+    Option.bind typ (fun typ ->
+      shallow_unit_like_after_applying infos typ stack)
+
+let flex_has_unit_like infos tab lft stack fl ind =
+  match unit_like_of_flex infos tab lft stack fl with
+  | Some flex_ind -> Ind.UserOrd.equal ind flex_ind
+  | None -> false
+
+let same_unit_like_flexes infos lft1 v1 fl1 lft2 v2 fl2 =
+  match unit_like_of_flex infos infos.lft_tab lft1 v1 fl1,
+        unit_like_of_flex infos infos.rgt_tab lft2 v2 fl2 with
+  | Some ind1, Some ind2 -> Ind.UserOrd.equal ind1 ind2
+  | _ -> false
+
+let same_unit_like_flex_rel infos flex_tab flex_lift flex_stack flex
+    rel_tab rel_lift rel_stack rel =
+  match unit_like_of_flex infos flex_tab flex_lift flex_stack flex,
+        unit_like_of_rel infos rel_tab rel_lift rel_stack rel with
+  | Some flex_ind, Some rel_ind -> Ind.UserOrd.equal flex_ind rel_ind
+  | _ -> false
+
+let flex_result_inductive infos tab lft stack fl =
+  let env = info_env infos.cnv_inf in
+  let typ = match fl with
+  | RelKey n ->
+    let n = reloc_rel n (el_stack lft stack) in
+    rel_type infos n
+  | VarKey id ->
+    Some (inject
+      (Context.Named.Declaration.get_type (Environ.lookup_named id env)))
+  | ConstKey (c, u) ->
+    Some (inject (Environ.constant_type_in env (c, u)))
+  in
+  let flex_ind = Option.bind typ (fun typ ->
+    try match inductive_after_applying infos tab typ stack with
+      | Some _ as ind -> ind
+      | None -> transparent_inductive_after_applying infos typ stack
+    with Not_found | Assert_failure _ -> None)
+  in
+  flex_ind
+
+let flex_has_inductive infos tab lft stack fl ind =
+  match flex_result_inductive infos tab lft stack fl with
+  | Some flex_ind -> Ind.UserOrd.equal ind flex_ind
+  | None -> false
+
 let rec ccnv cv_pb l2r infos lft1 lft2 term1 term2 cuniv =
   let fast = fast_test lft1 term1 lft2 term2 in
   if fast then cuniv
@@ -417,6 +778,8 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
 
     (* 2 index known to be bound to no constant *)
     | (FRel n, FRel m) ->
+        let original_n = n in
+        let original_m = m in
         let el1 = el_stack lft1 v1 in
         let el2 = el_stack lft2 v2 in
         let n = reloc_rel n el1 in
@@ -427,10 +790,24 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
           let v1 = CClosure.skip_irrelevant_stack infos.cnv_inf v1 in
           let v2 = CClosure.skip_irrelevant_stack infos.cnv_inf v2 in
           convert_stacks l2r infos lft1 lft2 v1 v2 cuniv
-        else if Int.equal n m then
-          convert_stacks l2r infos lft1 lft2 v1 v2 cuniv
         else
-          raise NotConvertible
+          let same_unit_like () =
+            let unit1 =
+              unit_like_of_rel infos infos.lft_tab lft1 v1 original_n
+            in
+            let unit2 =
+              unit_like_of_rel infos infos.rgt_tab lft2 v2 original_m
+            in
+            match unit1, unit2 with
+            | Some ind1, Some ind2 when Ind.UserOrd.equal ind1 ind2 -> true
+            | _ -> false
+          in
+          if Int.equal n m then
+            try convert_stacks l2r infos lft1 lft2 v1 v2 cuniv
+            with (NotConvertible | NotConvertibleTrace _) as error ->
+              if same_unit_like () then cuniv else raise error
+          else
+            if same_unit_like () then cuniv else raise NotConvertible
 
     (* 2 constants, 2 local defined vars or 2 defined rels *)
     | (FFlex fl1, FFlex fl2) ->
@@ -445,6 +822,8 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
          in
          convert_stacks ~mask l2r infos lft1 lft2 v1 v2 cuniv
        with NotConvertible | NotConvertibleTrace _ ->
+        if same_unit_like_flexes infos lft1 v1 fl1 lft2 v2 fl2 then cuniv
+        else
         let r1 = unfold_ref_with_args infos.cnv_inf infos.lft_tab fl1 v1 in
         let r2 = unfold_ref_with_args infos.cnv_inf infos.rgt_tab fl2 v2 in
         match r1, r2 with
@@ -493,6 +872,54 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
           let t2 = whd_stack (infos_with_reds infos.cnv_inf all) infos.rgt_tab t2 v2 in
           eqwhnf cv_pb l2r infos appr1 (lft2, t2) cuniv
         )
+
+    | (FProj (p1, r1, c1), FConstruct (((ind2, 1), u2), args2))
+      when infos.cnv_typ &&
+           is_eta_record (info_env infos.cnv_inf) (ind2, u2) ->
+      let () = assert_reduced_constructor v2 in
+      begin match unfold_projection infos.cnv_inf p1 r1 with
+      | Some s1 ->
+        eqappr cv_pb l2r infos (lft1, (c1, s1 :: v1)) appr2 cuniv
+      | None ->
+        if is_registered_unit_like (info_env infos.cnv_inf) ind2 then cuniv
+        else
+          begin match
+            try Some (eta_expand_ind_stack (info_env infos.cnv_inf) (ind2, u2)
+              args2 (snd appr1))
+            with Not_found -> None
+          with
+          | Some (v2, v1) ->
+            let mask =
+              record_unit_like_mask infos infos.rgt_tab (ind2, u2) args2
+            in
+            convert_stacks ~mask l2r infos lft1 lft2 v1 v2 cuniv
+          | None -> raise NotConvertible
+          end
+      end
+
+    | (FConstruct (((ind1, 1), u1), args1), FProj (p2, r2, c2))
+      when infos.cnv_typ &&
+           is_eta_record (info_env infos.cnv_inf) (ind1, u1) ->
+      let () = assert_reduced_constructor v1 in
+      begin match unfold_projection infos.cnv_inf p2 r2 with
+      | Some s2 ->
+        eqappr cv_pb l2r infos appr1 (lft2, (c2, s2 :: v2)) cuniv
+      | None ->
+        if is_registered_unit_like (info_env infos.cnv_inf) ind1 then cuniv
+        else
+          begin match
+            try Some (eta_expand_ind_stack (info_env infos.cnv_inf) (ind1, u1)
+              args1 (snd appr2))
+            with Not_found -> None
+          with
+          | Some (v1, v2) ->
+            let mask =
+              record_unit_like_mask infos infos.lft_tab (ind1, u1) args1
+            in
+            convert_stacks ~mask l2r infos lft1 lft2 v1 v2 cuniv
+          | None -> raise NotConvertible
+          end
+      end
 
     | (FProj (p1,r1,c1), FProj (p2, r2, c2)) ->
       (* Projections: prefer unfolding to first-order unification,
@@ -558,7 +985,7 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
         let el1 = el_stack lft1 v1 in
         let el2 = el_stack lft2 v2 in
         let cuniv = ccnv CONV l2r infos el1 el2 ty1 ty2 cuniv in
-        ccnv CONV l2r (push_relevance infos x1) (el_lift el1) (el_lift el2) bd1 bd2 cuniv
+        ccnv CONV l2r (push_relevance ~typ:(Some ty1) infos x1) (el_lift el1) (el_lift el2) bd1 bd2 cuniv
 
     | (FProd (x1, c1, c2, e), FProd (_, c'1, c'2, e')) ->
         if not (is_empty_stack v1 && is_empty_stack v2) then
@@ -569,7 +996,7 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
         let el2 = el_stack lft2 v2 in
         let cuniv = ccnv CONV l2r infos el1 el2 c1 c'1 cuniv in
         let x1 = usubst_binder e x1 in
-        ccnv cv_pb l2r (push_relevance infos x1) (el_lift el1) (el_lift el2) (mk_clos (usubs_lift e) c2) (mk_clos (usubs_lift e') c'2) cuniv
+        ccnv cv_pb l2r (push_relevance ~typ:(Some c1) infos x1) (el_lift el1) (el_lift el2) (mk_clos (usubs_lift e) c2) (mk_clos (usubs_lift e') c'2) cuniv
 
     (* Eta-expansion on the fly *)
     | (FLambda _, _) ->
@@ -578,8 +1005,8 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
         | _ ->
           anomaly (Pp.str "conversion was given unreduced term (FLambda).")
         in
-        let (x1,_ty1,bd1) = destFLambda mk_clos hd1 in
-        let infos = push_relevance infos x1 in
+        let (x1,ty1,bd1) = destFLambda mk_clos hd1 in
+        let infos = push_relevance ~typ:(Some ty1) infos x1 in
         eqappr CONV l2r infos
           (el_lift lft1, (bd1, [])) (el_lift lft2, (hd2, eta_expand_stack infos.cnv_inf x1 v2)) cuniv
     | (_, FLambda _) ->
@@ -588,14 +1015,48 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
         | _ ->
           anomaly (Pp.str "conversion was given unreduced term (FLambda).")
         in
-        let (x2,_ty2,bd2) = destFLambda mk_clos hd2 in
-        let infos = push_relevance infos x2 in
+        let (x2,ty2,bd2) = destFLambda mk_clos hd2 in
+        let infos = push_relevance ~typ:(Some ty2) infos x2 in
         eqappr CONV l2r infos
           (el_lift lft1, (hd1, eta_expand_stack infos.cnv_inf x2 v1)) (el_lift lft2, (bd2, [])) cuniv
 
     (* only one constant, defined var or defined rel *)
     | (FFlex fl1, c2)      ->
-      begin match unfold_ref_with_args infos.cnv_inf infos.lft_tab fl1 v1 with
+      if
+        match c2 with
+        | FRel rel ->
+          same_unit_like_flex_rel infos infos.lft_tab lft1 v1 fl1
+            infos.rgt_tab lft2 v2 rel
+        | _ -> false
+      then cuniv
+      else
+      let eta_before_unfolding () =
+        match c2 with
+        | FConstruct (((ind2, 1), u2), args2) ->
+          let () = assert_reduced_constructor v2 in
+          if not (flex_has_inductive infos infos.lft_tab lft1 v1 fl1 ind2)
+          then None
+          else if is_registered_unit_like (info_env infos.cnv_inf) ind2 &&
+             (infos.cnv_typ ||
+              flex_has_unit_like infos infos.lft_tab lft1 v1 fl1 ind2)
+          then Some cuniv
+          else
+            (try
+               let v2, v1 =
+                 eta_expand_ind_stack (info_env infos.cnv_inf) (ind2, u2)
+                   args2 (snd appr1)
+               in
+               let mask =
+                 record_unit_like_mask infos infos.rgt_tab (ind2, u2) args2
+               in
+               Some (convert_stacks ~mask l2r infos lft1 lft2 v1 v2 cuniv)
+             with Not_found | NotConvertible | NotConvertibleTrace _ -> None)
+        | _ -> None
+      in
+      begin match eta_before_unfolding () with
+      | Some cuniv -> cuniv
+      | None ->
+        match unfold_ref_with_args infos.cnv_inf infos.lft_tab fl1 v1 with
         | Some (def1,v1) ->
           (** By virtue of the previous case analyses, we know [c2] is rigid.
               Conversion check to rigid terms eventually implies full weak-head
@@ -604,34 +1065,51 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
             let all = RedFlags.(red_add_transparent all (red_transparent (info_flags infos.cnv_inf))) in
             let r1 = whd_stack (infos_with_reds infos.cnv_inf all) infos.lft_tab def1 v1 in
             eqwhnf cv_pb l2r infos (lft1, r1) appr2 cuniv
-        | None ->
-          (match c2 with
-           | FConstruct (((ind2, 1), u2), args2) ->
-             let () = assert_reduced_constructor v2 in
-             (try
-                let v2, v1 =
-                  eta_expand_ind_stack (info_env infos.cnv_inf) (ind2,u2) args2 (snd appr1)
-                in convert_stacks l2r infos lft1 lft2 v1 v2 cuniv
-              with Not_found -> raise NotConvertible)
-           | _ -> raise NotConvertible)
+        | None -> raise NotConvertible
       end
 
     | (c1, FFlex fl2)      ->
-       begin match unfold_ref_with_args infos.cnv_inf infos.rgt_tab fl2 v2 with
+      if
+        match c1 with
+        | FRel rel ->
+          same_unit_like_flex_rel infos infos.rgt_tab lft2 v2 fl2
+            infos.lft_tab lft1 v1 rel
+        | _ -> false
+      then cuniv
+      else
+       let eta_before_unfolding () =
+         match c1 with
+         | FConstruct (((ind1, 1), u1), args1) ->
+           let () = assert_reduced_constructor v1 in
+           if not (flex_has_inductive infos infos.rgt_tab lft2 v2 fl2 ind1)
+           then None
+           else if is_registered_unit_like (info_env infos.cnv_inf) ind1 &&
+              (infos.cnv_typ ||
+               flex_has_unit_like infos infos.rgt_tab lft2 v2 fl2 ind1)
+           then Some cuniv
+           else
+             (try
+                let v1, v2 =
+                  eta_expand_ind_stack (info_env infos.cnv_inf) (ind1, u1)
+                    args1 (snd appr2)
+                in
+                let mask =
+                  record_unit_like_mask infos infos.lft_tab (ind1, u1) args1
+                in
+                Some (convert_stacks ~mask l2r infos lft1 lft2 v1 v2 cuniv)
+              with Not_found | NotConvertible | NotConvertibleTrace _ -> None)
+         | _ -> None
+       in
+       begin match eta_before_unfolding () with
+       | Some cuniv -> cuniv
+       | None ->
+         match unfold_ref_with_args infos.cnv_inf infos.rgt_tab fl2 v2 with
         | Some (def2, v2) ->
           (** Symmetrical case of above. *)
           let all = RedFlags.(red_add_transparent all (red_transparent (info_flags infos.cnv_inf))) in
           let r2 = whd_stack (infos_with_reds infos.cnv_inf all) infos.rgt_tab def2 v2 in
           eqwhnf cv_pb l2r infos appr1 (lft2, r2) cuniv
-        | None ->
-          match c1 with
-          | FConstruct (((ind1, 1), u1), args1) ->
-            let () = assert_reduced_constructor v1 in
-            (try let v1, v2 =
-                   eta_expand_ind_stack (info_env infos.cnv_inf) (ind1,u1) args1 (snd appr2)
-               in convert_stacks l2r infos lft1 lft2 v1 v2 cuniv
-             with Not_found -> raise NotConvertible)
-          | _ -> raise NotConvertible
+        | None -> raise NotConvertible
        end
 
     (* Inductive types:  MutInd MutConstruct Fix Cofix *)
@@ -693,20 +1171,32 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
       let () = assert_reduced_constructor v1 in
       (* records only have 1 constructor *)
       let () = if not @@ Int.equal j1 1 then raise NotConvertible in
-      (try
+      if is_registered_unit_like (info_env infos.cnv_inf) ind1 &&
+         (infos.cnv_typ ||
+          rel_has_unit_like infos infos.rgt_tab lft2 (hd2, v2) ind1)
+      then cuniv
+      else (try
          let v1, v2 =
             eta_expand_ind_stack (info_env infos.cnv_inf) (ind1,u1) args1 (snd appr2)
-         in convert_stacks l2r infos lft1 lft2 v1 v2 cuniv
+         in
+         let mask = record_unit_like_mask infos infos.lft_tab (ind1, u1) args1 in
+         convert_stacks ~mask l2r infos lft1 lft2 v1 v2 cuniv
        with Not_found -> raise NotConvertible)
 
     | (_, FConstruct (((ind2, j2), u2), args2)) ->
       let () = assert_reduced_constructor v2 in
       (* records only have 1 constructor *)
       let () = if not @@ Int.equal j2 1 then raise NotConvertible in
-      (try
+      if is_registered_unit_like (info_env infos.cnv_inf) ind2 &&
+         (infos.cnv_typ ||
+          rel_has_unit_like infos infos.lft_tab lft1 (hd1, v1) ind2)
+      then cuniv
+      else (try
          let v2, v1 =
             eta_expand_ind_stack (info_env infos.cnv_inf) (ind2,u2) args2 (snd appr1)
-         in convert_stacks l2r infos lft1 lft2 v1 v2 cuniv
+         in
+         let mask = record_unit_like_mask infos infos.rgt_tab (ind2, u2) args2 in
+         convert_stacks ~mask l2r infos lft1 lft2 v1 v2 cuniv
        with Not_found -> raise NotConvertible)
 
     | (FFix (((op1, i1),(na1,tys1,cl1)),e1), FFix(((op2, i2),(_,tys2,cl2)),e2)) ->
@@ -971,7 +1461,7 @@ let clos_gen_conv (type err) ~typed trans cv_pb l2r evars env graph univs t1 t2 
       let box e = Error.Error e in
       let infos = {
         cnv_inf = infos;
-        cnv_typ = typed;
+        cnv_typ = typed; cnv_rel_types = Range.empty;
         lft_tab = create_tab ();
         rgt_tab = create_tab ();
         err_ret = box;
@@ -1023,7 +1513,7 @@ let () =
       let box = Empty.abort in
       let state = info_univs infos in
       let qual_equal q1 q2 = CClosure.eq_quality infos q1 q2 in
-      let infos = { cnv_inf = infos; cnv_typ = true; lft_tab = tab; rgt_tab = tab; err_ret = box; } in
+      let infos = { cnv_inf = infos; cnv_typ = true; cnv_rel_types = Range.empty; lft_tab = tab; rgt_tab = tab; err_ret = box; } in
       let state', _ = ccnv CONV false infos el_id el_id a b (state, checked_universes_gen qual_equal) in
       assert (state==state');
       true
