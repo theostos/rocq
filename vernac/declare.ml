@@ -605,6 +605,10 @@ let is_unsafe_typing_flags flags =
 
 let declare_constant ~loc ?(local = Locality.ImportDefaultBehavior) ~name ~kind ~typing_flags ?user_warns cd =
   let before_univs = Global.universes () in
+  let trace stage =
+    if Option.has_some (Sys.getenv_opt "ROCQ_OPAQUE_TRACE") then
+      Printf.eprintf "[declare] %s\n%!" stage
+  in
   let make_constant = function
   (* Logically define the constant and its subproofs, no libobject tampering *)
     | DefinitionEntry de ->
@@ -673,10 +677,15 @@ let declare_constant ~loc ?(local = Locality.ImportDefaultBehavior) ~name ~kind 
         Opaques.declare_defined_opaque ?feedback_id i body
       | Def _ | Undef _ | Primitive _ | Symbol _ -> assert false
   in
+  let () = trace "before name check" in
   let () = check_exists name in
+  let () = trace "after name check" in
   let decl, unsafe, ubinders, delayed, ctx = make_constant cd in
+  let () = trace "after entry conversion" in
   let () = Global.push_context_set ctx in
+  let () = trace "after universe context" in
   let kn = Global.add_constant ?typing_flags name decl in
+  let () = trace "after kernel declaration" in
   let () =
     let is_new_constraint (u,_,v as c) =
       match UGraph.check_declared_universes before_univs Univ.Level.Set.(add u (add v empty)) with

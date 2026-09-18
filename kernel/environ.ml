@@ -52,25 +52,125 @@ module DepCache :
 sig
   type t
   val empty : t
-  val get : Constant.t -> t -> (Cset_env.t, Cset_env.t -> unit) union
-  val fresh : t -> t
+  val direct : Constant.t -> t -> Cset_env.t option
+  val add_direct : Constant.t -> Cset_env.t -> int -> t -> unit
+  val answer : Constant.t -> Constant.t -> t -> (bool * bool) option
+  val add_answer : stable:bool -> Constant.t -> Constant.t -> bool -> t -> unit
+  val height : Constant.t -> t -> int option
+  val add_height : Constant.t -> int -> t -> unit
+  val fresh : ?added:Constant.t -> ?replaced:bool -> t -> t
 end =
 struct
 
-type t = Cset_env.t Cmap_env.t ref option
+(* Cache direct edges, never the transitive closure of every declaration.
+   Immutable maps allow environment forks to share completed entries safely.
+   Both edge storage and pair answers have fixed caps. Clearing a cache only
+   loses an optimization: no incomplete negative answer is ever stored. *)
+type state = {
+  direct : Cset_env.t Cmap_env.t;
+  direct_weight : int;
+  answers : (bool * bool) Cmap_env.t Cmap_env.t;
+  answer_count : int;
+  unstable_answers : bool;
+  heights : int Cmap_env.t;
+  height_count : int;
+}
+type t = state ref option
 
 let empty = None
+let empty_state = {
+  direct = Cmap_env.empty; direct_weight = 0;
+  answers = Cmap_env.empty; answer_count = 0;
+  unstable_answers = false;
+  heights = Cmap_env.empty; height_count = 0;
+}
+let max_direct_weight = 65_536
+let max_answers = 8_192
+let max_heights = 65_536
 
-let get kn cache = match cache with
-| None -> Inr ignore
+let height kn = function
+| None -> None
+| Some cache -> Cmap_env.find_opt kn !cache.heights
+
+let add_height kn height = function
+| None -> ()
 | Some cache ->
-  match Cmap_env.find_opt kn !cache with
-  | None -> Inr (fun s -> cache := Cmap_env.add kn s !cache)
-  | Some s -> Inl s
+  let state = !cache in
+  if not (Cmap_env.mem kn state.heights) then begin
+    let heights, count =
+      if state.height_count >= max_heights then Cmap_env.empty, 0
+      else state.heights, state.height_count
+    in
+    cache := { state with heights = Cmap_env.add kn height heights;
+                          height_count = count + 1 }
+  end
 
-let fresh = function
-| None -> Some (ref Cmap_env.empty)
-| Some cache -> Some (ref !cache)
+let direct kn = function
+| None -> None
+| Some cache ->
+  Cmap_env.find_opt kn !cache.direct
+
+let add_direct kn edges count = function
+| None -> ()
+| Some cache ->
+  if count < max_direct_weight && not (Cmap_env.mem kn !cache.direct) then begin
+    let weight = count + 1 in
+    let state = !cache in
+    let state =
+      if state.direct_weight > max_direct_weight - weight then
+        { state with direct = Cmap_env.empty; direct_weight = 0 }
+      else state
+    in
+    cache := { state with
+      direct = Cmap_env.add kn edges state.direct;
+      direct_weight = state.direct_weight + weight }
+  end
+
+let answer source target = function
+| None -> None
+| Some cache ->
+  Option.bind (Cmap_env.find_opt source !cache.answers)
+    (Cmap_env.find_opt target)
+
+let add_answer ~stable source target result = function
+| None -> ()
+| Some cache ->
+  let state = !cache in
+  let answers, count, unstable =
+    if state.answer_count >= max_answers then Cmap_env.empty, 0, false
+    else state.answers, state.answer_count, state.unstable_answers
+  in
+  let previous = Option.default Cmap_env.empty
+    (Cmap_env.find_opt source answers) in
+  let count = if Cmap_env.mem target previous then count else count + 1 in
+  cache := { state with
+    answers = Cmap_env.add source (Cmap_env.add target (result, stable) previous) answers;
+    answer_count = count; unstable_answers = unstable || not stable }
+
+let fresh ?added ?(replaced=false) cache =
+  let state = match cache with None -> empty_state | Some cache -> !cache in
+  let state = match added with
+  | None -> state
+  | Some kn ->
+    (* Completed searches through existing declarations survive ordinary
+       extensions. A missing reference may acquire a body, and a replacement
+       can change arbitrary paths: invalidate answers in those cases. *)
+    let direct, direct_weight = match Cmap_env.find_opt kn state.direct with
+    | None -> state.direct, state.direct_weight
+    | Some _ ->
+      (* Avoid an unbudgeted cardinality scan during environment construction. *)
+      Cmap_env.empty, 0
+    in
+    let state = { state with direct; direct_weight } in
+    let state = if replaced then
+      { state with heights = Cmap_env.empty; height_count = 0 }
+      else state in
+    if replaced || state.unstable_answers then
+      { state with answers = Cmap_env.empty; answer_count = 0;
+                   unstable_answers = false }
+    else state
+  in
+  Some (ref state)
 
 end
 
@@ -780,13 +880,14 @@ let add_constant_key kn cb linkinfo env =
     | _ -> env.symb_pats
   in
   let constant_deps =
-    (* when replacing a previous constant, invalidate the cache *)
-    if Cmap_env.mem kn env.env_constants then DepCache.empty
-    else match CEphemeron.get env.constant_deps with
-    | cache -> cache
-    | exception CEphemeron.InvalidKey -> DepCache.empty
+    let cache =
+      try CEphemeron.get env.constant_deps
+      with CEphemeron.InvalidKey -> DepCache.empty
+    in
+    cache
   in
-  let constant_deps = CEphemeron.create @@ DepCache.fresh constant_deps in
+  let constant_deps = CEphemeron.create @@ DepCache.fresh ~added:kn
+    ~replaced:(Cmap_env.mem kn env.env_constants) constant_deps in
   { env with constant_hyps; irr_constants; symb_pats; env_constants = new_constants; constant_deps }
 
 let add_constant kn cb env =
@@ -1270,35 +1371,143 @@ end
 
 module QGlobRef = HackQ(GlobRef)(GlobRef.Map_env)
 
-let rec constant_dependencies_with_cache env cache kn =
-  match DepCache.get kn cache with
-  | Inl deps -> deps
-  | Inr set ->
-    match Cmap_env.find_opt kn env.env_constants with
-    | None -> Cset_env.empty
-    | Some (body, _, _) ->
-      let deps = match body.const_body with
-      | Def c ->
-        let rec compute_dependencies accu c = match kind c with
-        | Const (kn, _) ->
-          Cset_env.fold Cset_env.add (constant_dependencies_with_cache env cache kn) (Cset_env.add kn accu)
-        | _ -> Constr.fold compute_dependencies accu c
-        in
-        compute_dependencies Cset_env.empty c
-      | Undef _ | OpaqueDef _ | Primitive _ | Symbol _ -> Cset_env.empty
-      in
-      let () = set deps in
-      deps
-
-let constant_dependencies env kn =
+let constant_depends_on ?(fuel = ref 16_384) env cst1 cst2 =
+  let exception Exhausted in
+  let exception Found in
+  let visit () =
+    if !fuel <= 0 then raise Exhausted;
+    decr fuel;
+    if !fuel land 255 = 0 then Control.check_for_interrupt ()
+  in
   let cache =
     try CEphemeron.get env.constant_deps
     with CEphemeron.InvalidKey -> DepCache.empty
   in
-  constant_dependencies_with_cache env cache kn
-
-let constant_depends_on env cst1 cst2 =
-  Cset_env.mem cst2 (constant_dependencies env cst1)
+  (* An unmarshalled environment has no process-local cache. Still share work
+     inside this query, without installing data into an older environment. *)
+  let cache = if cache == DepCache.empty then DepCache.fresh cache else cache in
+  let missing = ref false in
+  let direct kn = match DepCache.direct kn cache with
+  | Some edges -> edges
+  | None ->
+    let edges = ref Cset_env.empty in
+    let count = ref 0 in
+    (match Cmap_env.find_opt kn env.env_constants with
+    | Some ({ const_body = Def body; _ }, _, _) ->
+      (* A fixed physical memo makes shared syntax cheap without retaining it.
+         Collisions may lose work, but the shared fuel bounds retries. The
+         explicit work list avoids recursion through a deep expression. *)
+      let seen = lazy (Array.make 4096 None) in
+      let rec collect = function
+      | [] -> ()
+      | `Done (slot, term) :: rest ->
+        (Lazy.force seen).(slot) <- Some term;
+        collect rest
+      | `Visit term :: rest ->
+        visit ();
+        match kind term with
+        | Const (constant, _) ->
+          if not (Cset_env.mem constant !edges) then begin
+            edges := Cset_env.add constant !edges;
+            incr count
+          end;
+          collect rest
+        | Rel _ | Meta _ | Var _ | Sort _ | Ind _ | Construct _
+        | Int _ | Float _ | String _ -> collect rest
+        | _ ->
+          let seen = Lazy.force seen in
+          let slot = Hashtbl.hash_param 4 16 term land 4095 in
+          match seen.(slot) with
+          | Some previous when previous == term -> collect rest
+          | _ ->
+            let todo = ref (`Done (slot, term) :: rest) in
+            Constr.iter (fun child -> visit (); todo := `Visit child :: !todo) term;
+            collect !todo
+      in
+      collect [`Visit body]
+    | None -> missing := true
+    | Some ({ const_body = (Undef _ | OpaqueDef _ | Primitive _ | Symbol _); _ }, _, _) -> ());
+    (* Missing declarations are not cached as terminal bodies. A negative
+       answer involving them is invalidated by the next environment extension. *)
+    if Cmap_env.mem kn env.env_constants then
+      DepCache.add_direct kn !edges !count cache;
+    !edges
+  in
+  try
+    visit ();
+    match DepCache.answer cst1 cst2 cache with
+    | Some (result, _) -> Some result
+    | None ->
+      let seen = ref Cset_env.empty in
+      let active = ref Cset_env.empty in
+      let cyclic = ref false in
+      let target_height = DepCache.height cst2 cache in
+      (* Heights are certified by complete postorder scans of existing bodies,
+         independently of oracle strategies. A path must strictly decrease
+         height. Missing references, cycles, cached answers without heights and
+         partial scans never certify an ancestor's height. *)
+      let absorb parent child = match parent with
+      | None -> ()
+      | Some parent ->
+        parent := match !parent, child with
+        | Some current, Some height when height < max_int ->
+          Some (max current (height + 1))
+        | _ -> None
+      in
+      let rec search = function
+      | [] -> false
+      | `Done (constant, height, parent) :: rest ->
+        visit ();
+        active := Cset_env.remove constant !active;
+        Option.iter (fun height -> DepCache.add_height constant height cache) !height;
+        absorb parent !height;
+        (* A completed DAG subgraph has no path to the target. Cache it even
+           if a later branch exhausts fuel. Once a back edge has been seen,
+           local completion does not establish that fact: only a completed
+           search from the original root may produce a cached negative. *)
+        if not !cyclic then
+          DepCache.add_answer ~stable:(not !missing) constant cst2 false cache;
+        search rest
+      | `Enter (constant, parent) :: rest ->
+        visit ();
+        if Cset_env.mem constant !seen then begin
+          if Cset_env.mem constant !active then begin
+            cyclic := true;
+            absorb parent None
+          end else absorb parent (DepCache.height constant cache);
+          search rest
+        end
+        else begin
+          seen := Cset_env.add constant !seen;
+          match DepCache.answer constant cst2 cache with
+          | Some (true, _) -> raise Found
+          | Some (false, stable) ->
+            (* Stability is part of each answer, not just cache-wide state:
+               an eviction during this query may clear the global marker. *)
+            if not stable then missing := true;
+            absorb parent (DepCache.height constant cache);
+            search rest
+          | None when
+              (match DepCache.height constant cache, target_height with
+               | Some height, Some target -> height <= target
+               | _ -> false) ->
+            absorb parent (DepCache.height constant cache);
+            search rest
+          | None ->
+            active := Cset_env.add constant !active;
+            let height = ref (if Cmap_env.mem constant env.env_constants then Some 0 else None) in
+            let todo = ref (`Done (constant, height, parent) :: rest) in
+            Cset_env.iter (fun dependency ->
+              visit ();
+              if Constant.UserOrd.equal dependency cst2 then raise Found;
+              todo := `Enter (dependency, Some height) :: !todo) (direct constant);
+            search !todo
+        end
+      in
+      let result = try search [`Enter (cst1, None)] with Found -> true in
+      DepCache.add_answer ~stable:(not !missing) cst1 cst2 result cache;
+      Some result
+  with Exhausted -> None
 
 module Internal = struct
   let push_template_context uctx env =

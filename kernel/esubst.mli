@@ -28,6 +28,11 @@
 *)
 type 'a subs
 
+(** Map substituted values, preserving all relocation information. [visit] is
+    called for every structural node, including nodes containing only variables.
+    This allows a caller to interrupt or bound copying before allocation. *)
+val map_subs : visit:(unit -> unit) -> ('a -> 'b) -> 'a subs -> 'b subs
+
 (** Derived constructors granting basic invariants *)
 
 (** Assuming [|Γ| = n], [Γ ⊢ subs_id n : Γ] *)

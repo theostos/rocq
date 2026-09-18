@@ -113,10 +113,17 @@ let marshal_in_segment (type a) h ~segment : a * Digest.t =
   (v, s.hash)
 
 let marshal_out_segment h ~segment v =
+  let trace stage =
+    if Option.has_some (Sys.getenv_opt "ROCQ_DIAGNOSTIC_SERIALIZATION") then
+      Printf.eprintf "[rocq serialization] %s %s cpu=%.3f heap_words=%d\n%!"
+        stage segment.id (Sys.time ()) (Gc.quick_stat ()).Gc.heap_words
+  in
   let { out_channel = ch } = h in
   let () = assert (not (CString.Map.mem segment.id h.out_segments)) in
   let pos = LargeFile.pos_out ch in
+  let () = trace "before" in
   let () = Marshal.to_channel ch v [] in
+  let () = trace "after" in
   let () = flush ch in
   let pos' = LargeFile.pos_out ch in
   let len = Int64.sub pos' pos in

@@ -18,14 +18,46 @@ module RelDecl = Context.Rel.Declaration
 
 exception LocalOccur
 
+module TermDepthCache = Hashtbl.Make (struct
+  type t = int * Constr.t
+  let equal (depth1, term1) (depth2, term2) =
+    Int.equal depth1 depth2 && term1 == term2
+  let hash (depth, term) = Hashtbl.hash (depth, Hashtbl.hash_param 4 16 term)
+end)
+
+(* All other substitution/occurrence parameters are fixed for one invocation.
+   Cache completed compound results by physical syntax and binder depth. The
+   table is operation-local; it neither retains whole environments nor mixes
+   independently substituted terms. Atomic nodes need no table allocation. *)
+let shared_with_binders f depth term =
+  let cache = lazy (TermDepthCache.create 17) in
+  let visits = ref 0 in
+  let rec visit depth term =
+    incr visits;
+    if !visits land 255 = 0 then Control.check_for_interrupt ();
+    match Constr.kind term with
+    | Constr.Rel _ | Constr.Var _ | Constr.Meta _ | Constr.Sort _
+    | Constr.Const _ | Constr.Ind _ | Constr.Construct _
+    | Constr.Int _ | Constr.Float _ | Constr.String _ -> f visit depth term
+    | _ ->
+      let cache = Lazy.force cache in
+      match TermDepthCache.find_opt cache (depth, term) with
+      | Some result -> result
+      | None ->
+        let result = f visit depth term in
+        TermDepthCache.add cache (depth, term) result;
+        result
+  in
+  visit depth term
+
 (* (closedn n M) is true iff M is a (de Brujin) closed term under n binders *)
 
 let closedn n c =
-  let rec closed_rec n c = match Constr.kind c with
+  let closed_rec closed_rec n c = match Constr.kind c with
     | Constr.Rel m -> if m>n then raise_notrace LocalOccur
     | _ -> Constr.iter_with_binders succ closed_rec n c
   in
-  try closed_rec n c; true with LocalOccur -> false
+  try shared_with_binders closed_rec n c; true with LocalOccur -> false
 
 (* [closed0 M] is true iff [M] is a (de Bruijn) closed term *)
 
@@ -34,21 +66,21 @@ let closed0 c = closedn 0 c
 (* (noccurn n M) returns true iff (Rel n) does NOT occur in term M  *)
 
 let noccurn n term =
-  let rec occur_rec n c = match Constr.kind c with
+  let occur_rec occur_rec n c = match Constr.kind c with
     | Constr.Rel m -> if Int.equal m n then raise_notrace LocalOccur
     | _ -> Constr.iter_with_binders succ occur_rec n c
   in
-  try occur_rec n term; true with LocalOccur -> false
+  try shared_with_binders occur_rec n term; true with LocalOccur -> false
 
 (* (noccur_between n m M) returns true iff (Rel p) does NOT occur in term M
   for n <= p < n+m *)
 
 let noccur_between n m term =
-  let rec occur_rec n c = match Constr.kind c with
+  let occur_rec occur_rec n c = match Constr.kind c with
     | Constr.Rel p -> if n<=p && p<n+m then raise_notrace LocalOccur
     | _        -> Constr.iter_with_binders succ occur_rec n c
   in
-  try occur_rec n term; true with LocalOccur -> false
+  try shared_with_binders occur_rec n term; true with LocalOccur -> false
 
 (* Checking function for terms containing existential variables.
  The function [noccur_with_meta] considers the fact that
@@ -62,7 +94,7 @@ let isMeta c = match Constr.kind c with
 | _ -> false
 
 let noccur_with_meta n m term =
-  let rec occur_rec n c = match Constr.kind c with
+  let occur_rec occur_rec n c = match Constr.kind c with
     | Constr.Rel p -> if n<=p && p<n+m then raise_notrace LocalOccur
     | Constr.App(f,_cl) ->
         (match Constr.kind f with
@@ -72,7 +104,7 @@ let noccur_with_meta n m term =
     | Constr.Evar (_, _) -> ()
     | _ -> Constr.iter_with_binders succ occur_rec n c
   in
-  try (occur_rec n term; true) with LocalOccur -> false
+  try (shared_with_binders occur_rec n term; true) with LocalOccur -> false
 
 (*********************)
 (*      Lifting      *)
@@ -134,13 +166,13 @@ let substn_many lamv n c =
   let lv = Array.length lamv in
   if Int.equal lv 0 then c
   else
-    let rec substrec depth c = match Constr.kind c with
+    let substrec substrec depth c = match Constr.kind c with
       | Constr.Rel k     ->
           if k<=depth then c
           else if k-depth <= lv then lift_substituend depth (Array.unsafe_get lamv (k-depth-1))
           else Constr.mkRel (k-lv)
       | _ -> Constr.map_with_binders succ substrec depth c in
-    substrec n c
+    shared_with_binders substrec n c
 
 let make_subst = function
 | [] -> [||]
@@ -238,7 +270,7 @@ let replace_vars var_alist x =
   match var_alist with
   | [] -> x
   | _ ->
-    let rec substrec n c = match Constr.kind c with
+    let substrec substrec n c = match Constr.kind c with
     | Constr.Var x ->
       begin match find_var x var_alist with
       | var -> lift_substituend n var
@@ -248,7 +280,7 @@ let replace_vars var_alist x =
       CErrors.anomaly (Pp.str "Substituting an evar in the kernel")
     | _ -> Constr.map_with_binders succ substrec n c
     in
-    substrec 0 x
+    shared_with_binders substrec 0 x
 
 (* (subst_var str t) substitute (Var str) by (Rel 1) in t *)
 let subst_var str t = replace_vars [(str, Constr.mkRel 1)] t
@@ -357,56 +389,75 @@ let fold_kind_relevance f acc c =
   | CoFix (_,data) ->
     fold_rec_declaration_relevance f acc data
 
+module PhysicalConstrTbl = Hashtbl.Make (struct
+  type t = Constr.t
+
+  let equal = ( == )
+  let hash term = Hashtbl.hash_param 4 16 term
+end)
+
 let subst_univs_level_constr subst c =
   if UVars.is_empty_sort_subst subst then c
   else
     let f = UVars.subst_sort_level_instance subst in
+    (* Imported terms can be DAGs with extensive physical sharing.  Preserve
+       it while substituting universes instead of expanding the DAG through a
+       repeated tree traversal. *)
+    let cache = PhysicalConstrTbl.create 251 in
     (* XXX shouldn't Constr.map return the pointer equal term when unchanged instead? *)
     let changed = ref false in
-    let rec aux t =
+    let rec aux input =
+      match PhysicalConstrTbl.find_opt cache input with
+      | Some output -> output
+      | None ->
+      let t = input in
       let t' = map_constr_relevance (UVars.subst_sort_level_relevance subst) t in
       let t = if t' == t then t else (changed := true; t') in
-      match kind t with
-      | Const (c, u) ->
-        if UVars.Instance.is_empty u then t
-        else
-          let u' = f u in
-            if u' == u then t
-            else (changed := true; mkConstU (c, u'))
-      | Ind (i, u) ->
-        if UVars.Instance.is_empty u then t
-        else
-          let u' = f u in
-            if u' == u then t
-            else (changed := true; mkIndU (i, u'))
-      | Construct (c, u) ->
-        if UVars.Instance.is_empty u then t
-        else
-          let u' = f u in
-            if u' == u then t
-            else (changed := true; mkConstructU (c, u'))
-      | Sort s ->
-        let s' = UVars.subst_sort_level_sort subst s in
-        if s' == s then t
-        else
-          (changed := true; mkSort s')
+      let output =
+        match kind t with
+        | Const (c, u) ->
+          if UVars.Instance.is_empty u then t
+          else
+            let u' = f u in
+              if u' == u then t
+              else (changed := true; mkConstU (c, u'))
+        | Ind (i, u) ->
+          if UVars.Instance.is_empty u then t
+          else
+            let u' = f u in
+              if u' == u then t
+              else (changed := true; mkIndU (i, u'))
+        | Construct (c, u) ->
+          if UVars.Instance.is_empty u then t
+          else
+            let u' = f u in
+              if u' == u then t
+              else (changed := true; mkConstructU (c, u'))
+        | Sort s ->
+          let s' = UVars.subst_sort_level_sort subst s in
+          if s' == s then t
+          else
+            (changed := true; mkSort s')
 
-      | Case (ci, u, pms, p, iv, c, br) ->
-        if UVars.Instance.is_empty u then Constr.map aux t
-        else
+        | Case (ci, u, pms, p, iv, c, br) ->
+          if UVars.Instance.is_empty u then Constr.map aux t
+          else
+            let u' = f u in
+            if u' == u then Constr.map aux t
+            else (changed:=true; Constr.map aux (mkCase (ci,u',pms,p,iv,c,br)))
+
+        | Array (u,elems,def,ty) ->
           let u' = f u in
-          if u' == u then Constr.map aux t
-          else (changed:=true; Constr.map aux (mkCase (ci,u',pms,p,iv,c,br)))
+          let elems' = CArray.Smart.map aux elems in
+          let def' = aux def in
+          let ty' = aux ty in
+          if u == u' && elems == elems' && def == def' && ty == ty' then t
+          else (changed := true; mkArray (u',elems',def',ty'))
 
-      | Array (u,elems,def,ty) ->
-        let u' = f u in
-        let elems' = CArray.Smart.map aux elems in
-        let def' = aux def in
-        let ty' = aux ty in
-        if u == u' && elems == elems' && def == def' && ty == ty' then t
-        else (changed := true; mkArray (u',elems',def',ty'))
-
-      | _ -> Constr.map aux t
+        | _ -> Constr.map aux t
+      in
+      PhysicalConstrTbl.add cache input output;
+      output
     in
     let c' = aux c in
       if !changed then c' else c
@@ -421,7 +472,30 @@ let subst_instance_constr subst c =
   if UVars.Instance.is_empty subst then c
   else
     let f u = UVars.subst_instance_instance subst u in
-    let rec aux t =
+    (* The instance is fixed, including qualities: the same physical syntax
+       has the same result at every binder depth during this operation. *)
+    let cache = lazy (PhysicalConstrTbl.create 17) in
+    let visits = ref 0 in
+    let rec aux input =
+      incr visits;
+      if !visits land 255 = 0 then Control.check_for_interrupt ();
+      let atomic = match kind input with
+        | Rel _ | Var _ | Meta _ | Sort _ | Const _ | Ind _ | Construct _
+        | Int _ | Float _ | String _ -> true
+        | _ -> false in
+      (* Closure quotation often instantiates a single constant or sort.
+         Such a root cannot contain sharing. Inside a compound traversal,
+         retain memoization of atoms as well to preserve shared results. *)
+      if atomic && not (Lazy.is_val cache) then transform input else
+      let cache = Lazy.force cache in
+      match PhysicalConstrTbl.find_opt cache input with
+      | Some result -> result
+      | None ->
+        let result = transform input in
+        PhysicalConstrTbl.add cache input result;
+        result
+    and transform input =
+      let t = input in
       let t = if CArray.is_empty (fst (UVars.Instance.to_array subst)) then t
         else map_constr_relevance (UVars.subst_instance_relevance subst) t
       in
@@ -531,9 +605,14 @@ let visit_kind_univs visit acc c =
   | _ -> acc
 
 let sort_and_universes_of_constr ?(init=Sorts.Quality.Set.empty,Univ.Level.Set.empty) c =
+  let visited = PhysicalConstrTbl.create 251 in
   let rec aux s c =
-    let s = visit_kind_univs univs_and_qvars_visitor s (kind c) in
-    Constr.fold aux s c
+    if PhysicalConstrTbl.mem visited c then s
+    else begin
+      PhysicalConstrTbl.add visited c c;
+      let s = visit_kind_univs univs_and_qvars_visitor s (kind c) in
+      Constr.fold aux s c
+    end
   in
   aux init c
 

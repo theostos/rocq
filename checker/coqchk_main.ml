@@ -197,6 +197,10 @@ let add_compile s =
     between coqtop and coqc. *)
 
 let compile_files senv =
+  if CheckFlags.strict_checks_enabled () &&
+     (not (List.is_empty !admit_list) || not (List.is_empty !norec_list))
+  then CErrors.user_err
+    (str "Strict checking is incompatible with -admit and -norec.");
   CheckLibrary.recheck_library senv
     ~norec:(List.rev !norec_list)
     ~admit:(List.rev !admit_list)
@@ -220,6 +224,8 @@ let print_usage_channel co command =
 \n\
 \n  -admit module               load module and dependencies without checking\
 \n  -norec module               check module but admit dependencies without checking\
+\n  -strict                     reject disabled safety checks and admitted dependencies\
+\n  -allow-uip                  explicitly permit definitional UIP with -strict\
 \n\
 \n  -d (d1,..,dn)               enable specified debug messages\
 \n  -debug                      enable all debug messages\
@@ -426,6 +432,8 @@ let parse_args argv =
     | ("-o" | "--output-context") :: rem ->
         output_context := true; parse rem
 
+    | "-strict" :: rem -> CheckFlags.enable_strict_checks (); parse rem
+    | "-allow-uip" :: rem -> CheckFlags.allow_definitional_uip (); parse rem
     | "-admit" :: s :: rem -> add_admit s; parse rem
     | "-admit" :: [] -> usage 1
 

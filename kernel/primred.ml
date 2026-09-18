@@ -8,6 +8,8 @@ open CErrors
 type _ action_kind =
   | IncompatTypes : _ prim_type -> Constant.t action_kind
   | IncompatInd : _ prim_ind -> inductive action_kind
+  | IncompatPeanoOperation : string -> Constant.t action_kind
+  | IncompatPeanoConstructor : string -> constructor action_kind
 
 type exn += IncompatibleDeclarations : 'a action_kind * 'a * 'a -> exn
 
@@ -19,8 +21,212 @@ let check_same_inds ind i1 i2 =
   if not (Ind.UserOrd.equal i1 i2)
   then raise (IncompatibleDeclarations (IncompatInd ind, i1, i2))
 
+let check_same_peano_operation operation c1 c2 =
+  if not (Constant.UserOrd.equal c1 c2) then
+    raise (IncompatibleDeclarations
+      (IncompatPeanoOperation operation, c1, c2))
+
+let check_same_peano_constructor description c1 c2 =
+  if not (Construct.UserOrd.equal c1 c2) then
+    raise (IncompatibleDeclarations
+      (IncompatPeanoConstructor description, c1, c2))
+
+let add_peano_bool_operation description ind c false_ctor true_ctor entries =
+  let same op =
+    Ind.UserOrd.equal ind op.bool_op_inductive &&
+    Constant.UserOrd.equal c op.bool_op_constant
+  in
+  match List.find_opt same entries with
+  | Some old ->
+    check_same_peano_constructor (description ^ " false result")
+      false_ctor old.bool_op_false;
+    check_same_peano_constructor (description ^ " true result")
+      true_ctor old.bool_op_true;
+    entries
+  | None -> {
+      bool_op_inductive = ind;
+      bool_op_constant = c;
+      bool_op_false = false_ctor;
+      bool_op_true = true_ctor;
+    } :: entries
+
+let add_peano_nat_operation description ind c get set entries =
+  let rec update = function
+    | [] -> CErrors.user_err Pp.(str "Missing Peano type registration for " ++
+        str description)
+    | entry :: rest ->
+      if Ind.UserOrd.equal ind entry.peano_inductive then begin
+        Option.iter (fun old ->
+          check_same_peano_operation description c old) (get entry);
+        set entry (Some c) :: rest
+      end else entry :: update rest
+  in
+  update entries
+
 let add_retroknowledge retro action =
   match action with
+  | Register_peano_nat ind ->
+    let entry = {
+      peano_inductive = ind;
+      peano_zero = (ind, 1);
+      peano_succ = (ind, 2);
+      peano_double = None;
+      peano_decoders = [];
+      peano_add = None;
+      peano_mul = None;
+      peano_pow = None;
+      peano_sub = None;
+      peano_div_go = [];
+      peano_mod_go = [];
+    } in
+    let rec add = function
+      | [] -> [entry]
+      | old :: rest ->
+        if Ind.UserOrd.equal ind old.peano_inductive then old :: rest
+        else old :: add rest
+    in
+    { retro with retro_peano_nat = add retro.retro_peano_nat }
+  | Register_peano_nat_double (ind, c) ->
+    let rec update = function
+      | [] -> [{
+          peano_inductive = ind;
+          peano_zero = (ind, 1);
+          peano_succ = (ind, 2);
+          peano_double = Some c;
+          peano_decoders = [];
+          peano_add = None;
+          peano_mul = None;
+          peano_pow = None;
+          peano_sub = None;
+          peano_div_go = [];
+          peano_mod_go = [];
+        }]
+      | entry :: rest ->
+        if Ind.UserOrd.equal ind entry.peano_inductive then begin
+          Option.iter (fun old ->
+            check_same_peano_operation "doubling builder" c old)
+            entry.peano_double;
+          { entry with peano_double = Some c } :: rest
+        end else entry :: update rest
+    in
+    { retro with retro_peano_nat = update retro.retro_peano_nat }
+  | Register_peano_nat_of_N (ind, n_ind, pos_ind, c) ->
+    let rec update = function
+      | [] -> [{
+          peano_inductive = ind;
+          peano_zero = (ind, 1);
+          peano_succ = (ind, 2);
+          peano_double = None;
+          peano_decoders = [{
+            decoder_constant = c;
+            binary_nat = n_ind;
+            binary_positive = pos_ind;
+          }];
+          peano_add = None;
+          peano_mul = None;
+          peano_pow = None;
+          peano_sub = None;
+          peano_div_go = [];
+          peano_mod_go = [];
+        }]
+      | entry :: rest ->
+        if Ind.UserOrd.equal ind entry.peano_inductive then begin
+          let same old =
+            Constant.UserOrd.equal old.decoder_constant c &&
+            Ind.UserOrd.equal old.binary_nat n_ind &&
+            Ind.UserOrd.equal old.binary_positive pos_ind
+          in
+          let peano_decoders =
+            if List.exists same entry.peano_decoders then entry.peano_decoders
+            else {
+              decoder_constant = c;
+              binary_nat = n_ind;
+              binary_positive = pos_ind;
+            } :: entry.peano_decoders
+          in
+          { entry with peano_decoders } :: rest
+        end else entry :: update rest
+    in
+    { retro with retro_peano_nat = update retro.retro_peano_nat }
+  | Register_peano_nat_add (ind, c) ->
+    let retro_peano_nat =
+      add_peano_nat_operation "addition" ind c
+        (fun entry -> entry.peano_add)
+        (fun entry peano_add -> { entry with peano_add })
+        retro.retro_peano_nat
+    in
+    { retro with retro_peano_nat }
+  | Register_peano_nat_mul (ind, c) ->
+    let retro_peano_nat =
+      add_peano_nat_operation "multiplication" ind c
+        (fun entry -> entry.peano_mul)
+        (fun entry peano_mul -> { entry with peano_mul })
+        retro.retro_peano_nat
+    in
+    { retro with retro_peano_nat }
+  | Register_peano_nat_pow (ind, c) ->
+    let retro_peano_nat =
+      add_peano_nat_operation "exponentiation" ind c
+        (fun entry -> entry.peano_pow)
+        (fun entry peano_pow -> { entry with peano_pow })
+        retro.retro_peano_nat
+    in
+    { retro with retro_peano_nat }
+  | Register_peano_nat_sub (ind, c) ->
+    let retro_peano_nat =
+      add_peano_nat_operation "subtraction" ind c
+        (fun entry -> entry.peano_sub)
+        (fun entry peano_sub -> { entry with peano_sub })
+        retro.retro_peano_nat
+    in
+    { retro with retro_peano_nat }
+  | Register_peano_nat_div_go (ind, worker) ->
+    let rec update = function
+      | [] -> assert false
+      | entry :: rest ->
+        if Ind.UserOrd.equal ind entry.peano_inductive then begin
+          let peano_div_go =
+            if List.exists (Constant.UserOrd.equal worker) entry.peano_div_go
+            then entry.peano_div_go
+            else worker :: entry.peano_div_go
+          in
+          { entry with peano_div_go } :: rest
+        end else entry :: update rest
+    in
+    { retro with retro_peano_nat = update retro.retro_peano_nat }
+  | Register_peano_nat_mod_go (ind, worker) ->
+    let rec update = function
+      | [] -> assert false
+      | entry :: rest ->
+        if Ind.UserOrd.equal ind entry.peano_inductive then begin
+          let peano_mod_go =
+            if List.exists (Constant.UserOrd.equal worker) entry.peano_mod_go
+            then entry.peano_mod_go
+            else worker :: entry.peano_mod_go
+          in
+          { entry with peano_mod_go } :: rest
+        end else entry :: update rest
+    in
+    { retro with retro_peano_nat = update retro.retro_peano_nat }
+  | Register_peano_nat_beq (ind, c, false_ctor, true_ctor) ->
+    let retro_peano_nat_beq =
+      add_peano_bool_operation "equality test" ind c false_ctor true_ctor
+        retro.retro_peano_nat_beq
+    in
+    { retro with retro_peano_nat_beq }
+  | Register_peano_nat_ble (ind, c, false_ctor, true_ctor) ->
+    let retro_peano_nat_ble =
+      add_peano_bool_operation "less-than-or-equal test" ind c false_ctor
+        true_ctor retro.retro_peano_nat_ble
+    in
+    { retro with retro_peano_nat_ble }
+  | Register_unit_like ind ->
+    let retro_unit_like =
+      if List.exists (Ind.UserOrd.equal ind) retro.retro_unit_like then
+        retro.retro_unit_like
+      else ind :: retro.retro_unit_like
+    in
+    { retro with retro_unit_like }
   | Register_type(typ,c) ->
     begin match typ with
       | PT_int63 ->

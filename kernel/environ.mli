@@ -512,10 +512,14 @@ val retroknowledge : env -> Retroknowledge.retroknowledge
 
 (** {5 Dependency analysis} *)
 
-(** [constant_depends_on c1 c2] is true when [c2] appears in the transitive set of
+(** [constant_depends_on env c1 c2] returns [Some true] when [c2] appears among
     constants reachable from the body of [c1]. Axioms, opaque definitions,
-    and primitives have no body and thus no dependencies. *)
-val constant_depends_on : env -> Constant.t -> Constant.t -> bool
+    and primitives have no traversable body. [Some false] is an exhaustive
+    negative answer; [None] means the optional search exhausted its allowance.
+    Callers may share [fuel] across related queries; the default is 16,384
+    syntax/graph work units. Only complete direct edges and definite answers
+    are cached, with fixed storage caps and environment-local validity. *)
+val constant_depends_on : ?fuel:int ref -> env -> Constant.t -> Constant.t -> bool option
 
 (** {5 Internals} *)
 

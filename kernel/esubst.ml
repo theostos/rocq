@@ -130,6 +130,29 @@ type 'a tree =
 *)
 
 type 'a subs = Nil of shf * int | Cons of int * 'a tree * 'a subs
+
+(* Map values without composing or changing relocations. [visit] also accounts
+   for variable-only nodes, so callers can bound the complete traversal. *)
+let map_subs ~visit f s =
+  let value = function Arg x -> Arg (f x) | Var n -> Var n in
+  let rec tree = function
+    | Leaf (w, x) -> visit (); Leaf (w, value x)
+    | Node (w, x, left, right, shift) ->
+      visit ();
+      let x = value x in
+      let left = tree left in
+      let right = tree right in
+      Node (w, x, left, right, shift)
+  in
+  let rec subs = function
+    | Nil (w, n) -> visit (); Nil (w, n)
+    | Cons (height, t, rest) ->
+      visit ();
+      let t = tree t in
+      let rest = subs rest in
+      Cons (height, t, rest)
+  in
+  subs s
 (*
   In the naive semantics mentioned above, we have the following.
 

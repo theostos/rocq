@@ -853,14 +853,43 @@ let map_with_binders g f l c0 = match kind c0 with
 (*      Lifting      *)
 (*********************)
 
-(* The generic lifting function *)
-let rec exliftn el c =
+module LiftCache = Hashtbl.Make (struct
+  type nonrec t = int * t
+  let equal (depth1, term1) (depth2, term2) =
+    Int.equal depth1 depth2 && term1 == term2
+  (* Structural hashing is bounded and GC-stable. Collisions affect lookup
+     cost only; equality always checks both identity and binder depth. *)
+  let hash (depth, term) = Hashtbl.hash (depth, Hashtbl.hash_param 4 16 term)
+end)
+
+(* The relocation is fixed for this operation. Its value below a node is
+   determined by the number of intervening binders, so depth is sufficient in
+   the key. Cache complete compound results, not just substituends: tree
+   traversal here otherwise expands a shared quoted closure exponentially. *)
+let exliftn el c =
   let open Esubst in
-  match kind c with
-  | Rel i ->
-    let j = reloc_rel i el in
-    if Int.equal i j then c else mkRel j
-  | _ -> map_with_binders el_lift exliftn el c
+  let cache = lazy (LiftCache.create 17) in
+  let visits = ref 0 in
+  let under_binder (depth, el) = depth + 1, el_lift el in
+  let rec lift ((depth, el) as context) c =
+    incr visits;
+    if !visits land 255 = 0 then Control.check_for_interrupt ();
+    match kind c with
+    | Rel i ->
+      let j = reloc_rel i el in
+      if Int.equal i j then c else mkRel j
+    | Var _ | Meta _ | Sort _ | Const _ | Ind _ | Construct _
+    | Int _ | Float _ | String _ -> c
+    | _ ->
+      let cache = Lazy.force cache in
+      match LiftCache.find_opt cache (depth, c) with
+      | Some result -> result
+      | None ->
+        let result = map_with_binders under_binder lift context c in
+        LiftCache.add cache (depth, c) result;
+        result
+  in
+  lift (0, el) c
 
 (* Lifting the binding depth across k bindings *)
 

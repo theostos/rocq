@@ -1613,6 +1613,19 @@ let explain_incompatible_prim_declarations (type a) (act:a Primred.action_kind) 
     let px = try pr_inductive env x with Not_found -> MutInd.print (fst x) in
     str "Cannot declare " ++ px ++ str " as primitive " ++ str (CPrimitives.prim_ind_to_string ind) ++
     str ": " ++ pr_inductive env y ++ str " is already declared."
+  | IncompatPeanoOperation operation ->
+    let px = try pr_constant env x with Not_found -> Constant.print x in
+    str "Cannot register " ++ px ++ str " as a Peano " ++ str operation ++
+    str ": " ++ pr_constant env y ++ str " is already registered."
+  | IncompatPeanoConstructor description ->
+    let print c =
+      try pr_constructor env c with Not_found ->
+        let ((mind, _), i) = c in
+        MutInd.print mind ++ str "." ++ int i
+    in
+    let px = print x in
+    str "Cannot register " ++ px ++ str " as a Peano " ++ str description ++
+    str ": " ++ print y ++ str " is already registered."
 
 (* Recursion schemes errors *)
 let error_not_mutual_in_scheme env ind ind' =

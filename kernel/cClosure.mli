@@ -22,6 +22,10 @@ type fconstr
 (** [fconstr] can be accessed by using the function [fterm_of] and by
    matching on type [fterm] *)
 
+(** Stable hash of a frozen term, independent of its mutable reduction state.
+    Collisions are possible, so this must be paired with physical equality. *)
+val fconstr_hash : fconstr -> int
+
 type finvert
 
 type evar_repack
@@ -29,7 +33,24 @@ type evar_repack
 type subs_content
 type usubs = subs_content subs UVars.puniverses
 
+(** Whether two relative variables are both instantiated by the same compact
+    Peano value.  Returns [false] for every other kind of substitution. *)
+val equal_compact_peano_rel : usubs -> int -> usubs -> int -> bool
+
 type table_key = Constant.t UVars.puniverses tableKey
+
+module PeanoNatValue : sig
+  type t
+  val equal : t -> t -> bool
+end
+
+type compact_peano = {
+  peano_ind : inductive;
+  peano_zero : constructor;
+  peano_succ : constructor;
+  peano_double : Constant.t;
+  peano_value : PeanoNatValue.t;
+}
 
 (** Relevances (eg in binder_annot or case_info) have NOT been substituted
     when there is a usubs field *)
@@ -53,10 +74,17 @@ type fterm =
   | FFloat of Float64.t
   | FString of Pstring.t
   | FArray of UVars.Instance.t * fconstr Parray.t * fconstr
+  | FPeanoNat of compact_peano
   | FLIFT of int * fconstr
   | FCLOS of constr * usubs
   | FIrrelevant
   | FLOCKED
+
+val peano_constructor_view : compact_peano -> fconstr
+
+(** Syntax-node cost of compact binary quotation, inspecting at most [limit]
+    bits. [None] means the requested bound is exceeded, not an invalid value. *)
+val peano_quotation_cost : limit:int -> compact_peano -> int option
 
 (***********************************************************************
   s A [stack] is a context of arguments, arguments are pushed by
@@ -95,6 +123,12 @@ val usubs_lift : usubs -> usubs
 val usubs_liftn : int -> usubs -> usubs
 val usubs_cons : fconstr -> usubs -> usubs
 
+(** Read a substituted relative variable without applying its lift, reducing,
+    or copying the closure. Only for inspections invariant under lifting
+    (e.g. closedness or constant names), not for evaluating the variable.
+    Unsubstituted and unapplied higher-order variables return [None]. *)
+val inspect_substituted_rel : usubs -> int -> fconstr option
+
 (** identity if the first instance is empty *)
 val usubst_instance : 'a UVars.puniverses -> UVars.Instance.t -> UVars.Instance.t
 
@@ -112,6 +146,10 @@ val mk_clos_vect : usubs -> constr array -> fconstr array
 val zip : fconstr -> stack -> fconstr
 
 val fterm_of : fconstr -> fterm
+(* Optional non-reducing flex-headed view, retaining an application overwritten
+   by sharing. May return its input unchanged; callers must still check all
+   arguments, universes and context conditions. No equality is certified. *)
+val symbolic_view : fconstr -> fconstr option
 val term_of_fconstr : fconstr -> constr
 val term_of_process : fconstr -> stack -> constr
 val destFLambda :
@@ -149,6 +187,10 @@ val create_tab : unit -> clos_tab
 val info_env : clos_infos -> env
 val info_flags: clos_infos -> reds
 val info_univs : clos_infos -> UGraph.t
+(* The enclosing conversion attempt's work counter. Reduction only carries
+   it to nested case-inversion conversion; it does not interpret exhaustion. *)
+val info_conversion_work : clos_infos -> int ref option
+val infos_with_conversion_work : clos_infos -> int ref option -> clos_infos
 val unfold_projection : clos_infos -> Projection.t -> Sorts.relevance -> stack_member option
 
 val push_relevance : clos_infos -> 'b binder_annot -> clos_infos
@@ -161,6 +203,38 @@ val is_irrelevant : clos_infos -> Sorts.relevance -> bool
 val eq_quality : clos_infos -> Sorts.Quality.t -> Sorts.Quality.t -> bool
 
 val infos_with_reds : clos_infos -> reds -> clos_infos
+
+(** A fresh private call-by-need view for ordinary weak-head reduction.
+    Copy closure cells only when demanded, retaining sharing inside the view
+    without updating the caller's cells or traversing unused substitutions.
+    Use an empty initial stack: external update frames are not owned here. *)
+val infos_with_private_reduction : clos_infos -> clos_infos
+
+(** Bounded type-head inspection in a private call-by-need view. Roots are
+    shallow copies; nested cells are copied only when demanded. Head work and
+    cell visits share [steps]; unused environments are not traversed. Exhaustion
+    and unsupported head-machine operations return [None]. The callback must
+    reduce with the supplied infos and fresh tables. Its initial stacks must
+    not contain caller-owned update frames. Returned roots are NOT eager deep
+    snapshots suitable for arbitrary mutation with unrelated reduction infos. *)
+val with_private_closure_query : steps:int -> clos_infos -> fconstr list ->
+  (clos_infos -> fconstr list -> 'a option) -> 'a option
+
+(** During cheap conversion reduction, recover retained symbolic views.
+    Full reduction still uses shared reduced cells. This is only a search
+    policy; callers must perform ordinary checked conversion. *)
+val infos_with_symbolic_views : clos_infos -> clos_infos
+
+(** Run a speculative type query on isolated, sharing-preserving closure
+    snapshots. Copying and head-machine steps share [steps]. No quotation is
+    performed. Ordinary constructor cases share this budget, including branch
+    substitutions. Unsupported computation (fixpoints, case inversion with its
+    external conversion callback, primitives, evars or higher-order
+    substitutions) and exhaustion return [None]. The callback must
+    use fresh reduction tables and only the supplied copies, not source cells.
+    This is a bounded optional query, not a complete normalization procedure. *)
+val with_closure_snapshot : steps:int -> clos_infos -> fconstr list ->
+  (clos_infos -> fconstr list -> 'a option) -> 'a option
 
 (** Reduction function *)
 

@@ -30,6 +30,63 @@ exception NotConvertibleVect of int
 
 let conv_leq env x y = default_conv CUMUL env x y
 
+(* Application checking repeatedly reconstructs the same expected domains.
+   Keep completed comparisons within one invocation of the typing machine,
+   separately from HConstr's inference cache. This cache never crosses a local
+   environment, infers constraints, remembers failures, or stores closures.
+   Bounded lookup/retention makes a miss an ordinary conversion, not a limit on
+   what the kernel accepts. *)
+module ApplicationConversions = struct
+  type entry = env * constr * constr
+  type t = {
+    buckets : entry list array Lazy.t;
+    mutable calls : int;
+    mutable hits : int;
+  }
+
+  let create () =
+    { buckets = lazy (Array.make 1024 []); calls = 0; hits = 0 }
+
+  let same_term left right =
+    let fuel = ref 1024 in
+    let rec equal nargs left right =
+      if !fuel = 0 then false
+      else begin
+        decr fuel;
+        if left == right then true else
+        (* Do not let compare_head's cast stripping bypass our work bound.
+           Kernel application arguments cannot contain unresolved variables. *)
+        match kind left, kind right with
+        | (Cast _ | Evar _ | Meta _), _ | _, (Cast _ | Evar _ | Meta _) -> false
+        | _ -> Constr.compare_head (fun _ _ -> false) equal nargs left right
+      end
+    in equal 0 left right
+
+  let convert cache check env left right =
+    cache.calls <- cache.calls + 1;
+    (* Preserve the existing constant-time reflexivity path without allocating
+       a table in the common case of already shared domains. *)
+    if left == right then check env left right else
+    let buckets = Lazy.force cache.buckets in
+    let hash = Hashtbl.hash (Hashtbl.hash_param 8 32 left,
+                            Hashtbl.hash_param 8 32 right) land 1023 in
+    let bucket = buckets.(hash) in
+    if List.exists (fun (env', left', right') ->
+        env == env' && same_term left left' && same_term right right') bucket
+    then begin
+      cache.hits <- cache.hits + 1;
+      Result.Ok ()
+    end else
+      match check env left right with
+      | Result.Error () as result -> result
+      | Result.Ok () as result ->
+        (* Retain at most four entries per bucket, including hash collisions.
+           The ordered pair is essential: cumulativity is not symmetric. *)
+        let bucket = if List.length bucket >= 4 then [] else bucket in
+        buckets.(hash) <- (env, left, right) :: bucket;
+        result
+end
+
 let conv_leq_vecti env v1 v2 =
   Array.fold_left2_i
     (fun i _ t1 t2 ->
@@ -207,7 +264,9 @@ let rec check_empty_stack = function
 | CClosure.Zupdate _ :: s -> check_empty_stack s
 | _ -> false
 
-let type_of_apply env func funt argsv argstv =
+let dump_eq_ndrec_argument_count = ref 0
+
+let type_of_apply ~convert env func funt argsv argstv =
   let open CClosure in
   let len = Array.length argsv in
   let infos = create_clos_infos RedFlags.all env in
@@ -223,9 +282,98 @@ let type_of_apply env func funt argsv argstv =
         let arg = argsv.(i) in
         let argt = argstv.(i) in
         let c1 = term_of_fconstr c1 in
-        begin match conv_leq env argt c1 with
+        let () =
+          if Option.has_some (Sys.getenv_opt "ROCQ_DUMP_EQ_NDREC_ARGUMENT") &&
+             Int.equal i 3
+          then
+            let head, _ = Constr.decompose_app func in
+            match Constr.kind head with
+            | Const (constant, _) when
+                String.ends_with ~suffix:"Eq_ndrec_inst1"
+                  (Constant.to_string constant) ->
+              incr dump_eq_ndrec_argument_count;
+              if Int.equal !dump_eq_ndrec_argument_count 2 then
+                CErrors.user_err
+                  Pp.(str "Eq_ndrec proof actual type:" ++ fnl () ++
+                      Constr.debug_print argt ++
+                      fnl () ++ str "Eq_ndrec proof expected type:" ++ fnl () ++
+                      Constr.debug_print c1)
+            | _ -> ()
+        in
+        let conversion = convert env argt c1 in
+        let conversion =
+          match conversion with
+          | Result.Error ()
+            when Option.has_some
+                   (Sys.getenv_opt
+                      "ROCQ_DIAGNOSTIC_NORMALIZE_APPLICATION_TYPES") ->
+            let reduction_infos =
+              CClosure.create_clos_infos RedFlags.betaiotazeta env
+            in
+            let normalize term =
+              CClosure.norm_val reduction_infos (CClosure.create_tab ())
+                (CClosure.inject term)
+            in
+            conv_leq env (normalize argt) (normalize c1)
+          | Result.Error ()
+            when Option.has_some
+                   (Sys.getenv_opt "ROCQ_DIAGNOSTIC_REVERSE_CONVERSION") ->
+            Conversion.conv_leq ~l2r:true env argt c1
+          | result -> result
+        in
+        begin match conversion with
         | Result.Ok () -> apply_rec (i+1) (mk_clos (CClosure.usubs_cons (inject arg) e) c2)
         | Result.Error () ->
+          let () =
+            if Option.has_some
+                 (Sys.getenv_opt "ROCQ_DIAGNOSTIC_BAD_APPLICATION_INDEX")
+            then
+              let compact_head term =
+                let head, arguments = Constr.decompose_app term in
+                let name =
+                  match Constr.kind head with
+                  | Const (constant, _) -> Constant.to_string constant
+                  | Ind (inductive, _) ->
+                    MutInd.to_string (fst inductive) ^ ".<inductive>"
+                  | Construct (constructor, _) ->
+                    MutInd.to_string (fst (fst constructor)) ^ ".<constructor>"
+                  | Rel index -> Printf.sprintf "Rel(%d)" index
+                  | Sort _ -> "<sort>"
+                  | Prod _ -> "<product>"
+                  | Lambda _ -> "<lambda>"
+                  | LetIn _ -> "<let>"
+                  | App _ -> assert false
+                  | Case _ -> "<case>"
+                  | Fix _ -> "<fix>"
+                  | CoFix _ -> "<cofix>"
+                  | Proj _ -> "<projection>"
+                  | Meta _ -> "<meta>"
+                  | Evar _ -> "<evar>"
+                  | Var id -> Id.to_string id
+                  | Cast _ -> "<cast>"
+                  | Int _ -> "<int>"
+                  | Float _ -> "<float>"
+                  | String _ -> "<string>"
+                  | Array _ -> "<array>"
+                in
+                Printf.sprintf "%s/%d" name (Array.length arguments)
+              in
+              let compact_type term =
+                let binders, conclusion = Term.decompose_prod term in
+                let domains =
+                  binders
+                  |> List.map (fun (_, domain) -> compact_head domain)
+                  |> String.concat ", "
+                in
+                Printf.sprintf "[%s] => %s" domains
+                  (compact_head conclusion)
+              in
+              CErrors.user_err
+                Pp.(str (Printf.sprintf
+                     "Bad application argument %d; function %s; expected %s; actual %s"
+                     (i + 1) (compact_head func) (compact_type c1)
+                     (compact_type argt)))
+          in
           error_cant_apply_bad_type env
             (i+1,c1,argt)
             (make_judge func funt)
@@ -599,13 +747,18 @@ let push_rec_types (lna,typarray,_) env =
   Array.fold_left (fun e assum -> push_rel assum e) env ctxt
 
 (* The typing machine. *)
+type typing_cache = {
+  inferred : constr HConstr.Tbl.t;
+  conversions : ApplicationConversions.t;
+}
+
 let rec execute tbl env cstr =
   if Int.equal (HConstr.refcount cstr) 1 then execute_aux tbl env cstr
-  else begin match HConstr.Tbl.find_opt tbl cstr with
+  else begin match HConstr.Tbl.find_opt tbl.inferred cstr with
     | Some v -> v
     | None ->
       let v = execute_aux tbl env cstr in
-      HConstr.Tbl.add tbl cstr v;
+      HConstr.Tbl.add tbl.inferred cstr v;
       v
   end
 
@@ -650,7 +803,12 @@ and execute_aux tbl env cstr =
             (* No template polymorphism *)
             execute tbl env f
         in
-        type_of_apply env (self f) ft args argst
+        let convert =
+          if (Environ.typing_flags env).unfold_dep_heuristic then
+            ApplicationConversions.convert tbl.conversions conv_leq
+          else conv_leq
+        in
+        type_of_apply ~convert env (self f) ft args argst
 
     | Lambda (name,c1,c2) ->
       let s = execute_is_type tbl env c1 in
@@ -823,7 +981,15 @@ and execute_array tbl env cs =
   Array.map (fun c -> execute tbl env c) cs
 
 let execute env c =
-  NewProfile.profile "Typeops.execute" (fun () -> execute (HConstr.Tbl.create ()) env c) ()
+  let tbl = { inferred = HConstr.Tbl.create ();
+              conversions = ApplicationConversions.create () } in
+  let trace = Option.has_some (Sys.getenv_opt "ROCQ_DIAGNOSTIC_TYPEOPS_CACHE") in
+  let started = if trace then Sys.time () else 0. in
+  NewProfile.profile "Typeops.execute" (fun () ->
+    Fun.protect (fun () -> execute tbl env c) ~finally:(fun () ->
+      if trace && (Sys.time () -. started > 0.1 || tbl.conversions.calls > 1000) then
+        Printf.eprintf "[typeops applications] cpu=%.3f calls=%d hits=%d\n%!"
+          (Sys.time () -. started) tbl.conversions.calls tbl.conversions.hits)) ()
 
 (* Derived functions *)
 
@@ -846,8 +1012,15 @@ let check_wellformed_universes env c =
 
 let infer_hconstr env hconstr =
   let constr = HConstr.self hconstr in
+  let trace stage =
+    if Option.has_some (Sys.getenv_opt "ROCQ_OPAQUE_TRACE") then
+      Printf.eprintf "[infer-hconstr] %s\n%!" stage
+  in
+  let () = trace "before wellformed universes" in
   let () = check_wellformed_universes env constr in
+  let () = trace "before execute" in
   let t = execute env hconstr in
+  let () = trace "after execute" in
   make_judge constr t
 
 let infer env c =
