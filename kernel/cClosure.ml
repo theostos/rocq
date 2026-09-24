@@ -302,8 +302,25 @@ type infos_cache = {
 
 type clos_infos = {
   i_flags : reds;
+  i_private : (fconstr -> fconstr) option; (* private view: copies a cell on demand *)
   i_relevances : Sorts.relevance Range.t;
+  i_inspection : int ref option; (* remaining budget of an inspection *)
   i_cache : infos_cache }
+
+(* An inspection is a budgeted reduction in a private view of the closures:
+   every head step and cell visit is charged, and the operations it does not
+   support decline. Both end the inspection with [Limit]. *)
+module Inspection = struct
+  exception Limit
+  let active info = Option.has_some info.i_inspection
+  let[@inline] charge info cost = match info.i_inspection with
+    | None -> ()
+    | Some remaining ->
+      if cost > !remaining then raise_notrace Limit;
+      remaining := !remaining - cost;
+      if !remaining land 255 = 0 then Control.check_for_interrupt ()
+  let[@inline] decline info = if active info then raise_notrace Limit
+end
 
 let info_flags info = info.i_flags
 let info_env info = info.i_cache.i_env
@@ -416,6 +433,13 @@ let clos_rel e i =
     | Inr (k, None) -> Regular (make_fconstr Ntrl (FRel k))
     | Inr (k, Some p) ->
       Regular (lift_fconstr (k-p) (make_fconstr Red (FFlex (RelKey p))))
+
+(* The value of a substituted variable, without its lift (regular values only:
+   higher-order ones relocate differently). *)
+let inspect_substituted_rel (e, _) i =
+  match expand_rel i e with
+  | Inl (_, Regular term) -> Some term
+  | Inl (_, HigherOrder _) | Inr _ -> None
 
 (* since the head may be reducible, we might introduce lifts of 0 *)
 let compact_stack head stk =
@@ -570,7 +594,12 @@ end = struct
         let body =
           match d with
           | RelDecl.LocalAssum _ -> raise Not_found
-          | RelDecl.LocalDef (_, t, _) -> lift n t
+          | RelDecl.LocalDef (_, t, _) ->
+            (* an inspection pays for the syntax the lift traverses *)
+            let () = if Inspection.active info then
+              let rec visit t = Inspection.charge info 1; Constr.iter visit t in
+              visit t in
+            lift n t
         in
         Def (inject body, [||])
       | VarKey id ->
@@ -591,7 +620,8 @@ end = struct
         let ts = RedFlags.red_transparent info.i_flags in
         if TransparentState.is_transparent_constant ts cst then match cb.const_body with
         | Undef _ | Def _ | OpaqueDef _ | Primitive _ ->
-          let mask = match cb.const_body_code with
+          let mask = if Inspection.active info then [||] else
+          match cb.const_body_code with
           | (Vmemitcodes.BCalias _ | Vmemitcodes.BCconstant | BCuncompiled) -> [||]
           | (Vmemitcodes.BCdefined (mask, _, _)) -> mask
           in
@@ -1061,6 +1091,31 @@ let get_nth_arg head n stk =
     | ((ZcaseT _ | Zproj _ | Zfix _ | Zprimitive _) :: _ | []) as s -> (None, List.rev rstk @ s) in
   strip_rec [] head n stk
 
+(* An inspection may unfold fixpoints (a family's base case can be a computed
+   type), but [get_nth_arg] and [contract_fix_vect] charge nothing: check the
+   vectors and pay for them and for the application prefix first. *)
+let inspect_fix_interface info ((recargs, index), (names, types, bodies)) stack =
+  if Inspection.active info then begin
+    let count = Array.length bodies in
+    Inspection.charge info count;
+    if count = 0 || index < 0 || index >= count ||
+       Array.length recargs <> count || Array.length names <> count ||
+       Array.length types <> count then Inspection.decline info;
+    Array.iter (fun arg -> if arg < 0 then Inspection.decline info) recargs;
+    let rec prefix = function
+      | [] -> ()
+      | Zapp args :: rest ->
+        Inspection.charge info 1;
+        Inspection.charge info (Array.length args);
+        prefix rest
+      | (Zshift _ | Zupdate _) :: rest ->
+        Inspection.charge info 1;
+        prefix rest
+      | (ZcaseT _ | Zproj _ | Zfix _ | Zprimitive _) :: _ -> ()
+    in
+    prefix stack
+  end
+
 let usubs_cons x (s,u) = subs_cons (Regular x) s, u
 
 let rec subs_consn v i n s =
@@ -1206,6 +1261,32 @@ let esubst_of_context ctx args e =
 (* Iota-reduction: feed the arguments of the constructor to the branch *)
 let get_branch infos ci pms ((ind, c), u) args br e =
   let i = c - 1 in
+  (* An inspected constructor need not be well typed: check the case
+     boundary before indexing and pay for the substitution first. *)
+  let () = if Inspection.active infos then begin
+      if not (Environ.QInd.equal (info_env infos) ind ci.ci_ind) ||
+         Array.length br <> Array.length ci.ci_cstr_ndecls ||
+         Array.length br <> Array.length ci.ci_cstr_nargs ||
+         i < 0 || i >= Array.length br ||
+         ci.ci_npar < 0 then
+        Inspection.decline infos;
+      let ndecls = ci.ci_cstr_ndecls.(i) in
+      let nargs = ci.ci_cstr_nargs.(i) in
+      if nargs < 0 || ndecls < nargs ||
+         Array.length pms <> ci.ci_npar ||
+         ci.ci_npar > Array.length args ||
+         Array.length args - ci.ci_npar <> nargs ||
+         Array.length (fst br.(i)) <> ndecls then
+        Inspection.decline infos;
+      Inspection.charge infos (Array.length args);
+      Inspection.charge infos ndecls;
+      if ndecls <> nargs then begin
+        (* parameter lets enter the substitution too *)
+        let mib = Environ.lookup_mind (fst ind) (info_env infos) in
+        List.iter (fun _ -> Inspection.charge infos 1) mib.Declarations.mind_params_ctxt
+      end
+    end
+  in
   let args = drop_parameters ci.ci_npar args in
   let (_nas, br) = br.(i) in
   if Int.equal ci.ci_cstr_ndecls.(i) ci.ci_cstr_nargs.(i) then
@@ -2015,10 +2096,20 @@ let is_irrelevant_constructor infos ((ind,_),u) =
    constructor, cofix, letin, constant), or a neutral term (product,
    inductive) *)
 let rec knh info m stk =
+  Inspection.charge info 1;
+  (* a private view owns every cell the reducer visits, so updates go there *)
+  let m = match info.i_private with None -> m | Some own -> own m in
+  let () = match [@ocaml.warning "-4"] m.term with
+    | FCoFix _ | FCaseInvert _ | FEvar _ | FArray _
+    | FPeanoNat _ -> Inspection.decline info
+    | FApp (_, args) | FConstruct (_, args) ->
+      Inspection.charge info (Array.length args)
+    | _ -> ()
+  in
   match m.term with
     | FLIFT(k,a) -> knh info a (zshift k stk)
     | FCLOS(t,e) -> knht info e t (zupdate info m stk)
-    | FLOCKED -> assert false
+    | FLOCKED -> Inspection.decline info; assert false
     | FApp(a,b) -> knh info a (append_stack b (zupdate info m stk))
     | FCaseT(ci,u,pms,(_,r as p),t,br,e) ->
       let r' = usubst_relevance e r in
@@ -2026,7 +2117,8 @@ let rec knh info m stk =
         (mk_irrelevant, skip_irrelevant_stack info stk)
       else
         knh info t (ZcaseT(ci,u,pms,p,br,e)::zupdate info m stk)
-    | FFix (((ri, n), (lna, _, _)), e) ->
+    | FFix (((ri, n), (lna, _, _) as fix), e) ->
+      inspect_fix_interface info fix stk;
       if is_irrelevant info (usubst_relevance e (lna.(n)).binder_relevance) then
         (mk_irrelevant, skip_irrelevant_stack info stk)
       else
@@ -2053,14 +2145,23 @@ let rec knh info m stk =
 
 (* The same for pure terms *)
 and knht info e t stk =
-  match compact_peano_of_constr info e t with
+  Inspection.charge info 1;
+  let () = match [@ocaml.warning "-4"] kind t with
+    | CoFix _ | Case (_, _, _, _, CaseInvert _, _, _)
+    | Evar _ | Array _ -> Inspection.decline info
+    | App (_, args) -> Inspection.charge info (Array.length args)
+    | _ -> ()
+  in
+  match (if Inspection.active info then None else compact_peano_of_constr info e t) with
   | Some n ->
     knh info (make_fconstr Cstr (FPeanoNat n)) stk
   | None -> match kind t with
   | Rel n ->
     begin match clos_rel (fst e) n with
     | Regular v -> knh info v stk
-    | HigherOrder _ -> CErrors.anomaly Pp.(str "Uncaught pattern variable")
+    | HigherOrder _ ->
+      Inspection.decline info;
+      CErrors.anomaly Pp.(str "Uncaught pattern variable")
     end
   | App (f, args) ->
     begin match [@ocaml.warning "-4"] kind f with
@@ -2069,6 +2170,7 @@ and knht info e t stk =
       begin match clos_rel (fst e) n with
       | Regular t -> knh info t (append_stack args stk)
       | HigherOrder (nargs, term) ->
+        Inspection.decline info;
         let subs', args = Array.chop nargs args in
         let id = subs_id (Range.length info.i_relevances) in
         let subs' = Array.fold_left (fun s v -> subs_cons (Regular v) s) id subs' in
@@ -2089,6 +2191,7 @@ and knht info e t stk =
         let term = FCaseInvert (ci, u, pms, p, (Array.map (mk_clos e) indices), mk_clos e t, br, e) in
         make_fconstr Red term, stk
     | Fix (((_, n), (lna, _, _)) as fx) ->
+      inspect_fix_interface info fx stk;
       if is_irrelevant info (usubst_relevance e (lna.(n)).binder_relevance) then
         (mk_irrelevant, skip_irrelevant_stack info stk)
       else
@@ -2106,6 +2209,8 @@ and knht info e t stk =
     | (Ind _|Const _|Var _|Meta _ | Sort _ | Int _|Float _|String _) -> (mk_clos e t, stk)
     | CoFix cfx ->
       make_fconstr Cstr (FCoFix (cfx, e)), stk
+    | Lambda (na, ty, body) when Inspection.active info ->
+      make_fconstr Cstr (FLambda (1, [na, ty], body, e)), stk
     | Lambda _ -> make_fconstr Cstr (mk_lambda e t), stk
     | Prod (n, t, c) ->
       make_fconstr Ntrl (FProd (n, mk_clos e t, c, e)), stk
@@ -2562,13 +2667,17 @@ type 'a depth = 'a RedPattern.depth
 (* Computes a weak head normal form from the result of knh. *)
 let rec knr : type a. _ -> _ -> pat_state:a depth -> _ -> _ -> a =
   fun info tab ~pat_state m stk ->
+  Inspection.charge info 1;
   match m.term with
   | FLambda(n,tys,f,e) when red_set info.i_flags fBETA ->
+      Inspection.charge info n;
       (match get_args n tys f e stk with
           Inl e', s -> knit info tab ~pat_state e' f s
         | Inr lam, s -> knr_ret info tab ~pat_state (lam,s))
   | FFlex fl when red_set info.i_flags fDELTA ->
       (match Table.lookup info tab fl with
+        | Def (v, _) when Inspection.active info ->
+          kni info tab ~pat_state v stk
         | Def (v, _) -> begin
           match [@ocaml.warning "-4"] fl with
           | ConstKey (c, _) ->
@@ -2580,6 +2689,7 @@ let rec knr : type a. _ -> _ -> pat_state:a depth -> _ -> _ -> a =
           | _ -> kni info tab ~pat_state v stk
           end
         | Primitive op ->
+          Inspection.decline info;
           if check_native_args op stk then
             let c = match fl with ConstKey c -> c | RelKey _ | VarKey _ -> assert false in
             let rargs, a, nargs, stk = get_native_args1 op c stk in
@@ -2588,6 +2698,7 @@ let rec knr : type a. _ -> _ -> pat_state:a depth -> _ -> _ -> a =
             (* Similarly to fix, partially applied primitives are not Ntrl! *)
             knr_ret info tab ~pat_state (m, stk)
         | Symbol (u, b, r) ->
+          Inspection.decline info;
           RedPattern.match_symbol knred info tab ~pat_state fl (u, b, r) stk
         | Undef _ | OpaqueDef _ -> (set_ntrl m; knr_ret info tab ~pat_state (m,stk)))
   | FConstruct (c, args) ->
@@ -2600,10 +2711,22 @@ let rec knr : type a. _ -> _ -> pat_state:a depth -> _ -> _ -> a =
       let (br, e) = get_branch info ci pms c args br e in
       knit info tab ~pat_state e br s
     | Zfix (fx, par) :: s when use_fix ->
+      let () = match fx.term with
+        | FFix (fix, _) -> inspect_fix_interface info fix par
+        | _ -> Inspection.decline info
+      in
       let stk' = par @ append_stack [|m|] s in
       let (fxe, fxbd) = contract_fix_vect fx.term in
       knit info tab ~pat_state fxe fxbd stk'
     | Zproj (p, _) :: s when use_match ->
+      (* an inspected constructor need not be well typed: check the bounds *)
+      let () = if Inspection.active info then
+          let index = Projection.Repr.npars p + Projection.Repr.arg p in
+          if not (Environ.QInd.equal info.i_cache.i_env
+              (fst (fst c)) (Projection.Repr.inductive p)) ||
+             index < 0 || index >= Array.length args then
+            Inspection.decline info
+      in
       let rargs = drop_parameters (Projection.Repr.npars p) args in
       let rarg = rargs.(Projection.Repr.arg p) in
       kni info tab ~pat_state rarg s
@@ -2932,7 +3055,7 @@ let create_infos i_mode ?univs ?evars i_flags i_env =
   let i_univs = Option.default (Environ.universes i_env) univs in
   let i_share = (Environ.typing_flags i_env).Declarations.share_reduction in
   let i_cache = {i_env; i_sigma = evars; i_share; i_univs; i_mode} in
-  {i_flags; i_relevances = Range.empty; i_cache}
+  {i_flags; i_private = None; i_relevances = Range.empty; i_inspection = None; i_cache}
 
 let create_conv_infos = create_infos Conversion
 let create_clos_infos = create_infos Reduction
@@ -2942,8 +3065,47 @@ let oracle_of_infos infos = Environ.oracle infos.i_cache.i_env
 let infos_with_reds infos reds =
   { infos with i_flags = reds }
 
+module Cells = Hashtbl.Make(struct
+  type t = fconstr
+  let equal a b = a == b
+  let hash = fconstr_hash
+end)
+
+(* Inspect [roots] with at most [steps] of reduction in a private view: the
+   cells [knh] visits are copied there and the copies, not the caller's cells,
+   receive the reducer's updates. Neutral marks depend on the reduction
+   flags, so a copy recomputes its mark; constructor, lambda and fixpoint
+   marks are kept. [None] when the budget runs out or the reduction reaches
+   an unsupported construct. *)
+let with_private_closure_query ~steps infos roots inspect =
+  let infos = { infos with i_inspection = Some (ref (max 0 steps)) } in
+  let mark source = match source.term with
+    | FConstruct _ | FPeanoNat _ | FLambda _ | FFix _ | FCoFix _
+    | FInt _ | FFloat _ | FString _ | FArray _ -> Cstr
+    | FRel _ | FAtom _ | FInd _ | FProd _ | FIrrelevant -> Ntrl
+    | FFlex _ | FApp _ | FProj _ | FCLOS _ | FLIFT _ | FLetIn _
+    | FCaseT _ | FCaseInvert _ | FEvar _ -> Red
+    | FLOCKED -> raise_notrace Inspection.Limit in
+  let cells = Cells.create 31 in
+  let own source =
+    Inspection.charge infos 1;
+    match Cells.find_opt cells source with
+    | Some owned -> owned
+    | None ->
+      let owned = make_fconstr (mark source) source.term in
+      Cells.add cells source owned;
+      (* an owned cell visited again keeps its updated result *)
+      Cells.add cells owned owned;
+      if Cells.length cells land 255 = 0 then Control.check_for_interrupt ();
+      owned in
+  let infos = { infos with i_private = Some own;
+                i_cache = { infos.i_cache with i_share = true } } in
+  try inspect infos (List.map own roots)
+  with Inspection.Limit -> None
+
 let unfold_ref_with_args infos tab fl v =
   match Table.lookup infos tab fl with
+  | Def (def, _) when Inspection.active infos -> Some (def, v)
   | Def (def, _) -> begin
     match [@ocaml.warning "-4"] fl with
     | ConstKey (c, _) ->
@@ -2956,6 +3118,8 @@ let unfold_ref_with_args infos tab fl v =
   | Primitive op when check_native_args op v ->
     let c = match [@ocaml.warning "-4"] fl with ConstKey c -> c | _ -> assert false in
     let rargs, a, nargs, v = get_native_args1 op c v in
+    (* the update frame must name the private view's cell, not the caller's *)
+    let a = match infos.i_private with None -> a | Some own -> own a in
     Some (a, (Zupdate a::(Zprimitive(op,c,rargs,nargs)::v)))
   | Symbol (u, b, r) ->
     RedPattern.match_symbol knred (infos_with_reds infos all) tab ~pat_state:(RedPattern.Nil Yes) fl (u, b, r) v

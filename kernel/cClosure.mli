@@ -116,6 +116,10 @@ val usubs_lift : usubs -> usubs
 val usubs_liftn : int -> usubs -> usubs
 val usubs_cons : fconstr -> usubs -> usubs
 
+(** The value of a substituted variable without its lift, for inspections
+    invariant under lifting; [None] for unsubstituted and higher-order ones. *)
+val inspect_substituted_rel : usubs -> int -> fconstr option
+
 (** identity if the first instance is empty *)
 val usubst_instance : 'a UVars.puniverses -> UVars.Instance.t -> UVars.Instance.t
 
@@ -182,6 +186,16 @@ val is_irrelevant : clos_infos -> Sorts.relevance -> bool
 val eq_quality : clos_infos -> Sorts.Quality.t -> Sorts.Quality.t -> bool
 
 val infos_with_reds : clos_infos -> reds -> clos_infos
+
+(** [with_private_closure_query ~steps infos roots inspect] runs [inspect]
+    on copies of [roots] in a private call-by-need view: cells are copied when
+    reduction first visits them and the caller's cells are never updated.
+    Head steps and cell visits share the [steps] budget; [None] when it runs
+    out or reduction meets an unsupported construct (cofixpoints, case
+    inversion, primitives, symbols, evars, higher-order substitutions).
+    [inspect] must reduce with the infos it receives and fresh tables. *)
+val with_private_closure_query : steps:int -> clos_infos -> fconstr list ->
+  (clos_infos -> fconstr list -> 'a option) -> 'a option
 
 (** Reduction function *)
 
