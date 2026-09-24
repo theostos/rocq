@@ -35,7 +35,7 @@ exception NotConvertibleVect of int
    dependent type is contracted first. A miss converts as usual. *)
 exception Syntax_probe_exhausted
 
-let same_syntax env left right =
+let equal_syntax left right =
   let fuel = ref 1024 in
   let rec equal nargs left right =
     if !fuel = 0 then raise_notrace Syntax_probe_exhausted;
@@ -46,8 +46,12 @@ let same_syntax env left right =
     | (Cast _ | Evar _ | Meta _), _ | _, (Cast _ | Evar _ | Meta _) -> false
     | _ -> Constr.compare_head (fun _ _ -> false) equal nargs left right
   in
-  try equal 0 left right
-  with Syntax_probe_exhausted ->
+  try Some (equal 0 left right) with Syntax_probe_exhausted -> None
+
+let same_syntax env left right =
+  match equal_syntax left right with
+  | Some equal -> equal
+  | None ->
     match HConstr.kind (HConstr.of_constr env (mkCast (left, DEFAULTcast, right))) with
     | Cast (left, _, right) -> left == right
     | _ -> assert false
@@ -64,6 +68,48 @@ let conv_leq env left right =
      (left' != left || right' != right) && same_syntax env left' right')
   in
   if same then Result.Ok () else default_conv CUMUL env left right
+
+(* Cumulativity checks of the arguments typed by one run of the typing
+   machine: many arguments are checked against the same rebuilt domain, which
+   [HConstr]'s inference cache does not see. An entry (env, inferred, expected)
+   is found by physical environment and bounded syntactic equality under a
+   bounded hash of both types; large types and misses convert as usual, and
+   nothing is remembered for a failure. *)
+module Conversions = struct
+  type t = (env * constr * constr) list array Lazy.t
+
+  let create () = lazy (Array.make 1024 [])
+
+  (* every node is hashed: a shallow hash collides on computed types that
+     differ only below a common prefix *)
+  let hash term =
+    let fuel = ref 1024 in
+    let rec visit term =
+      if !fuel = 0 then raise_notrace Exit;
+      decr fuel;
+      Constr.fold (fun hash child -> Hashset.Combine.combine hash (visit child))
+        (Hashtbl.hash_param 8 32 term) term
+    in
+    try Some (visit term) with Exit -> None
+
+  let convert cache check env left right =
+    if left == right then check env left right else
+    match hash left, hash right with
+    | None, _ | _, None -> check env left right
+    | Some left_hash, Some right_hash ->
+      let buckets = Lazy.force cache in
+      let i = Hashtbl.hash (left_hash, right_hash) land 1023 in
+      let bucket = buckets.(i) in
+      let same a b = equal_syntax a b = Some true in
+      if List.exists (fun (env', l, r) -> env == env' && same left l && same right r) bucket
+      then Result.Ok ()
+      else
+        let result = check env left right in
+        (* the pair is ordered: cumulativity is not symmetric; 4 per bucket *)
+        if Result.is_ok result then
+          buckets.(i) <- (env, left, right) :: (if List.length bucket >= 4 then [] else bucket);
+        result
+end
 
 let conv_leq_vecti env v1 v2 =
   Array.fold_left2_i
@@ -242,7 +288,7 @@ let rec check_empty_stack = function
 | CClosure.Zupdate _ :: s -> check_empty_stack s
 | _ -> false
 
-let type_of_apply env func funt argsv argstv =
+let type_of_apply ~convert env func funt argsv argstv =
   let open CClosure in
   let len = Array.length argsv in
   let infos = create_clos_infos RedFlags.all env in
@@ -258,7 +304,7 @@ let type_of_apply env func funt argsv argstv =
         let arg = argsv.(i) in
         let argt = argstv.(i) in
         let c1 = term_of_fconstr c1 in
-        begin match conv_leq env argt c1 with
+        begin match convert env argt c1 with
         | Result.Ok () -> apply_rec (i+1) (mk_clos (CClosure.usubs_cons (inject arg) e) c2)
         | Result.Error () ->
           error_cant_apply_bad_type env
@@ -634,15 +680,58 @@ let push_rec_types (lna,typarray,_) env =
   Array.fold_left (fun e assum -> push_rel assum e) env ctxt
 
 (* The typing machine. *)
+type typing_cache = {
+  inferred : constr HConstr.Tbl.t;
+  conversions : Conversions.t;
+}
+
+(* Applications are typed iteratively, the arguments before the head as
+   before (a template polymorphic head is typed from the argument types), so
+   that a long list literal does not take one stack frame per constructor. *)
 let rec execute tbl env cstr =
-  if Int.equal (HConstr.refcount cstr) 1 then execute_aux tbl env cstr
-  else begin match HConstr.Tbl.find_opt tbl cstr with
-    | Some v -> v
+  let remember c typ =
+    if not (Int.equal (HConstr.refcount c) 1) then HConstr.Tbl.add tbl.inferred c typ;
+    typ
+  in
+  let apply c f ft argst =
+    let args = snd (destApp (HConstr.self c)) in
+    let convert =
+      if (Environ.typing_flags env).unfold_dep_heuristic
+      then Conversions.convert tbl.conversions conv_leq else conv_leq in
+    remember c (type_of_apply ~convert env (HConstr.self f) ft args argst)
+  in
+  let rec visit c pending =
+    let cached =
+      if Int.equal (HConstr.refcount c) 1 then None
+      else HConstr.Tbl.find_opt tbl.inferred c
+    in
+    match cached with
+    | Some typ -> return typ pending
     | None ->
-      let v = execute_aux tbl env cstr in
-      HConstr.Tbl.add tbl cstr v;
-      v
-  end
+      match HConstr.kind c with
+      | App (f, args) ->
+        let argst = Array.make (Array.length args) mkProp in
+        visit args.(0) (`Arg (c, f, args, argst, 0) :: pending)
+      | _ -> return (remember c (execute_aux tbl env c)) pending
+  and return typ = function
+    | [] -> typ
+    | `Head (c, f, argst) :: pending -> return (apply c f typ argst) pending
+    | `Arg (c, f, args, argst, i) :: pending ->
+      argst.(i) <- typ;
+      let i = i + 1 in
+      if i < Array.length args then visit args.(i) (`Arg (c, f, args, argst, i) :: pending)
+      else
+        let raw_args = snd (destApp (HConstr.self c)) in
+        match HConstr.kind f with
+        | Ind ind when Environ.template_polymorphic_pind ind env ->
+          let ft = type_of_inductive_knowing_parameters env ind raw_args argst in
+          return (apply c f ft argst) pending
+        | Construct ((ind, _), _ as ctor) when Environ.template_polymorphic_ind ind env ->
+          let ft = type_of_constructor_knowing_parameters env ctor raw_args argst in
+          return (apply c f ft argst) pending
+        | _ -> visit f (`Head (c, f, argst) :: pending)
+  in
+  visit cstr []
 
 and execute_aux tbl env cstr =
   let open Context.Rel.Declaration in
@@ -672,20 +761,7 @@ and execute_aux tbl env cstr =
       ty
 
     (* Lambda calculus operators *)
-    | App (f,args) ->
-      let argst = execute_array tbl env args in
-      let args = snd @@ destApp (self cstr) in
-        let ft =
-          match HConstr.kind f with
-          | Ind ind when Environ.template_polymorphic_pind ind env ->
-            type_of_inductive_knowing_parameters env ind args argst
-          | Construct ((ind, _), _ as cstr) when Environ.template_polymorphic_ind ind env ->
-            type_of_constructor_knowing_parameters env cstr args argst
-          | _ ->
-            (* No template polymorphism *)
-            execute tbl env f
-        in
-        type_of_apply env (self f) ft args argst
+    | App _ -> assert false (* typed by [execute] *)
 
     | Lambda (name,c1,c2) ->
       let s = execute_is_type tbl env c1 in
@@ -858,7 +934,8 @@ and execute_array tbl env cs =
   Array.map (fun c -> execute tbl env c) cs
 
 let execute env c =
-  NewProfile.profile "Typeops.execute" (fun () -> execute (HConstr.Tbl.create ()) env c) ()
+  let tbl = { inferred = HConstr.Tbl.create (); conversions = Conversions.create () } in
+  NewProfile.profile "Typeops.execute" (fun () -> execute tbl env c) ()
 
 (* Derived functions *)
 
