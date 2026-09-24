@@ -231,16 +231,17 @@ let same_site a b =
   eq_lift a.left_lift b.left_lift && eq_lift a.right_lift b.right_lift &&
   Int.equal a.ctx b.ctx
 
-(* A memo table of one conversion call: an insertion into a full table first
-   clears it, so that a miss only repeats work. *)
+(* A memo table of one conversion call: an insertion into a full table
+   ([limit] entries) first clears it, so that a miss only repeats work. *)
 module Bounded (H : Hashtbl.HashedType) = struct
   module T = Hashtbl.Make (H)
-  type 'a t = { table : 'a T.t; mutable size : int }
-  let create () = { table = T.create 17; size = 0 }
+  type 'a t = { table : 'a T.t; mutable size : int; limit : int }
+  let create ?(limit = 4096) () = { table = T.create 17; size = 0; limit }
   let find t key = T.find_opt t.table key
   let mem t key = T.mem t.table key
+  let reserve t = if t.size >= t.limit then begin T.clear t.table; t.size <- 0 end
   let add t key value =
-    if t.size >= 4096 then begin T.clear t.table; t.size <- 0 end;
+    reserve t;
     T.replace t.table key value;
     t.size <- t.size + 1
 end
@@ -264,8 +265,8 @@ module Sites = struct
     add t (c1, c2) (site :: sites)
 end
 
-(* Applications of two constants whose bounded same-head congruence failed:
-   the retry goes straight to unfolding. A hit certifies nothing. *)
+(* Applications of two constants, keyed by the heads, the argument frames
+   and the site. *)
 type frame = Karg of fconstr | Kshift of int | Kproj of Projection.Repr.t * Sorts.relevance
 
 let congruence_frames stack =
@@ -281,7 +282,7 @@ let congruence_frames stack =
     | (Zapp _ | Zfix _ | ZcaseT _ | Zprimitive _) :: _ -> None
   in collect 128 [] stack
 
-module Failed = Bounded (struct
+module Applications = Bounded (struct
   type t = (pconstant * pconstant) * frame list * frame list * site
   let equal_frame a b = match a, b with
     | Karg a, Karg b -> a == b
@@ -311,6 +312,98 @@ module MajorProbes = Hashtbl.Make (struct
   let equal = (==)
   let hash = fconstr_hash
 end)
+
+(* Successful comparisons of one conversion call. Cells are keyed by identity
+   (sharing makes repeated comparisons of the same cells common), suspended
+   closures also by their syntax (the same body under substitutions found to
+   give the same instance). Both tables count towards one limit of 4_000_000
+   entries and are cleared together; 64 entries per key. Completed same-head
+   applications are keyed like the failed congruences. *)
+module Memo = struct
+  type entry = conv_pb * site
+
+  type template = Term of constr | Lambda of (Name.t binder_annot * constr) list * constr
+
+  module Cells = Hashtbl.Make (struct
+    type t = fconstr * fconstr
+    let equal (a, b) (c, d) = a == c && b == d
+    let hash (a, b) = Hashtbl.hash (fconstr_hash a, fconstr_hash b)
+  end)
+
+  module Suspended = Hashtbl.Make (struct
+    type t = template * template
+    let equal_template a b = match a, b with
+      | Term a, Term b -> a == b
+      | Lambda (ds, a), Lambda (es, b) ->
+        a == b && List.equal (fun (na, t) (nb, u) -> na == nb && t == u) ds es
+      | (Term _ | Lambda _), _ -> false
+    let hash_template = function
+      | Term body -> Hashtbl.hash (0, Hashtbl.hash_param 8 32 body)
+      | Lambda (ds, body) ->
+        List.fold_left (fun h (_, ty) -> Hashtbl.hash (h, Hashtbl.hash_param 8 32 ty))
+          (Hashtbl.hash (1, Hashtbl.hash_param 8 32 body)) ds
+    let equal (a, b) (c, d) = equal_template a c && equal_template b d
+    let hash (a, b) = Hashtbl.hash (hash_template a, hash_template b)
+  end)
+
+  type t = {
+    cells : entry list Cells.t;
+    suspended : (entry * usubs * usubs) list Suspended.t;
+    mutable size : int;
+    applications : conv_pb list Applications.t;
+  }
+
+  let create () =
+    { cells = Cells.create 251; suspended = Suspended.create 251; size = 0;
+      applications = Applications.create ~limit:32_768 () }
+
+  let reserve t =
+    if t.size >= 4_000_000 then begin
+      Cells.clear t.cells; Suspended.clear t.suspended; t.size <- 0 end
+
+  (* the entries of a full key are dropped *)
+  let entries t = function
+    | Some entries when List.length entries < 64 -> entries
+    | Some entries -> t.size <- t.size - List.length entries; []
+    | None -> []
+
+  let cached t cv_pb site c1 c2 =
+    match Cells.find_opt t.cells (c1, c2) with
+    | Some entries -> List.exists (fun (pb, s) -> pb = cv_pb && same_site s site) entries
+    | None -> false
+
+  let remember t cv_pb site c1 c2 =
+    reserve t;
+    Cells.replace t.cells (c1, c2) ((cv_pb, site) :: entries t (Cells.find_opt t.cells (c1, c2)));
+    t.size <- t.size + 1
+
+  (* The suspended syntax of two cells (their saved spines first): the body of
+     a closure, or the domains and body of a lambda. *)
+  let suspended_key c1 c2 =
+    let capture c = match [@ocaml.warning "-4"] fterm_of (Option.default c (symbolic_view c)) with
+      | FCLOS (body, subst) -> Some (Term body, subst)
+      | FLambda (n, domains, body, subst) when n <= 1024 -> Some (Lambda (domains, body), subst)
+      | _ -> None in
+    match capture c1, capture c2 with
+    | Some (t1, subst1), Some (t2, subst2) -> Some ((t1, t2), subst1, subst2)
+    | _ -> None
+
+  let suspended t key = Option.default [] (Suspended.find_opt t.suspended key)
+
+  let remember_suspended t cv_pb site (key, subst1, subst2) =
+    reserve t;
+    Suspended.replace t.suspended key
+      (((cv_pb, site), subst1, subst2) :: entries t (Suspended.find_opt t.suspended key));
+    t.size <- t.size + 1
+
+  let completed t cv_pb key =
+    List.mem cv_pb (Option.default [] (Applications.find t.applications key))
+
+  let complete t cv_pb key =
+    Applications.reserve t.applications;
+    let problems = Option.default [] (Applications.find t.applications key) in
+    if not (List.mem cv_pb problems) then Applications.add t.applications key (cv_pb :: problems)
+end
 
 module ConstructorMasks = Hashtbl.Make (struct
   type t = pconstructor
@@ -348,7 +441,8 @@ type 'e conv_tab = {
   cnv_symbolic_total : int ref; (* remaining steps of all symbolic recoveries *)
   cnv_symbolic_misses : site list Sites.t; (* pairs whose recovery failed *)
   cnv_projections : site list Sites.t; (* sources of projections found convertible *)
-  cnv_failed : unit Failed.t;
+  cnv_failed : unit Applications.t; (* congruence failed: the retry unfolds *)
+  cnv_memo : Memo.t option; (* of a typed conversion under the heuristic *)
   cnv_masks : bool array ConstructorMasks.t;
   cnv_major_misses : fterm MajorProbes.t;
   lft_tab : clos_tab;
@@ -386,16 +480,21 @@ let bounded_congruence infos compare =
     try compare { infos with cnv_probe = Some { depth = ref 256; work = ref 4096 } }
     with Probe_budget_exhausted -> raise NotConvertible
 
+let application_key infos lft1 lft2 fl1 stk1 fl2 stk2 =
+  match fl1, fl2, congruence_frames stk1, congruence_frames stk2 with
+  | ConstKey c, ConstKey d, Some left, Some right when infos.cnv_typ ->
+    Some ((c, d), left, right, { left_lift = lft1; right_lift = lft2; ctx = infos.cnv_ctx })
+  | _ -> None
+
+(* A failed congruence is remembered; a hit certifies nothing. *)
 let try_congruence infos lft1 lft2 fl1 stk1 fl2 stk2 compare =
-  let key = match fl1, fl2, congruence_frames stk1, congruence_frames stk2 with
-    | ConstKey c, ConstKey d, Some left, Some right when infos.cnv_typ ->
-      Some ((c, d), left, right, { left_lift = lft1; right_lift = lft2; ctx = infos.cnv_ctx })
-    | _ -> None in
-  if Option.cata (Failed.mem infos.cnv_failed) false key then raise NotConvertible;
+  let key = application_key infos lft1 lft2 fl1 stk1 fl2 stk2 in
+  if Option.cata (Applications.mem infos.cnv_failed) false key then raise NotConvertible;
   try bounded_congruence infos compare
   with (NotConvertible | NotConvertibleTrace _) as error ->
     Option.iter (fun key ->
-      if not (Failed.mem infos.cnv_failed key) then Failed.add infos.cnv_failed key ()) key;
+      if not (Applications.mem infos.cnv_failed key) then
+        Applications.add infos.cnv_failed key ()) key;
     raise error
 
 let convert_inductives cv_pb ind nargs u1 u2 (s, check) =
@@ -933,13 +1032,19 @@ module SyntaxPairs = Hashtbl.Make (struct
     | ClosurePair (a, _, b, _) -> Hashtbl.hash (1, fconstr_hash a, fconstr_hash b)
 end)
 
+(* The memo of one test; [symbolic] compares the saved spines of two cells
+   before their values. *)
+type syntax_memo = { pairs : unit SyntaxPairs.t Lazy.t; symbolic : bool }
+
+let syntax_memo ?(symbolic = false) () = { pairs = lazy (SyntaxPairs.create 17); symbolic }
+
 let syntax_cached memo = function
   | None -> false
-  | Some key -> Lazy.is_val memo && SyntaxPairs.mem (Lazy.force memo) key
+  | Some key -> Lazy.is_val memo.pairs && SyntaxPairs.mem (Lazy.force memo.pairs) key
 
 let remember_syntax memo = function
   | None -> ()
-  | Some key -> SyntaxPairs.replace (Lazy.force memo) key ()
+  | Some key -> SyntaxPairs.replace (Lazy.force memo.pairs) key ()
 
 let rec compare_under memo budget e1 c1 e2 c2 =
   if !budget <= 0 then false else begin
@@ -1023,7 +1128,13 @@ and fast_test_under memo budget lft1 term1 lft2 term2 =
       Some (ClosurePair (term1, lft1, term2, lft2))
     | _ -> None in
   if syntax_cached memo key then true else
-  let equal =
+  let same_spines =
+    memo.symbolic &&
+    let spine term = Option.default term (symbolic_view term) in
+    let spine1 = spine term1 and spine2 = spine term2 in
+    (spine1 != term1 || spine2 != term2) &&
+    fast_test_under memo budget lft1 spine1 lft2 spine2 in
+  let equal = same_spines ||
   match fterm_of term1, fterm_of term2 with
   | FLIFT (i, term1), _ -> fast_test_under memo budget (el_shft i lft1) term1 lft2 term2
   | _, FLIFT (j, term2) -> fast_test_under memo budget lft1 term1 (el_shft j lft2) term2
@@ -1078,10 +1189,29 @@ and fast_test_under memo budget lft1 term1 lft2 term2 =
   equal
   end
 
-let syntax_memo () = lazy (SyntaxPairs.create 17)
-
 let fast_test lft1 term1 lft2 term2 =
   fast_test_under (syntax_memo ()) (ref 1024) lft1 term1 lft2 term2
+
+(* A suspended entry of the memo is reused when its substitutions and the
+   present ones give the same instance of the templates, by a read-only
+   syntactic test; one budget of 1024 for all the entries of a key. *)
+let suspended_cached memo cv_pb site ((template1, template2) as key, subst1, subst2) =
+  let budget = ref 1024 in
+  let same template subst old =
+    let instance subst old body =
+      compare_under (syntax_memo ~symbolic:true ()) budget subst body old body in
+    match template with
+    | Memo.Term body -> instance subst old body
+    | Memo.Lambda (domains, body) ->
+      let rec under subst old = function
+        | [] -> instance subst old body
+        | (_, domain) :: rest ->
+          instance subst old domain && under (usubs_lift subst) (usubs_lift old) rest
+      in under subst old domains
+  in
+  List.exists (fun ((pb, s), old1, old2) ->
+    pb = cv_pb && same_site s site && same template1 subst1 old1 && same template2 subst2 old2)
+    (Memo.suspended memo key)
 
 (* Two bare projections of the same constructor wrapper whose selected field
    forwards an argument that is syntactically the same on both sides: the
@@ -2181,18 +2311,32 @@ let rec ccnv cv_pb l2r infos lft1 lft2 term1 term2 cuniv =
   Option.iter (fun { work; _ } ->
     if Int.equal !work 0 then raise Probe_budget_exhausted;
     decr work) probe;
-  if fast_test lft1 term1 lft2 term2 then cuniv
-  else
-    let compare () =
-      match symbolic_congruence cv_pb l2r infos lft1 lft2 term1 term2 cuniv with
-      | Some cuniv -> cuniv
-      | None -> eqappr cv_pb l2r infos (lft1, (term1,[])) (lft2, (term2,[])) cuniv in
-    match probe with
+  let compare () =
+    match symbolic_congruence cv_pb l2r infos lft1 lft2 term1 term2 cuniv with
+    | Some cuniv -> cuniv
+    | None -> eqappr cv_pb l2r infos (lft1, (term1,[])) (lft2, (term2,[])) cuniv in
+  let compare () = match probe with
     | None -> compare ()
     | Some { depth; _ } ->
       if Int.equal !depth 0 then raise Probe_budget_exhausted;
       decr depth;
-      Fun.protect compare ~finally:(fun () -> incr depth)
+      Fun.protect compare ~finally:(fun () -> incr depth) in
+  match infos.cnv_memo with
+  | None -> if fast_test lft1 term1 lft2 term2 then cuniv else compare ()
+  | Some memo ->
+    (* the memo of cells before the syntactic test: it answers most repeated
+       comparisons at once; the suspended syntax is captured before reduction
+       overwrites the cells *)
+    let site = { left_lift = lft1; right_lift = lft2; ctx = infos.cnv_ctx } in
+    if Memo.cached memo cv_pb site term1 term2 || fast_test lft1 term1 lft2 term2 then cuniv
+    else
+      let suspended = Memo.suspended_key term1 term2 in
+      if Option.cata (suspended_cached memo cv_pb site) false suspended then cuniv
+      else
+        let cuniv = compare () in
+        Memo.remember memo cv_pb site term1 term2;
+        Option.iter (Memo.remember_suspended memo cv_pb site) suspended;
+        cuniv
 
 (* Two cells whose spines before reduction are headed by flexes (see
    [CClosure.symbolic_view]) are first compared by symbolic reduction, under
@@ -2409,7 +2553,14 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
             (match same_unit () with Some cuniv -> cuniv | None -> raise NotConvertible)
 
     (* 2 constants, 2 local defined vars or 2 defined rels *)
-    | (FFlex fl1, FFlex fl2) -> eq_flex_flex cv_pb l2r infos appr1 appr2 fl1 fl2 cuniv
+    | (FFlex fl1, FFlex fl2) ->
+      let key = Option.bind infos.cnv_memo (fun memo ->
+        Option.map (fun key -> memo, key) (application_key infos lft1 lft2 fl1 v1 fl2 v2)) in
+      if Option.cata (fun (memo, key) -> Memo.completed memo cv_pb key) false key then cuniv
+      else
+        let cuniv = eq_flex_flex cv_pb l2r infos appr1 appr2 fl1 fl2 cuniv in
+        Option.iter (fun (memo, key) -> Memo.complete memo cv_pb key) key;
+        cuniv
 
     (* A projection that does not unfold against a record constructor: eta *)
     | (FProj (p1, r1, c1), FConstruct (((ind2, 1), u2), args2))
@@ -3160,7 +3311,10 @@ let clos_gen_conv (type err) ~typed ?(strategy = plain_strategy) trans cv_pb l2r
         cnv_symbolic_total = ref (Option.default 16_384 strategy.steps);
         cnv_symbolic_misses = Sites.create ();
         cnv_projections = Sites.create ();
-        cnv_failed = Failed.create ();
+        cnv_failed = Applications.create ();
+        cnv_memo =
+          if typed && (Environ.typing_flags env).unfold_dep_heuristic
+          then Some (Memo.create ()) else None;
         cnv_masks = ConstructorMasks.create 17;
         cnv_major_misses = MajorProbes.create 16;
         lft_tab = create_tab ();
@@ -3221,7 +3375,7 @@ let () =
         cnv_strategy = plain_strategy; cnv_steps = None; cnv_probe = None;
         cnv_symbolic = None; cnv_symbolic_total = ref 16_384;
         cnv_symbolic_misses = Sites.create (); cnv_projections = Sites.create ();
-        cnv_failed = Failed.create ();
+        cnv_failed = Applications.create (); cnv_memo = None;
         cnv_masks = ConstructorMasks.create 17; cnv_major_misses = MajorProbes.create 16;
       } in
       let state', _ = ccnv CONV false infos el_id el_id a b (state, checked_universes_gen qual_equal) in
