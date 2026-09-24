@@ -180,7 +180,15 @@ type compact_peano = {
 type fconstr = {
   mutable state : int;
   mutable term: fterm;
+  mutable symbolic : symbolic_view;
 }
+
+(* Sharing overwrites a reduced cell with its value: the cell keeps a copy of
+   the spine it had, which a symbolic reduction (see [knh]) reads instead. *)
+and symbolic_view =
+  | NoSymbolicView
+  | SymbolicView of fconstr (* a copy of the former spine *)
+  | SymbolicCopy (* the copy itself: immutable, never locked *)
 
 and fterm =
   | FRel of int
@@ -229,11 +237,30 @@ let set_fconstr_mark v mark = v.state <- v.state land lnot 3 lor mark_code mark
 let next_uid = Atomic.make 0
 
 let make_fconstr mark term =
-  { state = Atomic.fetch_and_add next_uid 1 lsl 2 lor mark_code mark; term }
+  { state = Atomic.fetch_and_add next_uid 1 lsl 2 lor mark_code mark; term;
+    symbolic = NoSymbolicView }
 
 let get_invert fiv = fiv
 
 let fterm_of v = v.term
+
+(* The former spine of a cell (or the cell itself) when its head, followed
+   without reduction, is a flex. *)
+let symbolic_view v =
+  let view = match v.symbolic with
+    | SymbolicView view -> view
+    | NoSymbolicView | SymbolicCopy -> v in
+  let rec flex_head fuel v =
+    fuel > 0 && match [@ocaml.warning "-4"] v.term with
+    | FFlex _ -> true
+    | FApp (head, args) when Array.length args <= 256 -> flex_head (fuel - 1) head
+    | FLIFT (_, head) | FProj (_, _, head) -> flex_head (fuel - 1) head
+    | FCLOS (term, _) ->
+      begin match [@ocaml.warning "-4"] Constr.kind (fst (Constr.decompose_app term)) with
+      | Const _ | Var _ | Proj _ -> true
+      | _ -> false end
+    | _ -> false in
+  if flex_head 32 view then Some view else None
 
 let set_ntrl v = set_fconstr_mark v Ntrl
 
@@ -313,6 +340,7 @@ type infos_cache = {
 
 type clos_infos = {
   i_flags : reds;
+  i_symbolic : bool; (* symbolic reduction: reads the former spines of cells *)
   i_private : (fconstr -> fconstr) option; (* private view: copies a cell on demand *)
   i_relevances : Sorts.relevance Range.t;
   i_inspection : int ref option; (* remaining budget of an inspection *)
@@ -336,6 +364,10 @@ end
 let info_flags info = info.i_flags
 let info_env info = info.i_cache.i_env
 let info_univs info = info.i_cache.i_univs
+
+(* Symbolic reduction takes the former spine of a cell only during the cheap
+   head reduction of a conversion; full reduction uses the values. *)
+let symbolic_reduction info = info.i_symbolic && info.i_flags = RedFlags.betaiotazeta
 
 let push_relevance infos x =
   { infos with i_relevances = Range.cons x.binder_relevance infos.i_relevances }
@@ -400,6 +432,11 @@ end)
    when the lift is 0. Constructor arguments are copied, so a shared DAG of
    constructors is lifted once per cell. *)
 let rec lft_fconstr n ft =
+  match ft.symbolic with
+  | SymbolicView _ -> lft_construct n ft
+  | NoSymbolicView | SymbolicCopy -> lft_term n ft
+
+and lft_term n ft =
   match ft.term with
     | (FInd _|FConstruct (_,[||])|FFlex(ConstKey _|VarKey _)|FInt _|FFloat _|FString _|FPeanoNat _|FIrrelevant) -> ft
     | FRel i -> make_fconstr (fconstr_mark ft) (FRel (i + n))
@@ -427,7 +464,16 @@ and lft_construct n ft =
         | FConstruct (c, args) when not (Array.is_empty args) ->
           make_fconstr Cstr (FConstruct (c, Array.map (lift n) args))
         | FLIFT (k, m) -> lift (n + k) m
-        | _ -> lft_fconstr n ft in
+        | _ -> lft_term n ft in
+      let v = match ft.symbolic with
+        | NoSymbolicView | SymbolicCopy -> v
+        | SymbolicView view ->
+          (* a lifted cell with a view is a fresh cell, its view is shifted *)
+          let v = if v == ft then make_fconstr (fconstr_mark ft) ft.term else v in
+          let shifted = make_fconstr (fconstr_mark view) (FLIFT (n, view)) in
+          shifted.symbolic <- SymbolicCopy;
+          v.symbolic <- SymbolicView shifted;
+          v in
       LiftMemo.add tbl (ft, n) v;
       v
   in
@@ -467,10 +513,24 @@ let compact_stack head stk =
   in
   strip_rec 0 stk
 
+(* The spine of a cell about to be locked is kept for symbolic reduction,
+   during the conversions of typed terms only. *)
+let save_symbolic_view info m =
+  if info.i_cache.i_mode = Conversion && Option.is_empty info.i_private &&
+     not (Inspection.active info) &&
+     (Environ.typing_flags info.i_cache.i_env).unfold_dep_heuristic
+  then match [@ocaml.warning "-4"] m.symbolic, m.term with
+    | NoSymbolicView, (FCLOS _ | FApp _ | FProj _) ->
+      let copy = make_fconstr (fconstr_mark m) m.term in
+      copy.symbolic <- SymbolicCopy;
+      m.symbolic <- SymbolicView copy
+    | _ -> ()
+
 (* Put an update mark in the stack, only if needed *)
 let zupdate info m s =
   let share = info.i_cache.i_share in
-  if share && is_red (fconstr_mark m) then
+  if share && is_red (fconstr_mark m) && m.symbolic != SymbolicCopy then
+    let () = save_symbolic_view info m in
     let s' = compact_stack m s in
     let _ = m.term <- FLOCKED in
     Zupdate(m)::s'
@@ -923,6 +983,10 @@ let lift_union k = function
   | HigherOrder (n, v) -> HigherOrder (n+k, v)
 
 let rec resubst subs v =
+  (* the saved spine would keep the old substitution *)
+  let v = match v.symbolic with
+    | SymbolicView _ -> make_fconstr (fconstr_mark v) v.term
+    | NoSymbolicView | SymbolicCopy -> v in
   match v.term with
   | FRel i ->
     begin match clos_rel subs i with
@@ -2126,6 +2190,9 @@ let rec knh info m stk =
   Inspection.charge info 1;
   (* a private view owns every cell the reducer visits, so updates go there *)
   let m = match info.i_private with None -> m | Some own -> own m in
+  let m = match m.symbolic with
+    | SymbolicView view when symbolic_reduction info -> view
+    | SymbolicView _ | NoSymbolicView | SymbolicCopy -> m in
   let () = match [@ocaml.warning "-4"] m.term with
     | FCoFix _ | FCaseInvert _ | FEvar _ | FArray _
     | FPeanoNat _ -> Inspection.decline info
@@ -2135,6 +2202,22 @@ let rec knh info m stk =
   in
   match m.term with
     | FLIFT(k,a) -> knh info a (zshift k stk)
+    | FCLOS(t,e) when m.symbolic == SymbolicCopy ->
+      (* a saved spine is instantiated once; its arguments are ordinary
+         shared cells with their own views *)
+      let exposed = match [@ocaml.warning "-4"] kind t with
+        | App (f, args) -> begin match [@ocaml.warning "-4"] kind f with
+          | Rel n -> begin match clos_rel (fst e) n with
+            | Regular f -> Some (FApp (f, mk_clos_vect e args))
+            | HigherOrder _ -> None end
+          | _ -> Some (FApp (mk_clos e f, mk_clos_vect e args)) end
+        | Proj (p, r, c) -> Some (FProj (p, usubst_relevance e r, mk_clos e c))
+        | _ -> None
+      in
+      begin match exposed with
+      | Some term -> update m Red term; knh info m stk
+      | None -> knht info e t stk
+      end
     | FCLOS(t,e) -> knht info e t (zupdate info m stk)
     | FLOCKED -> Inspection.decline info; assert false
     | FApp(a,b) -> knh info a (append_stack b (zupdate info m stk))
@@ -2817,7 +2900,10 @@ let rec knr : type a. _ -> _ -> pat_state:a depth -> _ -> _ -> a =
            kni info tab ~pat_state a (Zprimitive(op,c,rargs,nargs)::s)
              end
      | (depth, _, _, stk) -> knr_ret info tab ~pat_state (m,zshift depth stk))
-  | FCaseInvert (ci, u, pms, ((_pnas, p), _r), iv, _c, v, env) when red_set info.i_flags fMATCH ->
+  (* symbolic reduction is a congruence search: an inverted case is kept for
+     structural comparison, the ordinary reduction still inverts it *)
+  | FCaseInvert (ci, u, pms, ((_pnas, p), _r), iv, _c, v, env)
+    when red_set info.i_flags fMATCH && not info.i_symbolic ->
     begin match case_inversion info tab ci u pms p iv v env with
       | Some c -> knit info tab ~pat_state env c stk
       | None -> knr_ret info tab ~pat_state (m, stk)
@@ -3063,11 +3149,12 @@ let norm_val info tab v = kl info tab v
 let norm_term info tab e t = klt info tab e t
 
 let whd_stack infos tab m stk = match fconstr_mark m with
-| Ntrl ->
+| Ntrl when not (symbolic_reduction infos) ->
   (** No need to perform [kni] nor to unlock updates because
       every head subterm of [m] is [Ntrl] *)
   knh infos m stk
-| Red | Cstr ->
+| Ntrl | Red | Cstr ->
+  (* a neutral mark certifies the value; a saved spine may still be a redex *)
   let k = kni infos tab m stk in
   let () =
     if infos.i_cache.i_share then
@@ -3082,7 +3169,8 @@ let create_infos i_mode ?univs ?evars i_flags i_env =
   let i_univs = Option.default (Environ.universes i_env) univs in
   let i_share = (Environ.typing_flags i_env).Declarations.share_reduction in
   let i_cache = {i_env; i_sigma = evars; i_share; i_univs; i_mode} in
-  {i_flags; i_private = None; i_relevances = Range.empty; i_inspection = None; i_cache}
+  {i_flags; i_symbolic = false; i_private = None; i_relevances = Range.empty;
+   i_inspection = None; i_cache}
 
 let create_conv_infos = create_infos Conversion
 let create_clos_infos = create_infos Reduction
@@ -3091,6 +3179,8 @@ let oracle_of_infos infos = Environ.oracle infos.i_cache.i_env
 
 let infos_with_reds infos reds =
   { infos with i_flags = reds }
+
+let infos_with_symbolic_views infos = { infos with i_symbolic = true }
 
 module Cells = Hashtbl.Make(struct
   type t = fconstr

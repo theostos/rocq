@@ -245,27 +245,24 @@ module Bounded (H : Hashtbl.HashedType) = struct
     t.size <- t.size + 1
 end
 
-(* Sites where the sources of two projections were found convertible: fields
-   of a shared record are projected many times, and the first comparison may
-   have updated the shared closure. *)
-module Projections = Bounded (struct
-  type t = fconstr * fconstr
-  let equal (a, b) (c, d) = a == c && b == d
-  let hash (a, b) = Hashtbl.hash (fconstr_hash a, fconstr_hash b)
-end)
-
-let projection_cached cache c1 c2 site =
-  match Projections.find cache (c1, c2) with
-  | Some sites -> List.exists (same_site site) sites
-  | None -> false
-
-(* At most 8 sites per pair. *)
-let remember_projection cache c1 c2 site =
-  let sites = match Projections.find cache (c1, c2) with
-    | Some sites when List.length sites < 8 -> sites
-    | Some sites -> cache.Projections.size <- cache.Projections.size - List.length sites; []
-    | None -> [] in
-  Projections.add cache (c1, c2) (site :: sites)
+(* Sites where two cells were compared, keyed by the cells (a comparison may
+   have updated them); at most 8 sites per pair. *)
+module Sites = struct
+  include Bounded (struct
+    type t = fconstr * fconstr
+    let equal (a, b) (c, d) = a == c && b == d
+    let hash (a, b) = Hashtbl.hash (fconstr_hash a, fconstr_hash b)
+  end)
+  let cached t c1 c2 site = match find t (c1, c2) with
+    | Some sites -> List.exists (same_site site) sites
+    | None -> false
+  let remember t c1 c2 site =
+    let sites = match find t (c1, c2) with
+      | Some sites when List.length sites < 8 -> sites
+      | Some sites -> t.size <- t.size - List.length sites; []
+      | None -> [] in
+    add t (c1, c2) (site :: sites)
+end
 
 (* Applications of two constants whose bounded same-head congruence failed:
    the retry goes straight to unfolding. A hit certifies nothing. *)
@@ -347,7 +344,10 @@ type 'e conv_tab = {
   cnv_strategy : strategy;
   cnv_steps : int ref option; (* remaining steps of a bounded attempt *)
   cnv_probe : probe option;
-  cnv_projections : site list Projections.t;
+  cnv_symbolic : int ref option; (* remaining steps of a symbolic recovery *)
+  cnv_symbolic_total : int ref; (* remaining steps of all symbolic recoveries *)
+  cnv_symbolic_misses : site list Sites.t; (* pairs whose recovery failed *)
+  cnv_projections : site list Sites.t; (* sources of projections found convertible *)
   cnv_failed : unit Failed.t;
   cnv_masks : bool array ConstructorMasks.t;
   cnv_major_misses : fterm MajorProbes.t;
@@ -367,12 +367,15 @@ let dep_heuristic infos = (Environ.typing_flags (info_env infos.cnv_inf)).unfold
 
 exception Probe_budget_exhausted
 exception Strategy_budget_exhausted
+exception Symbolic_budget_exhausted
 
-let charge_step infos = match infos.cnv_steps with
-  | None -> ()
-  | Some remaining ->
+let charge_step infos =
+  Option.iter (fun remaining ->
     if !remaining = 0 then raise Strategy_budget_exhausted;
-    decr remaining
+    decr remaining) infos.cnv_steps;
+  Option.iter (fun remaining ->
+    if !remaining = 0 || !(infos.cnv_symbolic_total) = 0 then raise Symbolic_budget_exhausted;
+    decr remaining; decr infos.cnv_symbolic_total) infos.cnv_symbolic
 
 (* Congruence may compare branches that evaluating the application would
    discard: bound its depth and total work, unless it already runs inside a
@@ -2180,13 +2183,35 @@ let rec ccnv cv_pb l2r infos lft1 lft2 term1 term2 cuniv =
     decr work) probe;
   if fast_test lft1 term1 lft2 term2 then cuniv
   else
-    let compare () = eqappr cv_pb l2r infos (lft1, (term1,[])) (lft2, (term2,[])) cuniv in
+    let compare () =
+      match symbolic_congruence cv_pb l2r infos lft1 lft2 term1 term2 cuniv with
+      | Some cuniv -> cuniv
+      | None -> eqappr cv_pb l2r infos (lft1, (term1,[])) (lft2, (term2,[])) cuniv in
     match probe with
     | None -> compare ()
     | Some { depth; _ } ->
       if Int.equal !depth 0 then raise Probe_budget_exhausted;
       decr depth;
       Fun.protect compare ~finally:(fun () -> incr depth)
+
+(* Two cells whose spines before reduction are headed by flexes (see
+   [CClosure.symbolic_view]) are first compared by symbolic reduction, under
+   a budget: the spines may be congruent while the values are large. A failure
+   or exhaustion is remembered by site and certifies nothing. *)
+and symbolic_congruence cv_pb l2r infos lft1 lft2 term1 term2 cuniv =
+  if not infos.cnv_typ || Option.has_some infos.cnv_symbolic ||
+     !(infos.cnv_symbolic_total) = 0 || not (dep_heuristic infos) then None
+  else
+    let site = { left_lift = lft1; right_lift = lft2; ctx = infos.cnv_ctx } in
+    if Sites.cached infos.cnv_symbolic_misses term1 term2 site then None else
+    match symbolic_view term1, symbolic_view term2 with
+    | Some left, Some right when left != term1 || right != term2 ->
+      let infos' = { infos with cnv_inf = infos_with_symbolic_views infos.cnv_inf;
+                                cnv_symbolic = Some (ref 4096) } in
+      (try Some (eqappr cv_pb l2r infos' (lft1, (left, [])) (lft2, (right, [])) cuniv)
+       with Symbolic_budget_exhausted | NotConvertible | NotConvertibleTrace _ ->
+         Sites.remember infos.cnv_symbolic_misses term1 term2 site; None)
+    | _ -> None
 
 (* Conversion between [lft1](hd1 v1) and [lft2](hd2 v2) *)
 and eqappr cv_pb l2r infos (lft1,st1) (lft2,st2) cuniv =
@@ -2434,10 +2459,10 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
           try
             let site = { left_lift = el1; right_lift = el2; ctx = infos.cnv_ctx } in
             let cuniv =
-              if projection_cached infos.cnv_projections c1 c2 site then cuniv
+              if Sites.cached infos.cnv_projections c1 c2 site then cuniv
               else begin
                 let cuniv = ccnv CONV l2r infos el1 el2 c1 c2 cuniv in
-                remember_projection infos.cnv_projections c1 c2 site;
+                Sites.remember infos.cnv_projections c1 c2 site;
                 cuniv
               end
             in
@@ -3130,7 +3155,11 @@ let clos_gen_conv (type err) ~typed ?(strategy = plain_strategy) trans cv_pb l2r
         cnv_strategy = strategy;
         cnv_steps = Option.map ref strategy.steps;
         cnv_probe = None;
-        cnv_projections = Projections.create ();
+        (* a bounded attempt shares its allowance with symbolic recovery *)
+        cnv_symbolic = None;
+        cnv_symbolic_total = ref (Option.default 16_384 strategy.steps);
+        cnv_symbolic_misses = Sites.create ();
+        cnv_projections = Sites.create ();
         cnv_failed = Failed.create ();
         cnv_masks = ConstructorMasks.create 17;
         cnv_major_misses = MajorProbes.create 16;
@@ -3190,7 +3219,9 @@ let () =
         cnv_rel_types = Range.empty; cnv_rel_type_lifts = Range.empty;
         cnv_ctx = 0; cnv_ctx_steps = CtxSteps.create 64;
         cnv_strategy = plain_strategy; cnv_steps = None; cnv_probe = None;
-        cnv_projections = Projections.create (); cnv_failed = Failed.create ();
+        cnv_symbolic = None; cnv_symbolic_total = ref 16_384;
+        cnv_symbolic_misses = Sites.create (); cnv_projections = Sites.create ();
+        cnv_failed = Failed.create ();
         cnv_masks = ConstructorMasks.create 17; cnv_major_misses = MajorProbes.create 16;
       } in
       let state', _ = ccnv CONV false infos el_id el_id a b (state, checked_universes_gen qual_equal) in

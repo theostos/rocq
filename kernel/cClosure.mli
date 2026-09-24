@@ -140,6 +140,11 @@ val mk_clos_vect : usubs -> constr array -> fconstr array
 val zip : fconstr -> stack -> fconstr
 
 val fterm_of : fconstr -> fterm
+
+(** The spine a shared cell had before its reduction (or the cell itself),
+    when it is headed by a flex. Nothing is certified: the two are convertible,
+    not equal. *)
+val symbolic_view : fconstr -> fconstr option
 val term_of_fconstr : fconstr -> constr
 val term_of_process : fconstr -> stack -> constr
 val destFLambda :
@@ -193,6 +198,11 @@ val relevance_mask : clos_infos -> UVars.Instance.t -> constr -> bool array
 val eq_quality : clos_infos -> Sorts.Quality.t -> Sorts.Quality.t -> bool
 
 val infos_with_reds : clos_infos -> reds -> clos_infos
+
+(** Symbolic reduction: the head reduction of a conversion reads the spines
+    the shared cells had before they were reduced, and does not invert cases.
+    A search policy only, the caller converts as usual on a failure. *)
+val infos_with_symbolic_views : clos_infos -> clos_infos
 
 (** [with_private_closure_query ~steps infos roots inspect] runs [inspect]
     on copies of [roots] in a private call-by-need view: cells are copied when
