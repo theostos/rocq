@@ -475,8 +475,8 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
               if (Environ.typing_flags env).unfold_dep_heuristic then
                 match fl1, fl2 with
                 | ConstKey (cst1, _), ConstKey (cst2, _) ->
-                  if Environ.constant_depends_on env cst1 cst2 then true
-                  else if Environ.constant_depends_on env cst2 cst1 then false
+                  if Environ.constant_depends_on env cst1 cst2 = Some true then true
+                  else if Environ.constant_depends_on env cst2 cst1 = Some true then false
                   else l2r
                 | _ -> l2r
               else l2r
