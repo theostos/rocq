@@ -237,6 +237,17 @@ let fterm_of v = v.term
 
 let set_ntrl v = set_fconstr_mark v Ntrl
 
+(* Number of syntax nodes [to_constr] builds for [n] (one for zero, two per
+   doubling, two more per set bit); [None] when it exceeds [limit]. *)
+let peano_quotation_cost ~limit n =
+  let rec cost remaining total = function
+    | [] -> Some total
+    | bit :: rest ->
+      let nodes = if bit then 4 else 2 in
+      if remaining < nodes then None
+      else cost (remaining - nodes) (total + nodes) rest in
+  if limit < 1 then None else cost (limit - 1) 1 n.peano_value
+
 let peano_constructor_view n =
   let empty = UVars.Instance.empty in
   match PeanoNatValue.pred n.peano_value with

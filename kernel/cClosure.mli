@@ -79,6 +79,9 @@ type fterm =
 (** The value as [zero] or [succ] of a compact value *)
 val peano_constructor_view : compact_peano -> fconstr
 
+(** Syntax-node cost of quoting a compact numeral, [None] above [limit]. *)
+val peano_quotation_cost : limit:int -> compact_peano -> int option
+
 (***********************************************************************
   s A [stack] is a context of arguments, arguments are pushed by
    [append_stack] one array at a time *)

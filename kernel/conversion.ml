@@ -197,6 +197,8 @@ let convert_inductives_gen cmp_instances cmp_cumul cv_pb (mind,ind) nargs u1 u2 
 type 'e conv_tab = {
   cnv_inf : clos_infos;
   cnv_typ : bool; (* true if the input terms were well-typed *)
+  cnv_rel_types : fconstr option Range.t;
+  cnv_rel_type_lifts : lift Range.t;
   lft_tab : clos_tab;
   rgt_tab : clos_tab;
   err_ret : 'e -> payload;
@@ -257,11 +259,82 @@ let same_args_size sk1 sk2 =
 (** The same heap separation invariant must hold for the fconstr arguments
     passed to each respective side of the conversion function below. *)
 
-let push_relevance infos r =
-  { infos with cnv_inf = CClosure.push_relevance infos.cnv_inf r }
+(* Unit-like types. A registered inductive (one constructor, no relevant
+   field) has definitionally equal inhabitants, and so does a record with eta
+   whose fields are all irrelevant or unit-like at its parameters. Two neutral
+   terms of such a type are convertible once their types are. Types are only
+   inspected in bounded private views, see [with_type_snapshot]. *)
+
+let rec direct_inductive typ =
+  match fterm_of typ with
+  | FInd (ind, _) -> Some ind
+  | FApp (head, _) | FLIFT (_, head) -> direct_inductive head
+  | FCLOS (term, _) ->
+    begin match Constr.kind (fst (Constr.decompose_app term)) with
+    | Constr.Ind (ind, _) -> Some ind
+    | _ -> None
+    end
+  | _ -> None
+
+(* The registered unit-like inductives, as a set built once per retroknowledge. *)
+let unit_like_index = ref ([], Indset_env.empty)
+
+let is_registered_unit_like env ind =
+  let registered = (Environ.retroknowledge env).Retroknowledge.retro_unit_like in
+  let previous, index = !unit_like_index in
+  let index = if registered == previous then index else begin
+    let index = Indset_env.of_list registered in
+    unit_like_index := registered, index;
+    index
+  end in
+  Indset_env.mem ind index
+
+let direct_registered_unit_like infos typ =
+  match direct_inductive typ with
+  | Some ind when is_registered_unit_like (info_env infos.cnv_inf) ind -> Some ind
+  | Some _ | None -> None
+
+(* Type of the variable [n]: the domain of a binder crossed by this conversion
+   (kept in [cnv_rel_types] with the lift of its side) or its declaration in
+   the environment. *)
+let rel_type infos n =
+  let depth = Range.length infos.cnv_rel_types in
+  if n <= depth then Range.get infos.cnv_rel_types (n - 1)
+  else
+    try
+      let decl = Environ.lookup_rel (n - depth) (info_env infos.cnv_inf) in
+      Some (inject (Context.Rel.Declaration.get_type decl))
+    with Not_found -> None
+
+(* The same, with its relocation into the current context. *)
+let rel_type_lifted infos n =
+  let depth = Range.length infos.cnv_rel_types in
+  if n <= depth then
+    Option.map (fun typ ->
+      let lift = Range.get infos.cnv_rel_type_lifts (n - 1) in
+      el_shft n (el_liftn n lift), typ) (rel_type infos n)
+  else
+    try
+      let decl = Environ.lookup_rel (n - depth) (info_env infos.cnv_inf) in
+      (* The declaration's type lives below it: lift the syntax, a closure
+         shift would turn its RelKey k into the other entry RelKey (k+n). *)
+      let typ = Vars.lift n (Context.Rel.Declaration.get_type decl) in
+      Some (el_id, mk_clos (subs_id depth, UVars.Instance.empty) typ)
+    with Not_found -> None
+
+let push_relevance ?typ ?(type_lift = el_id) infos r =
+  { infos with
+    cnv_inf = CClosure.push_relevance infos.cnv_inf r;
+    cnv_rel_types = Range.cons typ infos.cnv_rel_types;
+    cnv_rel_type_lifts = Range.cons type_lift infos.cnv_rel_type_lifts }
 
 let push_relevances infos nas =
-  { infos with cnv_inf = CClosure.push_relevances infos.cnv_inf nas }
+  { infos with
+    cnv_inf = CClosure.push_relevances infos.cnv_inf nas;
+    cnv_rel_types =
+      Array.fold_left (fun types _ -> Range.cons None types) infos.cnv_rel_types nas;
+    cnv_rel_type_lifts =
+      Array.fold_left (fun lifts _ -> Range.cons el_id lifts) infos.cnv_rel_type_lifts nas }
 
 let identity_of_ctx (ctx:Constr.rel_context) =
   Context.Rel.instance mkRel 0 ctx
@@ -372,6 +445,538 @@ let assert_reduced_constructor s =
   if not @@ CList.is_empty s then
     CErrors.anomaly Pp.(str "conversion was given unreduced term (FConstruct).")
 
+let is_eta_record env (ind, u) =
+  Declareops.is_record_with_eta (Inductive.lookup_mind_specif env ind) u
+
+(* The arguments of a stack, [None] when it eliminates. *)
+let rec application_args arrays = function
+  | Zapp args :: stack -> application_args (args :: arrays) stack
+  | (Zshift _ | Zupdate _) :: stack -> application_args arrays stack
+  | [] -> Some (Array.concat (List.rev arrays))
+  | (ZcaseT _ | Zproj _ | Zfix _ | Zprimitive _) :: _ -> None
+
+(* Return type of a case at [indices] and [subject], without evaluating the
+   subject or quoting the branches; let-bound parameters and indices come
+   from the inductive's own contexts. *)
+let case_predicate_type infos ci u params ((names, body), _) indices subject subst =
+  let env = info_env infos in
+  let mib, mip = Inductive.lookup_mind_specif env ci.ci_ind in
+  if ci.ci_npar <> mib.mind_nparams ||
+     Array.length params <> mib.mind_nparams ||
+     Array.length indices <> mip.mind_nrealargs ||
+     Array.length names <> mip.mind_nrealdecls + 1 ||
+     List.length mib.mind_params_ctxt + mip.mind_nrealdecls > 4096
+  then None
+  else
+    let instantiate ctx args type_subst result_subst =
+      let _, _, result = List.fold_left
+          (fun (index, type_subst, result_subst) decl ->
+            let index, value = match decl with
+              | Context.Rel.Declaration.LocalAssum _ -> index + 1, args.(index)
+              | Context.Rel.Declaration.LocalDef (_, value, _) ->
+                index, mk_clos type_subst value in
+            index, usubs_cons value type_subst, usubs_cons value result_subst)
+          (0, type_subst, result_subst) (List.rev ctx) in
+      result in
+    let u = usubst_instance subst u in
+    let params = Array.map (mk_clos subst) params in
+    let initial = subs_id 0, u in
+    let param_subst = instantiate mib.mind_params_ctxt params initial initial in
+    let index_context, _ = List.chop mip.mind_nrealdecls mip.mind_arity_ctxt in
+    let result_subst = instantiate index_context indices param_subst subst in
+    Some (mk_clos (usubs_cons subject result_subst) body)
+
+(* Type of a head of type [typ] under [stack] (arguments, projections and
+   cases), reduced with [infos] and handed to [classify]. The head itself is
+   [subject] when known: a case or a dependent projection needs it. With
+   [aliases], constants the oracle marks Expand are unfolded (with the
+   caller's transparency, in a separate table) when [classify] fails. *)
+let type_after_stack ?aliases ?subject ~classify infos tab typ stack =
+  let env = info_env infos in
+  let alias_tab = lazy (create_tab ()) in
+  let strategy alias_infos constant =
+    Conv_oracle.get_strategy (oracle_of_infos alias_infos) (Conv_oracle.EvalConstRef constant) in
+  let rec apply_args typ args index =
+    if Int.equal index (Array.length args) then Some typ
+    else
+      let typ, stack = whd_stack infos tab typ empty_stack in
+      match fterm_of (zip typ stack) with
+      | FProd (_, _, body, subst) ->
+        apply_args (mk_clos (usubs_cons args.(index) subst) body) args (index + 1)
+      | _ -> None
+  in
+  let rec final fuel typ =
+    let typ, stack = whd_stack infos tab typ empty_stack in
+    match classify (zip typ stack), aliases, fterm_of typ, stack with
+    | Some _ as result, _, _, _ -> result
+    | None, Some alias_infos, FFlex (ConstKey (constant, _) as flex), [] when fuel > 0 ->
+      begin match strategy alias_infos constant with
+      | Conv_oracle.Expand ->
+        Option.bind (unfold_ref_with_args alias_infos (Lazy.force alias_tab) flex stack)
+          (fun (typ, stack) -> final (fuel - 1) (zip typ stack))
+      | Conv_oracle.Level _ | Conv_oracle.Opaque -> None
+      end
+    | None, _, _, _ -> None
+  in
+  let rec projection_type fuel typ stack =
+    match aliases, fterm_of typ with
+    | Some alias_infos, FFlex (ConstKey (constant, _) as flex) when fuel > 0 ->
+      begin match strategy alias_infos constant with
+      | Conv_oracle.Opaque -> typ, stack
+      | Conv_oracle.Expand | Conv_oracle.Level _ ->
+        begin match unfold_ref_with_args alias_infos (Lazy.force alias_tab) flex stack with
+        | None -> typ, stack
+        | Some (body, stack) ->
+          (* follow the alias without evaluating matches or fixpoints *)
+          let typ, stack = whd_stack (infos_with_reds infos RedFlags.betazeta) tab body stack in
+          projection_type (fuel - 1) typ stack
+        end
+      end
+    | _ -> typ, stack
+  in
+  let rec eliminate typ subject = function
+    | [] -> final 32 typ
+    | Zupdate _ :: stack -> eliminate typ subject stack
+    | Zshift _ :: stack ->
+      (* a supplied subject is already in the common context *)
+      if Option.has_some subject then None else eliminate typ None stack
+    | Zapp args :: stack ->
+      Option.bind (apply_args typ args 0) (fun typ ->
+        let subject = Option.map (fun term -> zip term [Zapp args]) subject in
+        eliminate typ subject stack)
+    | Zproj (repr, relevance) :: stack ->
+      let typ, typ_stack = whd_stack infos tab typ empty_stack in
+      let typ, typ_stack = projection_type 32 typ typ_stack in
+      begin match fterm_of typ, application_args [] typ_stack with
+      | FInd ((current, u)), Some args
+        when Environ.QInd.equal env current (Projection.Repr.inductive repr) ->
+        begin match
+          try Some (Environ.lookup_projection (Projection.make repr true) env)
+          with Not_found -> None
+        with
+        | Some (_, projection_type)
+          when Option.has_some subject || Vars.noccurn 1 projection_type ->
+          (* Parameters are closures, not necessarily quotable (a proof may
+             already be [FIrrelevant]): substitute them lazily. *)
+          let subst =
+            Array.fold_left (fun subst arg -> usubs_cons arg subst) (subs_id 0, u) args in
+          let record = match subject with
+            | Some record -> record
+            | None -> inject (mkRel 1) in
+          let subst = usubs_cons record subst in
+          let subject = Option.map
+              (fun term -> zip term [Zproj (repr, relevance)]) subject in
+          eliminate (mk_clos subst projection_type) subject stack
+        | Some _ | None -> None
+        end
+      | _ -> None
+      end
+    | ZcaseT (ci, u, params, predicate, _, subst) as frame :: stack ->
+      Option.bind subject (fun subject ->
+        let typ, typ_stack = whd_stack infos tab typ empty_stack in
+        match fterm_of typ, application_args [] typ_stack with
+        | FInd (ind, _), Some args when Environ.QInd.equal env ind ci.ci_ind ->
+          let mib, mip = Inductive.lookup_mind_specif env ci.ci_ind in
+          if Array.length args <> mib.mind_nparams + mip.mind_nrealargs then None
+          else
+            let indices = Array.sub args mib.mind_nparams mip.mind_nrealargs in
+            Option.bind
+              (case_predicate_type infos ci u params predicate indices subject subst)
+              (fun typ -> eliminate typ (Some (zip subject [frame])) stack)
+        | _ -> None)
+    | (Zfix _ | Zprimitive _) :: _ -> None
+  in
+  eliminate typ subject stack
+
+(* Whether quoting [root] takes fewer than [remaining] syntax nodes (charged
+   as it goes), so that a type witness is only quoted when small. *)
+let small_reification remaining root =
+  let exception Too_large in
+  let visit () =
+    if !remaining <= 0 then raise Too_large;
+    decr remaining
+  in
+  let binder depth = visit (); depth + 1 in
+  let rec syntax subst depth term =
+    visit ();
+    match Constr.kind term with
+    | Rel index when index > depth ->
+      (match subst with
+      | None -> ()
+      | Some subst ->
+        match expand_rel (index - depth) (fst subst) with
+        | Inr _ -> ()
+        | Inl _ ->
+          match inspect_substituted_rel subst (index - depth) with
+          | Some term -> closure term
+          | None -> raise Too_large)
+    | _ -> Constr.iter_with_binders binder (syntax subst) depth term
+  and context subst (names, body) =
+    let depth = Array.fold_left (fun depth _ -> binder depth) 0 names in
+    syntax (Some subst) depth body
+  and closure term =
+    visit ();
+    match fterm_of term with
+    | FRel _ | FFlex _ | FInd _ | FInt _ | FFloat _ | FString _ -> ()
+    | FAtom term -> syntax None 0 term
+    | FLIFT (_, term) | FProj (_, _, term) -> closure term
+    | FConstruct (_, args) -> Array.iter closure args
+    | FApp (head, args) -> closure head; Array.iter closure args
+    | FCLOS (term, subst) -> syntax (Some subst) 0 term
+    | FFix (fix, subst) -> syntax (Some subst) 0 (mkFix fix)
+    | FCoFix (fix, subst) -> syntax (Some subst) 0 (mkCoFix fix)
+    | FLambda (len, domains, body, subst) ->
+      let depth = List.fold_left (fun depth (_, domain) ->
+        syntax (Some subst) depth domain; binder depth) 0 domains in
+      if not (Int.equal depth len) then raise Too_large;
+      syntax (Some subst) depth body
+    | FProd (_, domain, body, subst) ->
+      closure domain; syntax (Some subst) (binder 0) body
+    | FLetIn (_, value, typ, body, subst) ->
+      closure value; closure typ; syntax (Some subst) (binder 0) body
+    | FCaseT (_, _, params, (predicate, _), discr, branches, subst) ->
+      Array.iter (syntax (Some subst) 0) params;
+      context subst predicate;
+      closure discr;
+      Array.iter (context subst) branches
+    | FCaseInvert (_, _, params, (predicate, _), indices, discr, branches, subst) ->
+      Array.iter (syntax (Some subst) 0) params;
+      context subst predicate;
+      Array.iter closure (get_invert indices);
+      closure discr;
+      Array.iter (context subst) branches
+    | FArray (_, values, typ) ->
+      closure typ;
+      closure (Parray.default values);
+      for i = 0 to Parray.length_int values - 1 do
+        closure (Parray.get values (Uint63.of_int i))
+      done
+    | FPeanoNat n ->
+      (match peano_quotation_cost ~limit:!remaining n with
+       | None -> raise Too_large
+       | Some cost -> remaining := !remaining - cost)
+    | FEvar _ | FIrrelevant | FLOCKED -> raise Too_large
+  in
+  try closure root; true with Too_large -> false
+
+(* Run [inspect] on private copies of [typ], [stack] and [subject]: no cell of
+   the caller is forced or updated, and copying and head steps share one
+   budget. Update frames are dropped; a suspended case frame becomes a root of
+   the view (its placeholder subject is never typed). *)
+let with_type_snapshot ?subject infos typ stack inspect =
+  let limit = 4096 in
+  let rec collect size arrays = function
+    | [] -> Some (List.concat (List.rev arrays))
+    | _ when size >= limit -> None
+    | Zapp args :: rest ->
+      let size = size + Array.length args + 1 in
+      if size > limit then None
+      else collect size (Array.to_list args :: arrays) rest
+    | (Zshift _ | Zupdate _ | Zproj _) :: rest -> collect (size + 1) arrays rest
+    | ZcaseT _ as frame :: rest ->
+      collect (size + 1) ([zip (inject (mkRel 1)) [frame]] :: arrays) rest
+    | (Zfix _ | Zprimitive _) :: _ -> None
+  in
+  Option.bind (collect (if Option.has_some subject then 2 else 1) [] stack) (fun arguments ->
+    let roots = typ :: Option.List.cons subject arguments in
+    with_private_closure_query ~steps:limit infos.cnv_inf roots (fun cnv_inf copies ->
+      let typ, subject, copies = match subject, copies with
+        | None, typ :: copies -> typ, None, copies
+        | Some _, typ :: subject :: copies -> typ, Some subject, copies
+        | _, [] | Some _, [_] -> assert false in
+      let rec rebuild copies = function
+        | [] -> assert (List.is_empty copies); []
+        | Zupdate _ :: rest -> rebuild copies rest
+        | Zapp args :: rest ->
+          let args, copies = List.chop (Array.length args) copies in
+          Zapp (Array.of_list args) :: rebuild copies rest
+        | (Zshift _ | Zproj _) as frame :: rest -> frame :: rebuild copies rest
+        | ZcaseT _ :: rest ->
+          begin match copies with
+          | case :: copies ->
+            begin match fterm_of case with
+            | FCaseT (ci, u, params, predicate, _, branches, subst) ->
+              ZcaseT (ci, u, params, predicate, branches, subst) :: rebuild copies rest
+            | _ -> assert false
+            end
+          | [] -> assert false
+          end
+        | (Zfix _ | Zprimitive _) :: _ -> assert false
+      in
+      inspect { infos with cnv_inf } typ (rebuild copies stack) subject))
+
+(* Unit eta also applies under projections, not under cases and fixpoints. *)
+let rec unit_like_stack = function
+  | [] -> true
+  | (Zapp _ | Zproj _ | Zshift _ | Zupdate _) :: stack -> unit_like_stack stack
+  | (ZcaseT _ | Zfix _ | Zprimitive _) :: _ -> false
+
+(* Reduction of a type with the caller's and the oracle's transparency:
+   beta/iota/zeta alone stops at a transparent constant in the discriminant
+   of a type-level match. *)
+let unit_type_reduction_infos infos =
+  let allowed = RedFlags.red_transparent (info_flags infos.cnv_inf) in
+  let oracle = Conv_oracle.get_transp_state (oracle_of_infos infos.cnv_inf) in
+  let transparency = TransparentState.{
+    tr_var = Id.Pred.inter allowed.tr_var oracle.tr_var;
+    tr_cst = Cpred.inter allowed.tr_cst oracle.tr_cst;
+    tr_prj = PRpred.inter allowed.tr_prj oracle.tr_prj;
+  } in
+  infos_with_reds infos.cnv_inf (RedFlags.red_add_transparent RedFlags.all transparency)
+
+(* The unit-like inductive of a type: a registered one, or a record with eta
+   whose fields are all irrelevant or unit-like at these parameters (ULift
+   (PLift P) is, ULift nat is not). Only field types are inspected, with a
+   bounded number of head reductions and a separate table. *)
+let unit_like_type infos typ =
+  let env = info_env infos.cnv_inf in
+  let tab = create_tab () in
+  let type_infos = unit_type_reduction_infos infos in
+  let remaining = ref 32 in
+  let rec head typ stack =
+    if !remaining = 0 then None
+    else begin
+      decr remaining;
+      let typ, stack = whd_stack type_infos tab typ stack in
+      (* the alias and projection steps below must not update shared cells *)
+      let stack = List.filter (function Zupdate _ -> false | _ -> true) stack in
+      if not (unit_like_stack stack) then None
+      else match fterm_of typ with
+      | FFlex (ConstKey (constant, _) as flex) ->
+        let oracle = oracle_of_infos infos.cnv_inf in
+        begin match Conv_oracle.get_strategy oracle (Conv_oracle.EvalConstRef constant) with
+        | Conv_oracle.Opaque -> None
+        | Conv_oracle.Expand | Conv_oracle.Level _ ->
+          if not (RedFlags.red_set (info_flags infos.cnv_inf) (RedFlags.fCONST constant))
+          then None
+          else Option.bind (unfold_ref_with_args infos.cnv_inf tab flex stack)
+            (fun (body, stack) -> head body stack)
+        end
+      | FProj (projection, relevance, record) ->
+        Option.bind (unfold_projection infos.cnv_inf projection relevance)
+          (fun projection -> head record (projection :: stack))
+      | FConstruct (((ind, _), _), args) ->
+        let rec project shift = function
+          | Zshift n :: stack -> project (shift + n) stack
+          | Zproj (projection, _) :: stack
+            when Environ.QInd.equal env ind (Projection.Repr.inductive projection) ->
+            let index = Projection.Repr.npars projection + Projection.Repr.arg projection in
+            if index >= Array.length args then None
+            else
+              let arg = if shift = 0 then args.(index)
+                else zip args.(index) [Zshift shift] in
+              head arg stack
+          | _ -> None
+        in
+        project 0 stack
+      | _ -> Some (typ, stack)
+    end
+  in
+  let rec inspect typ =
+    match direct_registered_unit_like infos typ with
+    | Some _ as result -> result
+    | None when !remaining = 0 -> None
+    | None ->
+      Option.bind (head typ empty_stack) (fun (typ, stack) ->
+      match fterm_of typ, application_args [] stack with
+      | FInd ((ind, u) as pind), Some args ->
+        if is_registered_unit_like env ind then Some ind
+        else
+        let mib, mip as spec = Inductive.lookup_mind_specif env ind in
+        if not (Declareops.is_record_with_eta spec u) ||
+           Array.length args <> mib.Declarations.mind_nparams
+        then None
+        else
+          let rec fields index =
+            if index = mip.Declarations.mind_consnrealargs.(0) then true
+            else
+              let repr, relevance =
+                Declareops.inductive_make_projection ind mib ~proj_arg:index
+              in
+              let relevance = UVars.subst_instance_relevance u relevance in
+              if is_irrelevant infos.cnv_inf relevance then fields (index + 1)
+              else
+                let _, field_type =
+                  Environ.lookup_projection (Projection.make repr true) env
+                in
+                (* a dependent field would see a dummy record *)
+                Vars.noccurn 1 field_type &&
+                let subst = Array.fold_left
+                    (fun subst arg -> usubs_cons arg subst) (subs_id 0, snd pind) args in
+                let subst = usubs_cons (inject (mkRel 1)) subst in
+                Option.has_some (inspect (mk_clos subst field_type)) &&
+                fields (index + 1)
+          in
+          if fields 0 then Some ind else None
+      | _ -> None)
+  in
+  inspect typ
+
+(* The unit-like inductive of the type of a head of type [typ] under [stack]. *)
+let unit_like_after_stack infos typ stack =
+  with_type_snapshot infos typ stack (fun infos typ stack _ ->
+    if not (unit_like_stack stack) then None
+    else
+      type_after_stack ~aliases:infos.cnv_inf ~classify:(unit_like_type infos)
+        (infos_with_reds infos.cnv_inf RedFlags.betaiotazeta) (create_tab ()) typ stack)
+
+(* Declared type of a flex; the index of a RelKey is already relocated. *)
+let flex_type infos = function
+  | RelKey n -> rel_type infos n
+  | VarKey id ->
+    let decl = Environ.lookup_named id (info_env infos.cnv_inf) in
+    Some (inject (Context.Named.Declaration.get_type decl))
+  | ConstKey (c, u) ->
+    let cb = Environ.lookup_constant c (info_env infos.cnv_inf) in
+    Some (mk_clos (subs_id 0, u) cb.const_type)
+
+let unit_like_of_rel infos n stack =
+  if not (unit_like_stack stack) then None
+  else Option.bind (rel_type infos n) (fun typ -> unit_like_after_stack infos typ stack)
+
+let unit_like_of_flex infos lft stack fl =
+  if not (unit_like_stack stack) then None
+  else
+    let fl = match fl with
+      | RelKey n -> RelKey (reloc_rel n (el_stack lft stack))
+      | VarKey _ | ConstKey _ -> fl in
+    Option.bind (flex_type infos fl) (fun typ -> unit_like_after_stack infos typ stack)
+
+(* Both operands classified in the same unit-like family. *)
+let same_unit_like ind1 ind2 = match ind1 with
+  | Some ind1 -> Option.cata (Ind.UserOrd.equal ind1) false (ind2 ())
+  | None -> false
+
+let rel_has_unit_like infos lft (hd, stack) ind =
+  match fterm_of hd with
+  | FRel n ->
+    let n = reloc_rel n (el_stack lft stack) in
+    Option.cata (Ind.UserOrd.equal ind) false (unit_like_of_rel infos n stack)
+  | _ -> false
+
+(* Relocate a type or an argument by [lift] into the current context: quoted
+   when its syntax is small (charged to [remaining]); a uniform shift of a
+   closure or of an inversion subject stays lazy; anything else is
+   inconclusive. *)
+let relocate_unit_type infos remaining lift term =
+  if is_lift_id lift then Some term
+  else if small_reification remaining term then
+    Some (mk_clos (subs_id (Range.length infos.cnv_rel_types), UVars.Instance.empty)
+      (Vars.exliftn lift (term_of_fconstr term)))
+  else match lift, fterm_of term with
+    | ELSHFT (ELID, n), FCLOS (body, (subst, u)) ->
+      Some (mk_clos (subs_shft (n, subst), u) body)
+    | ELSHFT (ELID, n), FCaseInvert _ -> Some (zip term [Zshift n])
+    | _ -> None
+
+(* The type of [subject] (of type [typ] under [type_lift]) applied to [stack]
+   under [lift], in the current context; [None] when the interface is too
+   large to relocate. The quotation budget is separate from the stack budget:
+   an unchanged argument or a delayed shift must not depend on it. *)
+let unit_type_after_stack infos lift type_lift typ stack subject =
+  let remaining = ref 4096 in
+  let quote = relocate_unit_type infos (ref 4096) in
+  let rec arguments lift = function
+    | [] -> Some (lift, [])
+    | _ when !remaining <= 0 -> None
+    | frame :: rest ->
+      decr remaining;
+      Option.bind (arguments lift rest) (fun (lift, rest) ->
+        match frame with
+        | Zshift n -> Some (el_shft n lift, rest)
+        | Zupdate _ -> Some (lift, rest)
+        | Zapp args ->
+          if Array.length args > !remaining then None else
+          let () = remaining := !remaining - Array.length args in
+          let rec copy index copied =
+            if index = Array.length args then Some (Array.of_list (List.rev copied))
+            else Option.bind (quote lift args.(index))
+              (fun arg -> copy (index + 1) (arg :: copied)) in
+          Option.map (fun args -> lift, Zapp args :: rest) (copy 0 [])
+        | Zproj _ -> Some (lift, frame :: rest)
+        | ZcaseT _ when is_lift_id lift -> Some (lift, frame :: rest)
+        | ZcaseT _ | Zfix _ | Zprimitive _ -> None)
+  in
+  Option.bind (quote type_lift typ) (fun typ ->
+    Option.bind (arguments lift stack) (fun (_, stack) ->
+      with_type_snapshot ~subject infos typ stack (fun infos typ stack subject ->
+        type_after_stack ?subject ~classify:(fun typ -> Some typ)
+          (unit_type_reduction_infos infos) (create_tab ()) typ stack)))
+
+let neutral_type_witness infos lift stack flex =
+  let typ = match flex with
+    | RelKey n -> rel_type_lifted infos (reloc_rel n (el_stack lift stack))
+    | VarKey _ | ConstKey _ -> Option.map (fun typ -> el_id, typ) (flex_type infos flex)
+  in
+  let subject = match flex with
+    | RelKey n -> mkRel (reloc_rel n (el_stack lift stack))
+    | VarKey id -> mkVar id
+    | ConstKey constant -> mkConstU constant in
+  let subject =
+    mk_clos (subs_id (Range.length infos.cnv_rel_types), UVars.Instance.empty) subject in
+  Option.bind typ (fun (type_lift, typ) ->
+    unit_type_after_stack infos lift type_lift typ stack subject)
+
+(* The type of an operand of the conversion, in the current context, when it
+   is a neutral term, a full unit-like constructor or a stuck inversion. *)
+let unit_operand_type infos lift (head, stack) =
+  let type_of_head infos head stack = match fterm_of head with
+  | FFlex flex -> neutral_type_witness infos lift stack flex
+  | FRel n -> neutral_type_witness infos lift stack (RelKey n)
+  | FConstruct (((ind, constructor), u), args)
+    when is_registered_unit_like (info_env infos.cnv_inf) ind ->
+    let mib = Environ.lookup_mind (fst ind) (info_env infos.cnv_inf) in
+    let nparams = mib.mind_nparams in
+    let nfields = mib.mind_packets.(snd ind).mind_consnrealargs.(0) in
+    (* a partial constructor is a function, even of irrelevant fields *)
+    if constructor <> 1 || Array.length args <> nparams + nfields ||
+       not (is_empty_stack stack) then None
+    else
+      let typ = zip (inject (mkIndU (ind, u))) [Zapp (Array.sub args 0 nparams)] in
+      relocate_unit_type infos (ref 4096) (el_stack lift stack) typ
+  | FCaseInvert (ci, u, params, predicate, indices, discr, _, subst) ->
+    Option.bind (case_predicate_type infos.cnv_inf ci u params predicate
+      (get_invert indices) discr subst) (fun typ ->
+      Option.bind (relocate_unit_type infos (ref 4096) (el_stack lift stack) head)
+        (fun subject ->
+          unit_type_after_stack infos lift (el_stack lift stack) typ stack subject))
+  | FConstruct _ | FInd _ | FApp _ | FProj _ | FFix _ | FCoFix _ | FCaseT _
+  | FLambda _ | FProd _ | FLetIn _ | FEvar _ | FAtom _ | FInt _
+  | FFloat _ | FString _ | FArray _ | FPeanoNat _ | FLIFT _ | FCLOS _
+  | FIrrelevant | FLOCKED -> None
+  in
+  match fterm_of head with
+  | FProj _ ->
+    (* Opacity of a projection does not hide its declared field type: expose
+       the neutral record under the projections in a private view, keeping
+       the projections for the type instead of reducing their values. *)
+    with_type_snapshot infos head stack (fun infos head stack _ ->
+      let reds = infos_with_reds infos.cnv_inf RedFlags.betazeta in
+      let tab = create_tab () in
+      let rec spine fuel head stack =
+        if fuel = 0 then None else
+        match fterm_of head with
+        | FCaseInvert _ -> type_of_head infos head stack
+        | _ ->
+        let head, arguments = whd_stack reds tab head empty_stack in
+        let stack = arguments @ stack in
+        match fterm_of head with
+        | FProj (projection, relevance, record) ->
+          spine (fuel - 1) record (Zproj (Projection.repr projection, relevance) :: stack)
+        | _ -> type_of_head infos head stack
+      in
+      spine 4096 head stack)
+  | _ -> type_of_head infos head stack
+
+(* A projection or a case on the stack: the type needs the actual subject. *)
+let has_type_elimination_stack stack =
+  let rec inspect remaining = function
+    | [] -> false
+    | _ when remaining = 0 -> false
+    | (Zproj _ | ZcaseT _) :: _ -> true
+    | _ :: rest -> inspect (remaining - 1) rest in
+  inspect 4096 stack
+
 (* Conversion between  [lft1]term1 and [lft2]term2 *)
 let rec ccnv cv_pb l2r infos lft1 lft2 term1 term2 cuniv =
   let fast = fast_test lft1 term1 lft2 term2 in
@@ -390,6 +995,50 @@ and eqappr cv_pb l2r infos (lft1,st1) (lft2,st2) cuniv =
 
 (* assumes that appr1 and appr2 are in whnf *)
 and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2) cuniv =
+  let env = info_env infos.cnv_inf in
+  (* Unit-like operands are convertible when their types are. The type is
+     certified again in the current context: the classifications of the
+     cases below are only hints. *)
+  let unit_eta () =
+    Option.bind (unit_operand_type infos lft1 (hd1, v1)) (fun typ1 ->
+      Option.bind (unit_like_after_stack infos typ1 []) (fun _ ->
+        Option.bind (unit_operand_type infos lft2 (hd2, v2)) (fun typ2 ->
+          try Some (ccnv CONV l2r infos el_id el_id typ1 typ2 cuniv)
+          with NotConvertible | NotConvertibleTrace _ -> None)))
+  in
+  let unit_eta_exn () = match unit_eta () with
+    | Some cuniv -> cuniv
+    | None -> raise NotConvertible
+  in
+  (* Eta of a record constructor, on the [left] or the right of [other]; a
+     unit-like one compares by type instead when [unit] holds. *)
+  let construct_eta ~left ?(unit = fun () -> true) (ind, u) args other =
+    if is_registered_unit_like env ind && unit () then unit_eta_exn ()
+    else
+      try
+        let vc, vo = eta_expand_ind_stack env (ind, u) args (snd other) in
+        if left then convert_stacks l2r infos lft1 lft2 vc vo cuniv
+        else convert_stacks l2r infos lft1 lft2 vo vc cuniv
+      with Not_found -> raise NotConvertible
+  in
+  (* Whether the operand facing a unit-like constructor compares by type:
+     always for typed terms, else when its type needs the subject or it is
+     a variable of the same unit-like type. *)
+  let unit_operand lft (hd, v) ind =
+    infos.cnv_typ || has_type_elimination_stack v ||
+    (match fterm_of hd with FCaseInvert _ -> true | _ -> false) ||
+    rel_has_unit_like infos lft (hd, v) ind
+  in
+  (* A flex against a variable or a stuck inversion: units before unfolding. *)
+  let flex_unit_eta flex_lft flex_v fl rel_lft rel_v = function
+    | FRel n ->
+      if has_type_elimination_stack v1 || has_type_elimination_stack v2 ||
+         same_unit_like (unit_like_of_flex infos flex_lft flex_v fl)
+           (fun () -> unit_like_of_rel infos (reloc_rel n (el_stack rel_lft rel_v)) rel_v)
+      then unit_eta () else None
+    | FCaseInvert _ -> unit_eta ()
+    | _ -> None
+  in
   (** We delay the computation of the lifts that apply to the head of the term
       with [el_stack] inside the branches where they are actually used. *)
   (** Irrelevant terms are guaranteed to be [FIrrelevant], except for [FFlex],
@@ -430,10 +1079,19 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
           let v1 = CClosure.skip_irrelevant_stack infos.cnv_inf v1 in
           let v2 = CClosure.skip_irrelevant_stack infos.cnv_inf v2 in
           convert_stacks l2r infos lft1 lft2 v1 v2 cuniv
-        else if Int.equal n m then
-          convert_stacks l2r infos lft1 lft2 v1 v2 cuniv
         else
-          raise NotConvertible
+          let same_unit () =
+            if has_type_elimination_stack v1 || has_type_elimination_stack v2 ||
+               same_unit_like (unit_like_of_rel infos n v1)
+                 (fun () -> unit_like_of_rel infos m v2)
+            then unit_eta () else None
+          in
+          if Int.equal n m then
+            try convert_stacks l2r infos lft1 lft2 v1 v2 cuniv
+            with (NotConvertible | NotConvertibleTrace _) as error ->
+              (match same_unit () with Some cuniv -> cuniv | None -> raise error)
+          else
+            (match same_unit () with Some cuniv -> cuniv | None -> raise NotConvertible)
 
     (* 2 constants, 2 local defined vars or 2 defined rels *)
     | (FFlex fl1, FFlex fl2) ->
@@ -448,10 +1106,16 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
          in
          convert_stacks ~mask l2r infos lft1 lft2 v1 v2 cuniv
        with NotConvertible | NotConvertibleTrace _ ->
+        (* classified units first, then unfolding, then the operand types *)
+        let same = same_unit_like (unit_like_of_flex infos lft1 v1 fl1)
+            (fun () -> unit_like_of_flex infos lft2 v2 fl2) in
+        match (if same then unit_eta () else None) with
+        | Some cuniv -> cuniv
+        | None ->
         let r1 = unfold_ref_with_args infos.cnv_inf infos.lft_tab fl1 v1 in
         let r2 = unfold_ref_with_args infos.cnv_inf infos.rgt_tab fl2 v2 in
         match r1, r2 with
-        | None, None -> raise NotConvertible
+        | None, None -> unit_eta_exn ()
         | Some (t1, v1), Some (t2, v2) ->
           (* else the oracle tells which constant is to be expanded *)
           let oracle = CClosure.oracle_of_infos infos.cnv_inf in
@@ -497,11 +1161,51 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
           eqwhnf cv_pb l2r infos appr1 (lft2, t2) cuniv
         )
 
+    (* A projection that does not unfold against a record constructor: eta *)
+    | (FProj (p1, r1, c1), FConstruct (((ind2, 1), u2), args2))
+      when infos.cnv_typ && is_eta_record env (ind2, u2) ->
+      let () = assert_reduced_constructor v2 in
+      begin match unfold_projection infos.cnv_inf p1 r1 with
+      | Some s1 -> eqappr cv_pb l2r infos (lft1, (c1, s1 :: v1)) appr2 cuniv
+      | None -> construct_eta ~left:false (ind2, u2) args2 appr1
+      end
+
+    | (FConstruct (((ind1, 1), u1), args1), FProj (p2, r2, c2))
+      when infos.cnv_typ && is_eta_record env (ind1, u1) ->
+      let () = assert_reduced_constructor v1 in
+      begin match unfold_projection infos.cnv_inf p2 r2 with
+      | Some s2 -> eqappr cv_pb l2r infos appr1 (lft2, (c2, s2 :: v2)) cuniv
+      | None -> construct_eta ~left:true (ind1, u1) args1 appr2
+      end
+
     | (FProj (p1,r1,c1), FProj (p2, r2, c2)) ->
+      let same_projections =
+        Projection.Repr.CanOrd.equal (Projection.repr p1) (Projection.repr p2) &&
+        compare_stack_shape v1 v2
+      in
+      let congruence () =
+        let el1 = el_stack lft1 v1 in
+        let el2 = el_stack lft2 v2 in
+        let cuniv = ccnv CONV l2r infos el1 el2 c1 c2 cuniv in
+        convert_stacks l2r infos lft1 lft2 v1 v2 cuniv
+      in
+      (* the projections of a unit-like record are compared before unfolding *)
+      let congruence_first =
+        infos.cnv_typ && (Environ.typing_flags env).unfold_dep_heuristic &&
+        same_projections &&
+        is_registered_unit_like env (Projection.Repr.inductive (Projection.repr p1))
+      in
+      begin match
+        if congruence_first then
+          try Some (congruence ()) with NotConvertible | NotConvertibleTrace _ -> None
+        else None
+      with
+      | Some cuniv -> cuniv
+      | None ->
       (* Projections: prefer unfolding to first-order unification,
          which will happen naturally if the terms c1, c2 are not in constructor
          form *)
-      (match unfold_projection infos.cnv_inf p1 r1 with
+      match unfold_projection infos.cnv_inf p1 r1 with
       | Some s1 ->
         eqappr cv_pb l2r infos (lft1, (c1, (s1 :: v1))) appr2 cuniv
       | None ->
@@ -509,14 +1213,10 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
         | Some s2 ->
           eqappr cv_pb l2r infos appr1 (lft2, (c2, (s2 :: v2))) cuniv
         | None ->
-          if Projection.Repr.CanOrd.equal (Projection.repr p1) (Projection.repr p2)
-             && compare_stack_shape v1 v2 then
-            let el1 = el_stack lft1 v1 in
-            let el2 = el_stack lft2 v2 in
-            let u1 = ccnv CONV l2r infos el1 el2 c1 c2 cuniv in
-              convert_stacks l2r infos lft1 lft2 v1 v2 u1
+          if same_projections then congruence ()
           else (* Two projections in WHNF: unfold *)
-            raise NotConvertible)
+            raise NotConvertible
+      end
 
     | (FProj (p1,r1,c1), t2) ->
       begin match unfold_projection infos.cnv_inf p1 r1 with
@@ -561,7 +1261,8 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
         let el1 = el_stack lft1 v1 in
         let el2 = el_stack lft2 v2 in
         let cuniv = ccnv CONV l2r infos el1 el2 ty1 ty2 cuniv in
-        ccnv CONV l2r (push_relevance infos x1) (el_lift el1) (el_lift el2) bd1 bd2 cuniv
+        ccnv CONV l2r (push_relevance ~typ:ty1 ~type_lift:el1 infos x1)
+          (el_lift el1) (el_lift el2) bd1 bd2 cuniv
 
     | (FProd (x1, c1, c2, e), FProd (_, c'1, c'2, e')) ->
         if not (is_empty_stack v1 && is_empty_stack v2) then
@@ -572,7 +1273,9 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
         let el2 = el_stack lft2 v2 in
         let cuniv = ccnv CONV l2r infos el1 el2 c1 c'1 cuniv in
         let x1 = usubst_binder e x1 in
-        ccnv cv_pb l2r (push_relevance infos x1) (el_lift el1) (el_lift el2) (mk_clos (usubs_lift e) c2) (mk_clos (usubs_lift e') c'2) cuniv
+        ccnv cv_pb l2r (push_relevance ~typ:c1 ~type_lift:el1 infos x1)
+          (el_lift el1) (el_lift el2)
+          (mk_clos (usubs_lift e) c2) (mk_clos (usubs_lift e') c'2) cuniv
 
     (* Eta-expansion on the fly *)
     | (FLambda _, _) ->
@@ -581,8 +1284,8 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
         | _ ->
           anomaly (Pp.str "conversion was given unreduced term (FLambda).")
         in
-        let (x1,_ty1,bd1) = destFLambda mk_clos hd1 in
-        let infos = push_relevance infos x1 in
+        let (x1,ty1,bd1) = destFLambda mk_clos hd1 in
+        let infos = push_relevance ~typ:ty1 ~type_lift:lft1 infos x1 in
         eqappr CONV l2r infos
           (el_lift lft1, (bd1, [])) (el_lift lft2, (hd2, eta_expand_stack infos.cnv_inf x1 v2)) cuniv
     | (_, FLambda _) ->
@@ -591,14 +1294,19 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
         | _ ->
           anomaly (Pp.str "conversion was given unreduced term (FLambda).")
         in
-        let (x2,_ty2,bd2) = destFLambda mk_clos hd2 in
-        let infos = push_relevance infos x2 in
+        let (x2,ty2,bd2) = destFLambda mk_clos hd2 in
+        let infos = push_relevance ~typ:ty2 ~type_lift:lft2 infos x2 in
         eqappr CONV l2r infos
           (el_lift lft1, (hd1, eta_expand_stack infos.cnv_inf x2 v1)) (el_lift lft2, (bd2, [])) cuniv
 
+    | FCaseInvert _, FRel _ | FRel _, FCaseInvert _ -> unit_eta_exn ()
+
     (* only one constant, defined var or defined rel *)
     | (FFlex fl1, c2)      ->
-      begin match unfold_ref_with_args infos.cnv_inf infos.lft_tab fl1 v1 with
+      begin match flex_unit_eta lft1 v1 fl1 lft2 v2 c2 with
+      | Some cuniv -> cuniv
+      | None ->
+      match unfold_ref_with_args infos.cnv_inf infos.lft_tab fl1 v1 with
         | Some (def1,v1) ->
           (** By virtue of the previous case analyses, we know [c2] is rigid.
               Conversion check to rigid terms eventually implies full weak-head
@@ -611,16 +1319,15 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
           (match c2 with
            | FConstruct (((ind2, 1), u2), args2) ->
              let () = assert_reduced_constructor v2 in
-             (try
-                let v2, v1 =
-                  eta_expand_ind_stack (info_env infos.cnv_inf) (ind2,u2) args2 (snd appr1)
-                in convert_stacks l2r infos lft1 lft2 v1 v2 cuniv
-              with Not_found -> raise NotConvertible)
+             construct_eta ~left:false (ind2, u2) args2 appr1
            | _ -> raise NotConvertible)
       end
 
     | (c1, FFlex fl2)      ->
-       begin match unfold_ref_with_args infos.cnv_inf infos.rgt_tab fl2 v2 with
+      begin match flex_unit_eta lft2 v2 fl2 lft1 v1 c1 with
+      | Some cuniv -> cuniv
+      | None ->
+      match unfold_ref_with_args infos.cnv_inf infos.rgt_tab fl2 v2 with
         | Some (def2, v2) ->
           (** Symmetrical case of above. *)
           let all = RedFlags.(red_add_transparent all (red_transparent (info_flags infos.cnv_inf))) in
@@ -630,10 +1337,7 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
           match c1 with
           | FConstruct (((ind1, 1), u1), args1) ->
             let () = assert_reduced_constructor v1 in
-            (try let v1, v2 =
-                   eta_expand_ind_stack (info_env infos.cnv_inf) (ind1,u1) args1 (snd appr2)
-               in convert_stacks l2r infos lft1 lft2 v1 v2 cuniv
-             with Not_found -> raise NotConvertible)
+            construct_eta ~left:true (ind1, u1) args1 appr2
           | _ -> raise NotConvertible
        end
 
@@ -696,21 +1400,15 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
       let () = assert_reduced_constructor v1 in
       (* records only have 1 constructor *)
       let () = if not @@ Int.equal j1 1 then raise NotConvertible in
-      (try
-         let v1, v2 =
-            eta_expand_ind_stack (info_env infos.cnv_inf) (ind1,u1) args1 (snd appr2)
-         in convert_stacks l2r infos lft1 lft2 v1 v2 cuniv
-       with Not_found -> raise NotConvertible)
+      construct_eta ~left:true ~unit:(fun () -> unit_operand lft2 (hd2, v2) ind1)
+        (ind1, u1) args1 appr2
 
     | (_, FConstruct (((ind2, j2), u2), args2)) ->
       let () = assert_reduced_constructor v2 in
       (* records only have 1 constructor *)
       let () = if not @@ Int.equal j2 1 then raise NotConvertible in
-      (try
-         let v2, v1 =
-            eta_expand_ind_stack (info_env infos.cnv_inf) (ind2,u2) args2 (snd appr1)
-         in convert_stacks l2r infos lft1 lft2 v1 v2 cuniv
-       with Not_found -> raise NotConvertible)
+      construct_eta ~left:false ~unit:(fun () -> unit_operand lft1 (hd1, v1) ind2)
+        (ind2, u2) args2 appr1
 
     | (FFix (((op1, i1),(na1,tys1,cl1)),e1), FFix(((op2, i2),(_,tys2,cl2)),e2)) ->
         if Int.equal i1 i2 && Array.equal Int.equal op1 op2
@@ -975,6 +1673,8 @@ let clos_gen_conv (type err) ~typed trans cv_pb l2r evars env graph univs t1 t2 
       let infos = {
         cnv_inf = infos;
         cnv_typ = typed;
+        cnv_rel_types = Range.empty;
+        cnv_rel_type_lifts = Range.empty;
         lft_tab = create_tab ();
         rgt_tab = create_tab ();
         err_ret = box;
@@ -1026,7 +1726,8 @@ let () =
       let box = Empty.abort in
       let state = info_univs infos in
       let qual_equal q1 q2 = CClosure.eq_quality infos q1 q2 in
-      let infos = { cnv_inf = infos; cnv_typ = true; lft_tab = tab; rgt_tab = tab; err_ret = box; } in
+      let infos = { cnv_inf = infos; cnv_typ = true; lft_tab = tab; rgt_tab = tab; err_ret = box;
+                    cnv_rel_types = Range.empty; cnv_rel_type_lifts = Range.empty } in
       let state', _ = ccnv CONV false infos el_id el_id a b (state, checked_universes_gen qual_equal) in
       assert (state==state');
       true
