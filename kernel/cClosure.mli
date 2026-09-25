@@ -208,6 +208,10 @@ val with_private_closure_query : steps:int -> clos_infos -> fconstr list ->
     caller's cells are never updated. Start from an empty stack. *)
 val infos_with_private_reduction : clos_infos -> clos_infos
 
+(** The same, with [reduce] run under a bound on the cells visited; [None]
+    when the bound is exhausted. Compact naturals are supported. *)
+val with_bounded_private_reduction : steps:int -> clos_infos -> (clos_infos -> 'a) -> 'a option
+
 (** Reduction function *)
 
 (** [norm_val] is for strong normalization *)

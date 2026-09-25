@@ -307,6 +307,14 @@ module Failed = Bounded (struct
       s.left_lift, s.right_lift)
 end)
 
+(* Cells probed for a constructor major with a negative or exhausted answer,
+   with the term they had at the time. *)
+module MajorProbes = Hashtbl.Make (struct
+  type t = fconstr
+  let equal = (==)
+  let hash = fconstr_hash
+end)
+
 module ConstructorMasks = Hashtbl.Make (struct
   type t = pconstructor
   let equal (c, u) (d, v) = Construct.UserOrd.equal c d && UVars.Instance.equal u v
@@ -342,6 +350,7 @@ type 'e conv_tab = {
   cnv_projections : site list Projections.t;
   cnv_failed : unit Failed.t;
   cnv_masks : bool array ConstructorMasks.t;
+  cnv_major_misses : fterm MajorProbes.t;
   lft_tab : clos_tab;
   rgt_tab : clos_tab;
   err_ret : 'e -> payload;
@@ -486,16 +495,19 @@ let visible_constructor_head env term =
     | _ -> false in
   constructor 16 term
 
-(* The major premise of an eliminator, evaluated on demand in a private view
-   of the reduction machine with the caller's transparency: a constructor, or
-   [None] when the demand is stuck. *)
-let reduce_constructor_major ?(tab = create_tab ()) infos term =
-  let reds = RedFlags.(red_add_transparent all (red_transparent (info_flags infos))) in
-  let head, stack =
-    whd_stack (infos_with_private_reduction (infos_with_reds infos reds)) tab term [] in
+let major_reds infos = RedFlags.(red_add_transparent all (red_transparent (info_flags infos)))
+
+(* A constructor at the head of [term] reduced in the private view [infos]
+   with the caller's transparency, [None] when the demand is stuck. *)
+let constructor_major infos tab term =
+  let head, stack = whd_stack infos tab term [] in
   if is_empty_stack stack then
     (match fterm_of head with FConstruct _ | FPeanoNat _ -> Some head | _ -> None)
   else None
+
+let reduce_constructor_major ?(tab = create_tab ()) infos term =
+  let infos = infos_with_private_reduction (infos_with_reds infos (major_reds infos)) in
+  constructor_major infos tab term
 
 (* Index of the argument a transparent, relevant constant eliminates: the
    recursive argument of its fixpoint or the subject of its case. *)
@@ -536,6 +548,32 @@ let eliminates_constructor infos reference stack =
     Option.cata (fun (_, major) -> visible_constructor_head (info_env infos.cnv_inf) major)
       false (stack_argument el_id index stack)
   | None -> false
+
+(* Iota before delta: an eliminator whose major computes to a constructor
+   within 512 visits of a private reduction is unfolded first, as by Lean's
+   whnf_core. A negative or exhausted probe is remembered with the cell's
+   term, so that an unchanged cell is probed once per conversion. *)
+let probed_constructor_major ?tab infos reference stack =
+  match eliminator_major infos reference with
+  | None -> false
+  | Some index ->
+    match stack_argument el_id index stack with
+    | None -> false
+    | Some (_, major) ->
+      let misses = infos.cnv_major_misses in
+      let current = fterm_of major in
+      match MajorProbes.find_opt misses major with
+      | Some term when term == current -> false
+      | _ ->
+        let tab = match tab with Some tab -> tab | None -> create_tab () in
+        let infos = infos_with_reds infos.cnv_inf (major_reds infos.cnv_inf) in
+        match with_bounded_private_reduction ~steps:512 infos (fun infos ->
+            Option.has_some (constructor_major infos tab major)) with
+        | Some true -> true
+        | Some false | None ->
+          if MajorProbes.length misses >= 1_000_000 then MajorProbes.reset misses;
+          MajorProbes.replace misses major current;
+          false
 
 (* The stack with the eliminated major replaced by its reduced value, so that
    iota follows the unfolding instead of getting stuck on the original
@@ -2859,7 +2897,12 @@ and eq_flex_flex cv_pb l2r infos (lft1, (hd1, v1)) (lft2, (hd2, v2)) fl1 fl2 cun
       (* the original applications: compact arithmetic may have consumed
          arguments of the unfolded ones *)
       let eliminates =
-        eliminates_constructor infos fl1 v1, eliminates_constructor infos fl2 v2 in
+        let eliminates1 = eliminates_constructor infos fl1 v1 in
+        let eliminates2 = eliminates_constructor infos fl2 v2 in
+        let eliminates1 = eliminates1 || probed_constructor_major ~tab:infos.lft_tab infos fl1 v1 in
+        let eliminates2 = eliminates2 || probed_constructor_major ~tab:infos.rgt_tab infos fl2 v2 in
+        eliminates1, eliminates2
+      in
       let action = unfolding_action infos l2r ~eliminates ~compact:(compact1, compact2)
           fl1 (t1, s1) fl2 (t2, s2) in
       match action with
@@ -3090,6 +3133,7 @@ let clos_gen_conv (type err) ~typed ?(strategy = plain_strategy) trans cv_pb l2r
         cnv_projections = Projections.create ();
         cnv_failed = Failed.create ();
         cnv_masks = ConstructorMasks.create 17;
+        cnv_major_misses = MajorProbes.create 16;
         lft_tab = create_tab ();
         rgt_tab = create_tab ();
         err_ret = box;
@@ -3147,7 +3191,7 @@ let () =
         cnv_ctx = 0; cnv_ctx_steps = CtxSteps.create 64;
         cnv_strategy = plain_strategy; cnv_steps = None; cnv_probe = None;
         cnv_projections = Projections.create (); cnv_failed = Failed.create ();
-        cnv_masks = ConstructorMasks.create 17;
+        cnv_masks = ConstructorMasks.create 17; cnv_major_misses = MajorProbes.create 16;
       } in
       let state', _ = ccnv CONV false infos el_id el_id a b (state, checked_universes_gen qual_equal) in
       assert (state==state');

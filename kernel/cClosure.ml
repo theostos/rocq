@@ -3124,6 +3124,16 @@ let private_view ?(mark = fconstr_mark) ?(visit = ignore) infos =
 
 let infos_with_private_reduction infos = private_view infos
 
+exception Private_budget_exhausted
+
+let with_bounded_private_reduction ~steps infos reduce =
+  let remaining = ref (max 0 steps) in
+  let visit () =
+    if Int.equal !remaining 0 then raise_notrace Private_budget_exhausted;
+    decr remaining;
+    if !remaining land 255 = 0 then Control.check_for_interrupt () in
+  try Some (reduce (private_view ~visit infos)) with Private_budget_exhausted -> None
+
 let with_private_closure_query ~steps infos roots inspect =
   let infos = { infos with i_inspection = Some (ref (max 0 steps)) } in
   let mark source = match source.term with
