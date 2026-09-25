@@ -186,6 +186,10 @@ val set_info_relevances : clos_infos -> Sorts.relevance Range.t -> clos_infos
 val info_relevances : clos_infos -> Sorts.relevance Range.t
 
 val is_irrelevant : clos_infos -> Sorts.relevance -> bool
+
+(** Relevance of the arguments of a term of the given type; [false] entries
+    are not compared by the conversion. *)
+val relevance_mask : clos_infos -> UVars.Instance.t -> constr -> bool array
 val eq_quality : clos_infos -> Sorts.Quality.t -> Sorts.Quality.t -> bool
 
 val infos_with_reds : clos_infos -> reds -> clos_infos
@@ -199,6 +203,10 @@ val infos_with_reds : clos_infos -> reds -> clos_infos
     [inspect] must reduce with the infos it receives and fresh tables. *)
 val with_private_closure_query : steps:int -> clos_infos -> fconstr list ->
   (clos_infos -> fconstr list -> 'a option) -> 'a option
+
+(** A private call-by-need view: cells are copied when first visited and the
+    caller's cells are never updated. Start from an empty stack. *)
+val infos_with_private_reduction : clos_infos -> clos_infos
 
 (** Reduction function *)
 

@@ -560,6 +560,20 @@ let eq_quality info q1 q2 =
 
 (************************************************************************)
 
+(* Relevance of the arguments of a term of type [typ]: [false] where the
+   argument is irrelevant and need not be compared. *)
+let relevance_mask info instance typ =
+  let binders, _ = Term.decompose_prod typ in
+  let relevant (binder, _) =
+    not (is_irrelevant info (UVars.subst_instance_relevance instance binder.binder_relevance)) in
+  Array.of_list (List.rev_map relevant binders)
+
+let merge_masks first second =
+  let length = max (Array.length first) (Array.length second) in
+  Array.init length (fun index ->
+    (index >= Array.length first || first.(index)) &&
+    (index >= Array.length second || second.(index)))
+
 type table_val = (fconstr * bool array, Empty.t, UVars.Instance.t * bool * machine_rewrite_rule list) constant_def
 
 module Table : sig
@@ -632,9 +646,11 @@ end = struct
         if TransparentState.is_transparent_constant ts cst then match cb.const_body with
         | Undef _ | Def _ | OpaqueDef _ | Primitive _ ->
           let mask = if Inspection.active info then [||] else
-          match cb.const_body_code with
+          let mask = match cb.const_body_code with
           | (Vmemitcodes.BCalias _ | Vmemitcodes.BCconstant | BCuncompiled) -> [||]
           | (Vmemitcodes.BCdefined (mask, _, _)) -> mask
+          in
+          merge_masks mask (relevance_mask info u cb.const_type)
           in
           Def (constant_value_in u cb.const_body, mask)
         | Symbol b ->
@@ -3088,18 +3104,12 @@ end)
    flags, so a copy recomputes its mark; constructor, lambda and fixpoint
    marks are kept. [None] when the budget runs out or the reduction reaches
    an unsupported construct. *)
-let with_private_closure_query ~steps infos roots inspect =
-  let infos = { infos with i_inspection = Some (ref (max 0 steps)) } in
-  let mark source = match source.term with
-    | FConstruct _ | FPeanoNat _ | FLambda _ | FFix _ | FCoFix _
-    | FInt _ | FFloat _ | FString _ | FArray _ -> Cstr
-    | FRel _ | FAtom _ | FInd _ | FProd _ | FIrrelevant -> Ntrl
-    | FFlex _ | FApp _ | FProj _ | FCLOS _ | FLIFT _ | FLetIn _
-    | FCaseT _ | FCaseInvert _ | FEvar _ -> Red
-    | FLOCKED -> raise_notrace Inspection.Limit in
+(* A private call-by-need view of [infos]: a cell is copied, with [mark], the
+   first time reduction visits it; the caller's cells are never updated. *)
+let private_view ?(mark = fconstr_mark) ?(visit = ignore) infos =
   let cells = Cells.create 31 in
   let own source =
-    Inspection.charge infos 1;
+    visit ();
     match Cells.find_opt cells source with
     | Some owned -> owned
     | None ->
@@ -3109,9 +3119,22 @@ let with_private_closure_query ~steps infos roots inspect =
       Cells.add cells owned owned;
       if Cells.length cells land 255 = 0 then Control.check_for_interrupt ();
       owned in
-  let infos = { infos with i_private = Some own;
-                i_cache = { infos.i_cache with i_share = true } } in
-  try inspect infos (List.map own roots)
+  { infos with i_private = Some own;
+    i_cache = { infos.i_cache with i_share = true } }
+
+let infos_with_private_reduction infos = private_view infos
+
+let with_private_closure_query ~steps infos roots inspect =
+  let infos = { infos with i_inspection = Some (ref (max 0 steps)) } in
+  let mark source = match source.term with
+    | FConstruct _ | FPeanoNat _ | FLambda _ | FFix _ | FCoFix _
+    | FInt _ | FFloat _ | FString _ | FArray _ -> Cstr
+    | FRel _ | FAtom _ | FInd _ | FProd _ | FIrrelevant -> Ntrl
+    | FFlex _ | FApp _ | FProj _ | FCLOS _ | FLIFT _ | FLetIn _
+    | FCaseT _ | FCaseInvert _ | FEvar _ -> Red
+    | FLOCKED -> raise_notrace Inspection.Limit in
+  let infos = private_view ~mark ~visit:(fun () -> Inspection.charge infos 1) infos in
+  try inspect infos (List.map (Option.get infos.i_private) roots)
   with Inspection.Limit -> None
 
 let unfold_ref_with_args infos tab fl v =
