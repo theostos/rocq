@@ -76,7 +76,7 @@ type table_key = Constant.t UVars.puniverses tableKey
 type evar_repack = Evar.t * constr list -> constr
 
 type fconstr = {
-  mutable mark : red_state;
+  mutable state : int;
   mutable term: fterm;
 }
 
@@ -113,15 +113,31 @@ and usubs = subs_content subs UVars.puniverses
 
 and finvert = fconstr array
 
+(* [state] packs the reduction mark in its two low bits and a unique creation
+   counter above them, so [fconstr_hash] identifies a cell exactly. *)
+let fconstr_hash v = v.state lsr 2
+
+let mark_code = function Ntrl -> 0 | Cstr -> 1 | Red -> 2
+
+let fconstr_mark v = match v.state land 3 with 0 -> Ntrl | 1 -> Cstr | _ -> Red
+
+let set_fconstr_mark v mark = v.state <- v.state land lnot 3 lor mark_code mark
+
+let next_uid = Atomic.make 0
+
+let make_fconstr mark term =
+  { state = Atomic.fetch_and_add next_uid 1 lsl 2 lor mark_code mark; term }
+
 let get_invert fiv = fiv
 
 let fterm_of v = v.term
-let set_ntrl v = v.mark <- Ntrl
+
+let set_ntrl v = set_fconstr_mark v Ntrl
 
 (* Could issue a warning if no is still Red, pointing out that we loose
    sharing. *)
 let update v1 mark t =
-  v1.mark <- mark; v1.term <- t
+  set_fconstr_mark v1 mark; v1.term <- t
 
 type 'a evar_expansion =
 | EvarDefined of 'a
@@ -240,17 +256,21 @@ let usubs_shft (n,(e,u)) = subs_shft (n, e), u
 let rec lft_fconstr n ft =
   match ft.term with
     | (FInd _|FConstruct (_,[||])|FFlex(ConstKey _|VarKey _)|FInt _|FFloat _|FString _|FIrrelevant) -> ft
-    | FRel i -> {mark=ft.mark;term=FRel(i+n)}
-    | FLambda(k,tys,f,e) -> {mark=Cstr; term=FLambda(k,tys,f,usubs_shft(n,e))}
+    | FRel i -> make_fconstr (fconstr_mark ft) (FRel (i + n))
+    | FLambda(k,tys,f,e) ->
+      make_fconstr Cstr (FLambda (k, tys, f, usubs_shft (n, e)))
     | FFix(fx,e) ->
-      {mark=Cstr; term=FFix(fx,usubs_shft(n,e))}
+      make_fconstr Cstr (FFix (fx, usubs_shft (n, e)))
     | FCoFix(cfx,e) ->
-      {mark=Cstr; term=FCoFix(cfx,usubs_shft(n,e))}
+      make_fconstr Cstr (FCoFix (cfx, usubs_shft (n, e)))
     | FLIFT(k,m) -> lft_fconstr (n+k) m
-    | FConstruct (c,args) -> {mark=Cstr; term=FConstruct(c,Array.Fun1.map lft_fconstr n args)}
+    | FConstruct (c,args) ->
+      make_fconstr Cstr (FConstruct (c, Array.Fun1.map lft_fconstr n args))
     | FLOCKED -> assert false
     | FFlex (RelKey _) | FAtom _ | FApp _ | FProj _ | FCaseT _ | FCaseInvert _ | FProd _
-    | FLetIn _ | FEvar _ | FCLOS _ | FArray _ -> {mark=ft.mark; term=FLIFT(n,ft)}
+    | FLetIn _ | FEvar _ | FCLOS _ | FArray _ ->
+      make_fconstr (fconstr_mark ft) (FLIFT (n, ft))
+
 let lift_fconstr k f =
   if Int.equal k 0 then f else lft_fconstr k f
 
@@ -259,9 +279,9 @@ let clos_rel e i =
     | Inl (n, Regular mt) -> Regular (lift_fconstr n mt)
     | Inl (_, HigherOrder (0, mt)) -> Regular mt
     | Inl (_, HigherOrder (nargs, mt)) -> HigherOrder (nargs, mt)
-    | Inr (k, None) -> Regular {mark=Ntrl; term= FRel k}
+    | Inr (k, None) -> Regular (make_fconstr Ntrl (FRel k))
     | Inr (k, Some p) ->
-      Regular (lift_fconstr (k-p) {mark=Red;term=FFlex(RelKey p)})
+      Regular (lift_fconstr (k-p) (make_fconstr Red (FFlex (RelKey p))))
 
 (* since the head may be reducible, we might introduce lifts of 0 *)
 let compact_stack head stk =
@@ -272,7 +292,7 @@ let compact_stack head stk =
            lost by the update operation *)
         let h' = lft_fconstr depth head in
         (** The stack contains [Zupdate] marks only if in sharing mode *)
-        let () = update m h'.mark h'.term in
+        let () = update m (fconstr_mark h') h'.term in
         strip_rec depth s
     | ((ZcaseT _ | Zproj _ | Zfix _ | Zapp _ | Zprimitive _) :: _ | []) as stk -> zshift depth stk
   in
@@ -281,7 +301,7 @@ let compact_stack head stk =
 (* Put an update mark in the stack, only if needed *)
 let zupdate info m s =
   let share = info.i_cache.i_share in
-  if share && is_red m.mark then
+  if share && is_red (fconstr_mark m) then
     let s' = compact_stack m s in
     let _ = m.term <- FLOCKED in
     Zupdate(m)::s'
@@ -324,7 +344,8 @@ let destFLambda clos_fun t =
   | FLambda(_,[(na,ty)],b,e) ->
     (usubst_binder e na,clos_fun e ty,clos_fun (usubs_lift e) b)
   | FLambda(n,(na,ty)::tys,b,e) ->
-    (usubst_binder e na,clos_fun e ty,{mark=t.mark;term=FLambda(n-1,tys,b,usubs_lift e)})
+    (usubst_binder e na, clos_fun e ty,
+     make_fconstr (fconstr_mark t) (FLambda (n - 1, tys, b, usubs_lift e)))
   | _ -> assert false
 
 (* Optimization: do not enclose variables in a closure.
@@ -336,26 +357,27 @@ let mk_clos (e:usubs) t =
       | Regular v -> v
       | HigherOrder _ -> CErrors.anomaly Pp.(str "Uncaught pattern variable")
       end
-    | Var x -> {mark = Red; term = FFlex (VarKey x) }
-    | Const c -> {mark = Red; term = FFlex (ConstKey (usubst_punivs e c)) }
+    | Var x -> make_fconstr Red (FFlex (VarKey x))
+    | Const c -> make_fconstr Red (FFlex (ConstKey (usubst_punivs e c)))
     | Sort s ->
       let s = usubst_sort e s in
-      {mark = Ntrl; term = FAtom (mkSort s) }
-    | Meta _ -> {mark = Ntrl; term = FAtom t }
-    | Ind kn -> {mark = Ntrl; term = FInd (usubst_punivs e kn) }
-    | Construct kn -> {mark = Cstr; term = FConstruct (usubst_punivs e kn,[||]) }
-    | Int i -> {mark = Cstr; term = FInt i}
-    | Float f -> {mark = Cstr; term = FFloat f}
-    | String s -> {mark = Cstr; term = FString s}
+      make_fconstr Ntrl (FAtom (mkSort s))
+    | Meta _ -> make_fconstr Ntrl (FAtom t)
+    | Ind kn -> make_fconstr Ntrl (FInd (usubst_punivs e kn))
+    | Construct kn ->
+      make_fconstr Cstr (FConstruct (usubst_punivs e kn, [||]))
+    | Int i -> make_fconstr Cstr (FInt i)
+    | Float f -> make_fconstr Cstr (FFloat f)
+    | String s -> make_fconstr Cstr (FString s)
     | (CoFix _|Lambda _|Fix _|Prod _|Evar _|App _|Case _|Cast _|LetIn _|Proj _|Array _) ->
-        {mark = Red; term = FCLOS(t,e)}
+        make_fconstr Red (FCLOS (t, e))
   (* Invariant, pattern variables under apps are deferred to knht by being wrapped in FCLOS *)
 
 let injectu c u = mk_clos (subs_id 0, u) c
 
 let inject c = injectu c UVars.Instance.empty
 
-let mk_irrelevant = { mark = Cstr; term = FIrrelevant }
+let mk_irrelevant = make_fconstr Cstr FIrrelevant
 
 let is_irrelevant info r = match info.i_cache.i_mode with
 | Reduction -> false
@@ -672,61 +694,59 @@ let rec resubst subs v =
     | FRel i ->
       let args = Array.Fun1.map resubst subs ve in
       begin match clos_rel subs i with
-      | Regular t -> { v with term = FApp (t, args) }
+      | Regular t -> make_fconstr (fconstr_mark v) (FApp (t, args))
       | HigherOrder (nargs, term) ->
         let subs', args = Array.chop nargs args in
         let subs' = Array.fold_left (fun s v -> subs_cons (Regular v) s) (subs_id 0) subs' in
         let head = resubst subs' term in
-        { v with term = FApp (head, args) }
+        make_fconstr (fconstr_mark v) (FApp (head, args))
       end
     | _ ->
-      { v with term =
-          FApp (resubst subs f,
-                Array.Fun1.map resubst subs ve) }
+      make_fconstr (fconstr_mark v)
+        (FApp (resubst subs f,
+               Array.Fun1.map resubst subs ve))
     end
   | FCaseT (ci, u, pms, p, c, ve, env) ->
     let env = comp_subs subs env in
-    { v with term = FCaseT (ci, u, pms, p, resubst subs c, ve, env) }
+    make_fconstr (fconstr_mark v)
+      (FCaseT (ci, u, pms, p, resubst subs c, ve, env))
   | FCaseInvert (ci, u, pms, p, indices, c, ve, env) ->
     let env = comp_subs subs env in
     let indices = Array.Fun1.map resubst subs indices in
-    { v with term = FCaseInvert (ci, u, pms, p, indices, resubst subs c, ve, env) }
+    make_fconstr (fconstr_mark v)
+      (FCaseInvert (ci, u, pms, p, indices, resubst subs c, ve, env))
   | FFix (fx, e) ->
     let e = comp_subs subs e in
-    { v with term = FFix (fx, e) }
+    make_fconstr (fconstr_mark v) (FFix (fx, e))
   | FCoFix (cfx, e) ->
     let e = comp_subs subs e in
-    { v with term = FCoFix (cfx, e) }
+    make_fconstr (fconstr_mark v) (FCoFix (cfx, e))
   | FProj (p, r, c) ->
-    { v with term =
-      FProj (p, r, resubst subs c) }
+    make_fconstr (fconstr_mark v) (FProj (p, r, resubst subs c))
   | FLambda (len, tys, f, e) ->
     let e = comp_subs subs e in
-    { v with term = FLambda (len, tys, f, e) }
+    make_fconstr (fconstr_mark v) (FLambda (len, tys, f, e))
   | FProd (n, t, c, e) ->
     let e = comp_subs subs e in
-    { v with term = FProd (n, resubst subs t, c, e) }
+    make_fconstr (fconstr_mark v) (FProd (n, resubst subs t, c, e))
   | FLetIn (n, b, t, f, e) ->
     let e = comp_subs subs e in
-    { v with term =
-      FLetIn (n, resubst subs b, resubst subs t, f, e) }
+    make_fconstr (fconstr_mark v)
+      (FLetIn (n, resubst subs b, resubst subs t, f, e))
   | FEvar (ev, args, env, repack) ->
     let env = comp_subs subs env in
-    { v with term =
-      FEvar (ev, args, env, repack) }
+    make_fconstr (fconstr_mark v) (FEvar (ev, args, env, repack))
   | FLIFT (k, a) ->
     resubst (subs_popn k subs) a
 
   | FArray (u, t, ty) ->
     let t = Parray.map (resubst subs) t in
     let ty = resubst subs ty in
-    { v with term =
-      FArray (u, t, ty) }
+    make_fconstr (fconstr_mark v) (FArray (u, t, ty))
 
   | FCLOS (t,env) ->
     let env = comp_subs subs env in
-    { v with term =
-      FCLOS (t, env) }
+    make_fconstr (fconstr_mark v) (FCLOS (t, env))
 
   | FFlex (RelKey _) -> v (* outside the substitution *)
   | FFlex (ConstKey _ | VarKey _) | FInd _ | FConstruct _ | FAtom _ | FInt _ | FFloat _ | FString _ -> v
@@ -753,10 +773,10 @@ let mkFApp h args =
   else match[@warning "-4"] h.term with
     | FConstruct (c, args0) ->
       let args = if CArray.is_empty args0 then args else Array.append args0 args in
-      {mark=Cstr; term=FConstruct(c, args)}
+      make_fconstr Cstr (FConstruct (c, args))
     | _ ->
       (* don't bother collapsing FApp nodes *)
-      {mark=neutr h.mark; term=FApp(h,args)}
+      make_fconstr (neutr (fconstr_mark h)) (FApp (h, args))
 
 let rec zip m stk =
   match stk with
@@ -764,24 +784,25 @@ let rec zip m stk =
     | Zapp args :: s -> zip (mkFApp m args) s
     | ZcaseT(ci, u, pms, p, br, e)::s ->
         let t = FCaseT(ci, u, pms, p, m, br, e) in
-        let mark = (neutr m.mark) in
-        zip {mark; term=t} s
+        let mark = neutr (fconstr_mark m) in
+        zip (make_fconstr mark t) s
     | Zproj (p,r) :: s ->
-        let mark = (neutr m.mark) in
-        zip {mark; term=FProj(Projection.make p true,r,m)} s
+        let mark = neutr (fconstr_mark m) in
+        zip (make_fconstr mark (FProj (Projection.make p true, r, m))) s
     | Zfix(fx,par)::s ->
         zip fx (par @ append_stack [|m|] s)
     | Zshift(n)::s ->
         zip (lift_fconstr n m) s
     | Zupdate(rf)::s ->
       (** The stack contains [Zupdate] marks only if in sharing mode *)
-        let () = update rf m.mark m.term in
+        let () = update rf (fconstr_mark m) m.term in
         zip rf s
     | Zprimitive(_op,c,rargs,kargs)::s ->
       let args = List.rev_append rargs (m::List.map snd kargs) in
-      let f = {mark = Red; term = FFlex (ConstKey c)} in
+      let f = make_fconstr Red (FFlex (ConstKey c)) in
       (* don't need to mkFApp because not a constructor *)
-      zip {mark=(neutr m.mark); term = FApp (f, Array.of_list args)} s
+      zip (make_fconstr (neutr (fconstr_mark m))
+             (FApp (f, Array.of_list args))) s
 
 let fapp_stack (m,stk) = zip m stk
 
@@ -805,7 +826,7 @@ let strip_update_shift_absorb_app head stk =
         strip_rec (mkFApp h args) s
     | Zupdate(m)::s ->
       (** The stack contains [Zupdate] marks only if in sharing mode *)
-        let () = update m h.mark h.term in
+        let () = update m (fconstr_mark h) h.term in
         strip_rec m s
     | ((ZcaseT _ | Zproj _ | Zfix _ | Zprimitive _) :: _ | []) as stk ->
       (* depth and rstk only matter for cofix *)
@@ -822,7 +843,7 @@ let strip_update_shift_app_red head stk =
         strip_rec (Zapp args :: rstk) (mkFApp h args) depth s
     | Zupdate(m)::s ->
       (** The stack contains [Zupdate] marks only if in sharing mode *)
-        let () = update m h.mark h.term in
+        let () = update m (fconstr_mark h) h.term in
         strip_rec rstk m depth s
     | ((ZcaseT _ | Zproj _ | Zfix _ | Zprimitive _) :: _ | []) as stk ->
       (* depth and rstk only matter for cofix *)
@@ -831,11 +852,11 @@ let strip_update_shift_app_red head stk =
   strip_rec [] head 0 stk
 
 let strip_update_shift_app head stack =
-  assert (not (is_red head.mark));
+  assert (not (is_red (fconstr_mark head)));
   strip_update_shift_app_red head stack
 
 let get_nth_arg head n stk =
-  assert (not (is_red head.mark));
+  assert (not (is_red (fconstr_mark head)));
   let rec strip_rec rstk h n = function
     | Zshift(k) as e :: s ->
         strip_rec (e::rstk) (lift_fconstr k h) n s
@@ -852,7 +873,7 @@ let get_nth_arg head n stk =
           (Some (stk', args.(n)), append_stack aft s')
     | Zupdate(m)::s ->
         (** The stack contains [Zupdate] mark only if in sharing mode *)
-        let () = update m h.mark h.term in
+        let () = update m (fconstr_mark h) h.term in
         strip_rec rstk m n s
     | ((ZcaseT _ | Zproj _ | Zfix _ | Zprimitive _) :: _ | []) as s -> (None, List.rev rstk @ s) in
   strip_rec [] head n stk
@@ -887,7 +908,7 @@ let rec get_args n tys f e = function
           let etys = List.skipn na tys in
           get_args (n-na) etys f (usubs_consn l 0 na e) s
     | ((ZcaseT _ | Zproj _ | Zfix _ | Zprimitive _) :: _ | []) as stk ->
-      (Inr {mark=Cstr; term=FLambda(n,tys,f,e)}, stk)
+      (Inr (make_fconstr Cstr (FLambda (n, tys, f, e))), stk)
 
 (* Eta expansion: add a reference to implicit surrounding lambda at end of stack *)
 let rec eta_expand_stack info na = function
@@ -897,7 +918,7 @@ let rec eta_expand_stack info na = function
   | [] ->
     let arg =
       if is_irrelevant info na.binder_relevance then mk_irrelevant
-      else {mark = Ntrl; term = FRel 1}
+      else make_fconstr Ntrl (FRel 1)
     in
     [Zshift 1; Zapp [|arg|]]
 
@@ -928,13 +949,15 @@ let get_native_args op c stk =
            Zapp (Array.of_list eargs) :: s')
         | rnargs, kargs, _ ->
           (* head of h is not constructor -> no need to mkFApp *)
-          strip_rec rnargs {mark = h.mark;term=FApp(h, args)} depth kargs s'
+          strip_rec rnargs
+            (make_fconstr (fconstr_mark h) (FApp (h, args)))
+            depth kargs s'
       end
     | Zupdate(m) :: s ->
-      let () = update m h.mark h.term in
+      let () = update m (fconstr_mark h) h.term in
       strip_rec rnargs m depth  kargs s
     | (Zprimitive _ | ZcaseT _ | Zproj _ | Zfix _) :: _ | [] -> assert false
-  in strip_rec [] {mark = Red; term = FFlex(ConstKey c)} 0 kargs stk
+  in strip_rec [] (make_fconstr Red (FFlex (ConstKey c))) 0 kargs stk
 
 let get_native_args1 op c stk =
   match get_native_args op c stk with
@@ -1048,8 +1071,9 @@ let eta_expand_ind_stack env (ind,u) args m' =
       then raise Not_found (* partially applied constructor (missing non-param arguments) *)
     in
     let hstack = Array.map (fun (p,r) ->
-        { mark = Red; (* right can't be a constructor though *)
-          term = FProj (Projection.make p true, UVars.subst_instance_relevance u r, right) })
+        make_fconstr Red (* right can't be a constructor though *)
+          (FProj (Projection.make p true,
+             UVars.subst_instance_relevance u r, right)))
         projs
     in
     [Zapp argss], [Zapp hstack]
@@ -1068,13 +1092,11 @@ let contract_fix_vect fix =
     match [@ocaml.warning "-4"] fix with
       | FFix (((reci,i),(_,_,bds as rdcl)),env) ->
           (bds.(i),
-           (fun j -> { mark = Cstr;
-                       term = FFix (((reci,j),rdcl),env) }),
+           (fun j -> make_fconstr Cstr (FFix (((reci, j), rdcl), env))),
            env, Array.length bds)
       | FCoFix ((i,(_,_,bds as rdcl)),env) ->
           (bds.(i),
-           (fun j -> { mark = Cstr;
-                       term = FCoFix ((j,rdcl),env) }),
+           (fun j -> make_fconstr Cstr (FCoFix ((j, rdcl), env))),
            env, Array.length bds)
       | _ -> assert false
   in
@@ -1104,7 +1126,7 @@ module FNativeEntries =
 
     let mk_construct c =
       (* All constructors used in primitive functions are relevant *)
-      { mark = Cstr; term = FConstruct (UVars.in_punivs c, [||]) }
+      make_fconstr Cstr (FConstruct (UVars.in_punivs c, [||]))
 
     let get = Array.get
 
@@ -1128,7 +1150,7 @@ module FNativeEntries =
       | FArray (_u,t,_ty) -> t
       | _ -> assert false
 
-    let dummy = {mark = Ntrl; term = FRel 0}
+    let dummy = make_fconstr Ntrl (FRel 0)
 
     let current_retro = ref Retroknowledge.empty
     let defined_int = ref false
@@ -1138,7 +1160,7 @@ module FNativeEntries =
       match retro.Retroknowledge.retro_int63 with
       | Some c ->
         defined_int := true;
-        fint := { mark = Ntrl; term = FFlex (ConstKey (UVars.in_punivs c)) }
+        fint := make_fconstr Ntrl (FFlex (ConstKey (UVars.in_punivs c)))
       | None -> defined_int := false
 
     let defined_float = ref false
@@ -1148,7 +1170,7 @@ module FNativeEntries =
       match retro.Retroknowledge.retro_float64 with
       | Some c ->
         defined_float := true;
-        ffloat := { mark = Ntrl; term = FFlex (ConstKey (UVars.in_punivs c)) }
+        ffloat := make_fconstr Ntrl (FFlex (ConstKey (UVars.in_punivs c)))
       | None -> defined_float := false
 
     let defined_string = ref false
@@ -1158,7 +1180,7 @@ module FNativeEntries =
       match retro.Retroknowledge.retro_string with
       | Some c ->
         defined_string := true;
-        fstring := { mark = Ntrl; term = FFlex (ConstKey (UVars.in_punivs c)) }
+        fstring := make_fconstr Ntrl (FFlex (ConstKey (UVars.in_punivs c)))
       | None -> defined_string := false
 
     let defined_bool = ref false
@@ -1209,7 +1231,7 @@ module FNativeEntries =
         fLt := mk_construct cLt;
         fGt := mk_construct cGt;
         let (icmp, _) = cEq in
-        fcmp := { mark = Ntrl; term = FInd (UVars.in_punivs icmp) }
+        fcmp := make_fconstr Ntrl (FInd (UVars.in_punivs icmp))
       | None -> defined_cmp := false
 
     let defined_f_cmp = ref false
@@ -1318,15 +1340,15 @@ module FNativeEntries =
 
     let mkInt env i =
       check_int env;
-      { mark = Cstr; term = FInt i }
+      make_fconstr Cstr (FInt i)
 
     let mkFloat env f =
       check_float env;
-      { mark = Cstr; term = FFloat f }
+      make_fconstr Cstr (FFloat f)
 
     let mkString env s =
       check_string env;
-      { mark = Cstr; term = FString s }
+      make_fconstr Cstr (FString s)
 
     let mkBool env b =
       check_bool env;
@@ -1411,7 +1433,7 @@ module FNativeEntries =
 
     let mkArray env u t ty =
       check_array env;
-      { mark = Cstr; term = FArray (u,t,ty)}
+      make_fconstr Cstr (FArray (u, t, ty))
 
   end
 
@@ -1430,7 +1452,7 @@ let rec skip_irrelevant_stack info stk = match stk with
 | Zprimitive _ :: _ -> assert false (* no irrelevant primitives so far *)
 | Zupdate m :: s ->
   (** The stack contains [Zupdate] marks only if in sharing mode *)
-  let () = update m mk_irrelevant.mark mk_irrelevant.term in
+  let () = update m (fconstr_mark mk_irrelevant) mk_irrelevant.term in
   skip_irrelevant_stack info s
 
 let is_irrelevant_constructor infos ((ind,_),u) =
@@ -1508,30 +1530,30 @@ and knht info e t stk =
         (mk_irrelevant, skip_irrelevant_stack info stk)
       else
         let term = FCaseInvert (ci, u, pms, p, (Array.map (mk_clos e) indices), mk_clos e t, br, e) in
-        { mark = Red; term }, stk
+        make_fconstr Red term, stk
     | Fix (((_, n), (lna, _, _)) as fx) ->
       if is_irrelevant info (usubst_relevance e (lna.(n)).binder_relevance) then
         (mk_irrelevant, skip_irrelevant_stack info stk)
       else
-        knh info { mark = Cstr; term = FFix (fx, e) } stk
+        knh info (make_fconstr Cstr (FFix (fx, e))) stk
     | Cast(a,_,_) -> knht info e a stk
     | Proj (p, r, c) ->
       let r = usubst_relevance e r in
       if is_irrelevant info r then
         (mk_irrelevant, skip_irrelevant_stack info stk)
       else begin match unfold_projection info p r with
-      | None -> ({ mark = Red; term = FProj (p, r, mk_clos e c) }, stk)
+      | None -> (make_fconstr Red (FProj (p, r, mk_clos e c)), stk)
       | Some s -> knht info e c (s :: stk)
       end
     | Construct _ -> knh info (mk_clos e t) stk
     | (Ind _|Const _|Var _|Meta _ | Sort _ | Int _|Float _|String _) -> (mk_clos e t, stk)
     | CoFix cfx ->
-      { mark = Cstr; term = FCoFix (cfx,e) }, stk
-    | Lambda _ -> { mark = Cstr ; term = mk_lambda e t }, stk
+      make_fconstr Cstr (FCoFix (cfx, e)), stk
+    | Lambda _ -> make_fconstr Cstr (mk_lambda e t), stk
     | Prod (n, t, c) ->
-      { mark = Ntrl; term = FProd (n, mk_clos e t, c, e) }, stk
+      make_fconstr Ntrl (FProd (n, mk_clos e t, c, e)), stk
     | LetIn (n,b,t,c) ->
-      { mark = Red; term = FLetIn (n, mk_clos e b, mk_clos e t, c, e) }, stk
+      make_fconstr Red (FLetIn (n, mk_clos e b, mk_clos e t, c, e)), stk
     | Evar ev ->
       begin match info.i_cache.i_sigma.evar_expand ev with
       | EvarDefined c -> knht info e c stk
@@ -1541,7 +1563,7 @@ and knht info e t stk =
           (mk_irrelevant, skip_irrelevant_stack info stk)
         else
           let repack = info.i_cache.i_sigma.evar_repack in
-          { mark = Ntrl; term = FEvar (evk, args, e, repack) }, stk
+          make_fconstr Ntrl (FEvar (evk, args, e, repack)), stk
       end
     | Array(u,t,def,ty) ->
       let u = usubst_instance e u in
@@ -1549,7 +1571,7 @@ and knht info e t stk =
       let ty = mk_clos e ty in
       let t = Parray.init (Uint63.of_int len) (fun i -> mk_clos e t.(i)) (mk_clos e def) in
       let term = FArray (u,t,ty) in
-      knh info { mark = Cstr; term } stk
+      knh info (make_fconstr Cstr term) stk
 
 (************************************************************************)
 
@@ -1752,12 +1774,12 @@ and match_elim : 'a. ('a, 'a depth) reduction -> _ -> _ -> pat_state:'a depth ->
       match_main red info tab ~pat_state states loc
   | Zshift k :: s -> match_elim red info tab ~pat_state next depth states elims (lift_fconstr k head) s
   | Zupdate m :: s ->
-      let () = update m head.mark head.term in
+      let () = update m (fconstr_mark head) head.term in
       match_elim red info tab ~pat_state next depth states elims head s
   | ZcaseT (ci, u, pms, ((pctx, p), _ as pred), brs, e) :: s ->
       let t = FCaseT (ci, u, pms, pred, head, brs, e) in
-      let mark = neutr head.mark in
-      let head = {mark; term=t} in
+      let mark = neutr (fconstr_mark head) in
+      let head = make_fconstr mark t in
       let prets, pbrss, elims, states = extract_or_kill4 (function [@ocaml.warning "-4"]
       | PECase (pind, pret, pbrs) :: es, subst ->
         if not @@ QInd.equal (info_env info) pind ci.ci_ind then None else
@@ -1796,8 +1818,10 @@ and match_elim : 'a. ('a, 'a depth) reduction -> _ -> _ -> pat_state:'a depth ->
       let loc = LocArg { patterns = prets; depth = pdepth + depth; arg = mk_clos pred_e p; next = loc } in
       match_main red info tab ~pat_state states loc
   | Zproj (proj', r) :: s ->
-      let mark = (neutr head.mark) in
-      let head = {mark; term=FProj(Projection.make proj' true, r, head)} in
+      let mark = neutr (fconstr_mark head) in
+      let head =
+        make_fconstr mark (FProj (Projection.make proj' true, r, head))
+      in
       let elims, states = extract_or_kill2 (function [@ocaml.warning "-4"]
       | PEProj proj :: es, subst ->
         if not @@ QProjection.Repr.equal (info_env info) proj proj' then None else
@@ -1967,7 +1991,7 @@ let match_symbol red info tab ~pat_state fl (u, b, r) stk =
       | None -> Dead, Ignore
     ) (Array.of_list r)
   in
-  let m = { mark = Red; term = FFlex fl } in
+  let m = make_fconstr Red (FFlex fl) in
   let loc = LocStart { elims; depth=0; head = m; stack = stk; next = Return (unfold_fix, m, stk) } in
   match_main red info tab ~pat_state states loc
 
@@ -2140,7 +2164,7 @@ let kh info tab v stk = fapp_stack(kni info tab v stk)
 
 let is_val v = match v.term with
 | FAtom _ | FRel _   | FInd _ | FConstruct (_,[||]) | FInt _ | FFloat _ | FString _ -> true
-| FFlex _ -> v.mark == Ntrl
+| FFlex _ -> fconstr_mark v == Ntrl
 | FConstruct _ | FApp _ | FProj _ | FFix _ | FCoFix _ | FCaseT _ | FCaseInvert _ | FLambda _
 | FProd _ | FLetIn _ | FEvar _ | FArray _ | FLIFT _ | FCLOS _ -> false
 | FIrrelevant | FLOCKED -> assert false
@@ -2159,7 +2183,9 @@ and klt info tab e t = match kind t with
   | Inl (n, Regular mt) -> kl info tab @@ lift_fconstr n mt
   | Inl (_, HigherOrder (nargs, term)) -> assert (Int.equal nargs 0); kl info tab term
   | Inr (k, None) -> if Int.equal k i then t else mkRel k
-  | Inr (k, Some p) -> kl info tab @@ lift_fconstr (k-p) {mark=Red;term=FFlex(RelKey p)}
+  | Inr (k, Some p) ->
+    kl info tab @@
+      lift_fconstr (k - p) (make_fconstr Red (FFlex (RelKey p)))
   end
 | App (hd, args) ->
   let is_stuck = match kind hd with
@@ -2299,7 +2325,7 @@ let whd_val info tab v = term_of_fconstr (kh info tab v [])
 let norm_val info tab v = kl info tab v
 let norm_term info tab e t = klt info tab e t
 
-let whd_stack infos tab m stk = match m.mark with
+let whd_stack infos tab m stk = match fconstr_mark m with
 | Ntrl ->
   (** No need to perform [kni] nor to unlock updates because
       every head subterm of [m] is [Ntrl] *)

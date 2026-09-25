@@ -22,6 +22,9 @@ type fconstr
 (** [fconstr] can be accessed by using the function [fterm_of] and by
    matching on type [fterm] *)
 
+val fconstr_hash : fconstr -> int
+(** Unique identity of a cell, stable across reduction updates. *)
+
 type finvert
 
 type evar_repack
