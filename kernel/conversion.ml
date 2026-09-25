@@ -363,6 +363,9 @@ let rec fast_test lft1 term1 lft2 term2 = match fterm_of term1, fterm_of term2 w
   | FCLOS (c1, (e1,u1)), FCLOS (c2, (e2,u2)) ->
     eq_lift lft1 lft2 &&
     compare_under (e1, u1) c1 (e2, u2) c2
+  | FPeanoNat n1, FPeanoNat n2 ->
+    Ind.UserOrd.equal n1.peano_ind n2.peano_ind &&
+    CClosure.PeanoNatValue.equal n1.peano_value n2.peano_value
   | _ -> false
 
 let assert_reduced_constructor s =
@@ -651,6 +654,20 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
             let hd2 = eta_expand_ind env pind2 in
             eqappr cv_pb l2r infos (lft1,(hd1,v1)) (lft2,(hd2,v2)) cuniv
       else raise NotConvertible
+
+    | FPeanoNat n1, FPeanoNat n2 ->
+       if Ind.UserOrd.equal n1.peano_ind n2.peano_ind &&
+          CClosure.PeanoNatValue.equal n1.peano_value n2.peano_value
+       then convert_stacks l2r infos lft1 lft2 v1 v2 cuniv
+       else raise NotConvertible
+
+    | FPeanoNat n1, _ ->
+       eqwhnf cv_pb l2r infos
+         (lft1, (CClosure.peano_constructor_view n1, v1)) appr2 cuniv
+
+    | _, FPeanoNat n2 ->
+       eqwhnf cv_pb l2r infos
+         appr1 (lft2, (CClosure.peano_constructor_view n2, v2)) cuniv
 
     | (FConstruct (((ind1,j1),u1 as pctor1,args1)), FConstruct (((ind2,j2),u2 as pctor2),args2)) ->
       let () = assert_reduced_constructor v1 in
