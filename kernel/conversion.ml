@@ -686,7 +686,9 @@ let probed_constructor_major ?tab infos reference stack =
       | Some term when term == current -> false
       | _ ->
         let tab = match tab with Some tab -> tab | None -> create_tab () in
+        (* a case inversion inside the probe does not charge the attempt *)
         let infos = infos_with_reds infos.cnv_inf (major_reds infos.cnv_inf) in
+        let infos = infos_with_steps infos None in
         match with_bounded_private_reduction ~steps:512 infos (fun infos ->
             Option.has_some (constructor_major infos tab major)) with
         | Some true -> true
@@ -1029,11 +1031,16 @@ let memo_key infos lft1 lft2 term1 term2 =
   let reach m lft = if m = max_int then max_int else reloc_rel m lft in
   let u = min (reach m1 lft1) (reach m2 lft2) - 1 in
   let depth = Range.length infos.cnv_ctx_chain in
-  let ancestor =
-    if u <= 0 then infos.cnv_ctx
-    else if u >= depth then 0
-    else Range.get infos.cnv_ctx_chain (u - 1) in
-  let segs m lft = if m = max_int then [] else segments_from m (lift_segments lft) in
+  (* the root of a nested conversion is the enclosing reduction's context: the
+     same cell at two depths names two of its binders, so shifts are relative
+     to the root *)
+  let ancestor, below =
+    if u <= 0 then infos.cnv_ctx, 0
+    else if u >= depth then 0, depth
+    else Range.get infos.cnv_ctx_chain (u - 1), 0 in
+  let segs m lft =
+    if m = max_int then []
+    else List.map (fun (lo, d) -> (lo, d - below)) (segments_from m (lift_segments lft)) in
   { Memo.ancestor; left = segs m1 lft1; right = segs m2 lft2 }
 
 let identity_of_ctx (ctx:Constr.rel_context) =
@@ -3362,7 +3369,8 @@ let clos_gen_conv (type err) ~typed ?(strategy = plain_strategy) trans cv_pb l2r
     graph univs t1 t2 =
   NewProfile.profile "Conversion" begin fun () ->
       let reds = RedFlags.red_add_transparent RedFlags.betaiotazeta trans in
-      let infos = create_conv_infos ~univs:graph ~evars reds env in
+      let steps = Option.map ref strategy.steps in
+      let infos = infos_with_steps (create_conv_infos ~univs:graph ~evars reds env) steps in
       let module Error = struct type payload += Error of err end in
       let box e = Error.Error e in
       let infos = {
@@ -3374,7 +3382,7 @@ let clos_gen_conv (type err) ~typed ?(strategy = plain_strategy) trans cv_pb l2r
         cnv_ctx_chain = Range.empty;
         cnv_ctx_steps = CtxSteps.create 64;
         cnv_strategy = strategy;
-        cnv_steps = Option.map ref strategy.steps;
+        cnv_steps = steps;
         cnv_probe = None;
         (* a bounded attempt shares its allowance with symbolic recovery *)
         cnv_symbolic = None;
@@ -3433,6 +3441,8 @@ let checked_universes_gen qeq =
 let checked_universes = checked_universes_gen Sorts.Quality.equal
 
 let () =
+  (* a conversion started by case inversion: its own memo, the cells of the
+     enclosing reduction and the steps of the enclosing conversion *)
   let conv infos tab a b =
     try
       let box = Empty.abort in
@@ -3442,10 +3452,13 @@ let () =
         cnv_inf = infos; cnv_typ = true; lft_tab = tab; rgt_tab = tab; err_ret = box;
         cnv_rel_types = Range.empty; cnv_rel_type_lifts = Range.empty;
         cnv_ctx = 0; cnv_ctx_chain = Range.empty; cnv_ctx_steps = CtxSteps.create 64;
-        cnv_strategy = plain_strategy; cnv_steps = None; cnv_probe = None;
+        cnv_strategy = plain_strategy; cnv_steps = info_steps infos; cnv_probe = None;
         cnv_symbolic = None; cnv_symbolic_total = ref 16_384;
         cnv_symbolic_misses = Sites.create (); cnv_projections = Sites.create ();
-        cnv_failed = Applications.create (); cnv_memo = None;
+        cnv_failed = Applications.create ();
+        cnv_memo =
+          if (Environ.typing_flags (info_env infos)).unfold_dep_heuristic
+          then Some (Memo.create ()) else None;
         cnv_masks = ConstructorMasks.create 17; cnv_major_misses = MajorProbes.create 16;
       } in
       let state', _ = ccnv CONV false infos el_id el_id a b (state, checked_universes_gen qual_equal) in

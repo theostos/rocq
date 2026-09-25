@@ -199,6 +199,11 @@ val set_info_relevances : clos_infos -> Sorts.relevance Range.t -> clos_infos
 
 val info_relevances : clos_infos -> Sorts.relevance Range.t
 
+(** The step allowance of a bounded conversion, charged by the conversions
+    that reduction starts (case inversion). *)
+val info_steps : clos_infos -> int ref option
+val infos_with_steps : clos_infos -> int ref option -> clos_infos
+
 val is_irrelevant : clos_infos -> Sorts.relevance -> bool
 
 (** Relevance of the arguments of a term of the given type; [false] entries

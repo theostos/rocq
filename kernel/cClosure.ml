@@ -517,6 +517,7 @@ type clos_infos = {
   i_private : (fconstr -> fconstr) option; (* private view: copies a cell on demand *)
   i_relevances : Sorts.relevance Range.t;
   i_inspection : int ref option; (* remaining budget of an inspection *)
+  i_steps : int ref option; (* remaining steps of the enclosing bounded conversion *)
   i_cache : infos_cache }
 
 (* An inspection is a budgeted reduction in a private view of the closures:
@@ -554,6 +555,8 @@ let push_relevances infos nas =
 let set_info_relevances info r = { info with i_relevances = r }
 
 let info_relevances info = info.i_relevances
+let info_steps info = info.i_steps
+let infos_with_steps info i_steps = { info with i_steps }
 
 (**********************************************************************)
 (* The type of (machine) stacks (= lambda-bar-calculus' contexts)     *)
@@ -3368,7 +3371,7 @@ let create_infos i_mode ?univs ?evars i_flags i_env =
   let i_share = (Environ.typing_flags i_env).Declarations.share_reduction in
   let i_cache = {i_env; i_sigma = evars; i_share; i_univs; i_mode} in
   {i_flags; i_symbolic = false; i_private = None; i_relevances = Range.empty;
-   i_inspection = None; i_cache}
+   i_inspection = None; i_steps = None; i_cache}
 
 let create_conv_infos = create_infos Conversion
 let create_clos_infos = create_infos Reduction
