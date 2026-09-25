@@ -394,6 +394,18 @@ let subst_proj subst p =
 
 let subst_retro_action subst action =
   let open Retroknowledge in
+  let ind_const mk ind c =
+    let ind' = subst_ind subst ind in
+    let c' = subst_constant subst c in
+    if ind == ind' && c == c' then action else mk ind' c'
+  in
+  let bool_op mk ind c f t =
+    let ind' = subst_ind subst ind in
+    let c' = subst_constant subst c in
+    let f' = subst_constructor subst f in
+    let t' = subst_constructor subst t in
+    if ind == ind' && c == c' && f == f' && t == t' then action else mk ind' c' f' t'
+  in
   match action with
   | Register_ind(prim,ind) ->
     let ind' = subst_ind subst ind in
@@ -401,6 +413,34 @@ let subst_retro_action subst action =
   | Register_type(prim,c) ->
     let c' = subst_constant subst c in
     if c == c' then action else Register_type(prim, c')
+  | Register_peano_nat ind ->
+    let ind' = subst_ind subst ind in
+    if ind == ind' then action else Register_peano_nat ind'
+  | Register_peano_nat_double (ind, c) ->
+    ind_const (fun ind c -> Register_peano_nat_double (ind, c)) ind c
+  | Register_peano_nat_of_N (ind, n_ind, pos_ind, c) ->
+    let ind' = subst_ind subst ind in
+    let n_ind' = subst_ind subst n_ind in
+    let pos_ind' = subst_ind subst pos_ind in
+    let c' = subst_constant subst c in
+    if ind == ind' && n_ind == n_ind' && pos_ind == pos_ind' && c == c' then action
+    else Register_peano_nat_of_N (ind', n_ind', pos_ind', c')
+  | Register_peano_nat_add (ind, c) ->
+    ind_const (fun ind c -> Register_peano_nat_add (ind, c)) ind c
+  | Register_peano_nat_mul (ind, c) ->
+    ind_const (fun ind c -> Register_peano_nat_mul (ind, c)) ind c
+  | Register_peano_nat_pow (ind, c) ->
+    ind_const (fun ind c -> Register_peano_nat_pow (ind, c)) ind c
+  | Register_peano_nat_sub (ind, c) ->
+    ind_const (fun ind c -> Register_peano_nat_sub (ind, c)) ind c
+  | Register_peano_nat_div_go (ind, c) ->
+    ind_const (fun ind c -> Register_peano_nat_div_go (ind, c)) ind c
+  | Register_peano_nat_mod_go (ind, c) ->
+    ind_const (fun ind c -> Register_peano_nat_mod_go (ind, c)) ind c
+  | Register_peano_nat_beq (ind, c, f, t) ->
+    bool_op (fun ind c f t -> Register_peano_nat_beq (ind, c, f, t)) ind c f t
+  | Register_peano_nat_ble (ind, c, f, t) ->
+    bool_op (fun ind c f t -> Register_peano_nat_ble (ind, c, f, t)) ind c f t
 
 let map_kn f f' c =
   (* A module substitution is the same under binders: a shared subterm is

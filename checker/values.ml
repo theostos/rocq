@@ -489,6 +489,17 @@ let v_retro_action =
   v_sum "retro_action" 0 [|
     [|v_prim_ind; v_ind|];
     [|v_prim_type; v_cst|];
+    [|v_ind|];
+    [|v_ind; v_cst|];
+    [|v_ind; v_ind; v_ind; v_cst|];
+    [|v_ind; v_cst|];
+    [|v_ind; v_cst|];
+    [|v_ind; v_cst|];
+    [|v_ind; v_cst; v_cons; v_cons|];
+    [|v_ind; v_cst|];
+    [|v_ind; v_cst|];
+    [|v_ind; v_cst|];
+    [|v_ind; v_cst; v_cons; v_cons|];
   |]
 
 let v_retroknowledge =

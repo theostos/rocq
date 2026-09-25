@@ -183,6 +183,17 @@ val is_type_in_type : GlobRef.t -> bool
 
 val register_inline : Constant.t -> unit
 val register_inductive : inductive -> 'a CPrimitives.prim_ind -> unit
+val register_peano_nat : inductive -> unit
+val register_peano_nat_double : Constant.t -> unit
+val register_peano_nat_of_N : Constant.t -> unit
+val register_peano_nat_add : Constant.t -> unit
+val register_peano_nat_mul : Constant.t -> unit
+val register_peano_nat_pow : Constant.t -> unit
+val register_peano_nat_sub : Constant.t -> unit
+val register_peano_nat_div_go : Constant.t -> unit
+val register_peano_nat_mod_go : Constant.t -> unit
+val register_peano_nat_beq : Constant.t -> unit
+val register_peano_nat_ble : Constant.t -> unit
 
 (** {6 Oracle } *)
 

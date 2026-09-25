@@ -8,6 +8,8 @@ open CErrors
 type _ action_kind =
   | IncompatTypes : _ prim_type -> Constant.t action_kind
   | IncompatInd : _ prim_ind -> inductive action_kind
+  | IncompatPeanoOperation : string -> Constant.t action_kind
+  | IncompatPeanoConstructor : string -> constructor action_kind
 
 type exn += IncompatibleDeclarations : 'a action_kind * 'a * 'a -> exn
 
@@ -19,8 +21,96 @@ let check_same_inds ind i1 i2 =
   if not (Ind.UserOrd.equal i1 i2)
   then raise (IncompatibleDeclarations (IncompatInd ind, i1, i2))
 
+let check_same_peano_operation operation c1 c2 =
+  if not (Constant.UserOrd.equal c1 c2) then
+    raise (IncompatibleDeclarations (IncompatPeanoOperation operation, c1, c2))
+
+let check_same_peano_constructor description c1 c2 =
+  if not (Construct.UserOrd.equal c1 c2) then
+    raise (IncompatibleDeclarations (IncompatPeanoConstructor description, c1, c2))
+
+(* Registrations are replayed in declaration order, so the scheme of an
+   operation is always registered before it. *)
+let update_peano_nat ind f retro =
+  let rec update = function
+    | [] -> CErrors.user_err Pp.(str "Register the Peano inductive first")
+    | entry :: rest ->
+      if Ind.UserOrd.equal ind entry.peano_inductive then f entry :: rest
+      else entry :: update rest
+  in
+  { retro with retro_peano_nat = update retro.retro_peano_nat }
+
+let set_peano_operation description ind c get set retro =
+  update_peano_nat ind (fun entry ->
+    Option.iter (check_same_peano_operation description c) (get entry);
+    set entry) retro
+
+let add_peano_worker ind worker get set retro =
+  update_peano_nat ind (fun entry ->
+    if List.exists (Constant.UserOrd.equal worker) (get entry) then entry
+    else set entry (worker :: get entry)) retro
+
+let add_peano_bool_operation description ind c false_ctor true_ctor entries =
+  let same op =
+    Ind.UserOrd.equal ind op.bool_op_inductive && Constant.UserOrd.equal c op.bool_op_constant
+  in
+  match List.find_opt same entries with
+  | Some old ->
+    check_same_peano_constructor (description ^ " false result") false_ctor old.bool_op_false;
+    check_same_peano_constructor (description ^ " true result") true_ctor old.bool_op_true;
+    entries
+  | None ->
+    { bool_op_inductive = ind; bool_op_constant = c;
+      bool_op_false = false_ctor; bool_op_true = true_ctor } :: entries
+
 let add_retroknowledge retro action =
   match action with
+  | Register_peano_nat ind ->
+    let entry = {
+      peano_inductive = ind; peano_zero = (ind, 1); peano_succ = (ind, 2);
+      peano_double = None; peano_decoders = [];
+      peano_add = None; peano_mul = None; peano_pow = None; peano_sub = None;
+      peano_div_go = []; peano_mod_go = [];
+    } in
+    let known = List.exists (fun e -> Ind.UserOrd.equal ind e.peano_inductive) in
+    if known retro.retro_peano_nat then retro
+    else { retro with retro_peano_nat = retro.retro_peano_nat @ [entry] }
+  | Register_peano_nat_double (ind, c) ->
+    set_peano_operation "doubling builder" ind c (fun e -> e.peano_double)
+      (fun e -> { e with peano_double = Some c }) retro
+  | Register_peano_nat_of_N (ind, n_ind, pos_ind, c) ->
+    let decoder = { decoder_constant = c; binary_nat = n_ind; binary_positive = pos_ind } in
+    let same d =
+      Constant.UserOrd.equal d.decoder_constant c && Ind.UserOrd.equal d.binary_nat n_ind &&
+      Ind.UserOrd.equal d.binary_positive pos_ind
+    in
+    update_peano_nat ind (fun e ->
+      if List.exists same e.peano_decoders then e
+      else { e with peano_decoders = decoder :: e.peano_decoders }) retro
+  | Register_peano_nat_add (ind, c) ->
+    set_peano_operation "addition" ind c (fun e -> e.peano_add)
+      (fun e -> { e with peano_add = Some c }) retro
+  | Register_peano_nat_mul (ind, c) ->
+    set_peano_operation "multiplication" ind c (fun e -> e.peano_mul)
+      (fun e -> { e with peano_mul = Some c }) retro
+  | Register_peano_nat_pow (ind, c) ->
+    set_peano_operation "exponentiation" ind c (fun e -> e.peano_pow)
+      (fun e -> { e with peano_pow = Some c }) retro
+  | Register_peano_nat_sub (ind, c) ->
+    set_peano_operation "subtraction" ind c (fun e -> e.peano_sub)
+      (fun e -> { e with peano_sub = Some c }) retro
+  | Register_peano_nat_div_go (ind, worker) ->
+    add_peano_worker ind worker (fun e -> e.peano_div_go)
+      (fun e l -> { e with peano_div_go = l }) retro
+  | Register_peano_nat_mod_go (ind, worker) ->
+    add_peano_worker ind worker (fun e -> e.peano_mod_go)
+      (fun e l -> { e with peano_mod_go = l }) retro
+  | Register_peano_nat_beq (ind, c, false_ctor, true_ctor) ->
+    { retro with retro_peano_nat_beq = add_peano_bool_operation "equality test"
+        ind c false_ctor true_ctor retro.retro_peano_nat_beq }
+  | Register_peano_nat_ble (ind, c, false_ctor, true_ctor) ->
+    { retro with retro_peano_nat_ble = add_peano_bool_operation "less-than-or-equal test"
+        ind c false_ctor true_ctor retro.retro_peano_nat_ble }
   | Register_type(typ,c) ->
     begin match typ with
       | PT_int63 ->

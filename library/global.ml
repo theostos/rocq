@@ -242,6 +242,17 @@ let current_dirpath () =
 
 let register_inline c = globalize0 (Safe_typing.register_inline c)
 let register_inductive c r = globalize0 (Safe_typing.register_inductive c r)
+let register_peano_nat c = globalize0 (Safe_typing.register_peano_nat c)
+let register_peano_nat_double c = globalize0 (Safe_typing.register_peano_nat_double c)
+let register_peano_nat_of_N c = globalize0 (Safe_typing.register_peano_nat_of_N c)
+let register_peano_nat_add c = globalize0 (Safe_typing.register_peano_nat_add c)
+let register_peano_nat_mul c = globalize0 (Safe_typing.register_peano_nat_mul c)
+let register_peano_nat_pow c = globalize0 (Safe_typing.register_peano_nat_pow c)
+let register_peano_nat_sub c = globalize0 (Safe_typing.register_peano_nat_sub c)
+let register_peano_nat_div_go c = globalize0 (Safe_typing.register_peano_nat_div_go c)
+let register_peano_nat_mod_go c = globalize0 (Safe_typing.register_peano_nat_mod_go c)
+let register_peano_nat_beq c = globalize0 (Safe_typing.register_peano_nat_beq c)
+let register_peano_nat_ble c = globalize0 (Safe_typing.register_peano_nat_ble c)
 
 let set_strategy k l =
   globalize0 (Safe_typing.set_strategy k l)

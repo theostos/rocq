@@ -167,7 +167,8 @@ let subst_structure subst = subst_structure subst_codom subst
 (** {6 Adding a module in the environment } *)
 
 let add_retroknowledge l env =
-  List.fold_left Primred.add_retroknowledge env l
+  (* newest first; replay in declaration order *)
+  List.fold_left Primred.add_retroknowledge env (List.rev l)
 
 let rec add_structure mp sign resolver linkinfo env =
   let add_field env (l,elem) = match elem with

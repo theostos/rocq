@@ -28,12 +28,21 @@ let constants_of_opaques env opac =
 type check_state = {
   st_opaques : opaques;
   st_retro : (int * CPrimitives.prim_ind_ex) Mindmap_env.t * CPrimitives.prim_type_ex Cmap_env.t;
+  st_peano_inds : Retroknowledge.action list Mindmap_env.t;
+  st_peano_consts : Retroknowledge.action list Cmap_env.t;
 }
 
 let empty_state = {
   st_opaques = empty_opaques;
   st_retro = (Mindmap_env.empty, Cmap_env.empty);
+  st_peano_inds = Mindmap_env.empty;
+  st_peano_consts = Cmap_env.empty;
 }
+
+let apply_peano_actions env actions =
+  List.fold_left (fun env action ->
+    let () = Safe_typing.check_peano_retroknowledge env action in
+    Primred.add_retroknowledge env action) env actions
 
 let indirect_accessor : (Opaqueproof.opaque -> Opaqueproof.opaque_proofterm) ref =
   ref (fun _ -> assert false)
@@ -120,7 +129,11 @@ let check_constant_declaration env opac kn cb opacify =
     (* TODO: Some checking is performed by this function, but it looks too lightweight *)
     Primred.add_retroknowledge env (Retroknowledge.Register_type (prm, kn))
   in
-  env, opac
+  let actions = Option.default [] (Cmap_env.find_opt kn opac.st_peano_consts) in
+  let opac =
+    { opac with st_peano_consts = Cmap_env.remove kn opac.st_peano_consts }
+  in
+  apply_peano_actions env actions, opac
 
 let check_quality_mask env qmask lincheck =
   let open Sorts.Quality in
@@ -329,7 +342,15 @@ and check_structure_field env opac mp lab res opacify = function
         let opac = { opac with st_retro = (Mindmap_env.remove kn ind_retro, cst_retro) } in
         opac
       in
-      CheckInductive.check_inductive env kn mib retro, opac
+      let env = CheckInductive.check_inductive env kn mib retro in
+      let actions =
+        Option.default [] (Mindmap_env.find_opt kn opac.st_peano_inds)
+      in
+      let opac =
+        { opac with
+          st_peano_inds = Mindmap_env.remove kn opac.st_peano_inds }
+      in
+      apply_peano_actions env actions, opac
   | SFBmodule msb ->
       let mp = MPdot(mp, lab) in
       let opac = check_module env opac mp msb opacify in
@@ -358,7 +379,12 @@ let eq_prim_ind (type a b) (p : a CPrimitives.prim_ind) (q : b CPrimitives.prim_
   String.equal (CPrimitives.prim_ind_to_string p) (CPrimitives.prim_ind_to_string q)
 
 let get_retroknowlege env retro =
-  let fold (imap, cmap, extind) = function
+  (* Peano registrations are checked once their inductive or constant is *)
+  let add_ind_action ind action map =
+    Mindmap_env.add ind (Option.default [] (Mindmap_env.find_opt ind map) @ [action]) map in
+  let add_const_action c action map =
+    Cmap_env.add c (Option.default [] (Cmap_env.find_opt c map) @ [action]) map in
+  let fold (imap, cmap, extind, pinds, pcsts, env) action = match action with
   | Retroknowledge.Register_ind (prm, (ind, i)) ->
     (* Tolerate redeclarations because the kernel allows it somehow *)
     let check_prm map = match Mindmap_env.find_opt ind map with
@@ -374,27 +400,72 @@ let get_retroknowlege env retro =
     if Environ.mem_mind ind env then
       let spec = Inductive.lookup_mind_specif env (ind, i) in
       let () = Safe_typing.check_register_ind (ind, i) prm spec in
-      (imap, cmap, Mindmap_env.add ind (i, CPrimitives.PIE prm) extind)
+      (imap, cmap, Mindmap_env.add ind (i, CPrimitives.PIE prm) extind,
+       pinds, pcsts, env)
     else
-      (Mindmap_env.add ind (i, CPrimitives.PIE prm) imap, cmap, extind)
+      (Mindmap_env.add ind (i, CPrimitives.PIE prm) imap, cmap, extind,
+       pinds, pcsts, env)
   | Retroknowledge.Register_type (prm, cst) ->
     let () = assert (not (Cmap_env.mem cst cmap)) in
     let () = assert (not (Environ.mem_constant cst env)) in
-    (imap, Cmap_env.add cst (CPrimitives.PTE prm) cmap, extind)
+    (imap, Cmap_env.add cst (CPrimitives.PTE prm) cmap, extind,
+     pinds, pcsts, env)
+  | Retroknowledge.Register_peano_nat (mind, _) as action ->
+    if Environ.mem_mind mind env then
+      let env = apply_peano_actions env [action] in
+      (imap, cmap, extind, pinds, pcsts, env)
+    else
+      (imap, cmap, extind, add_ind_action mind action pinds, pcsts, env)
+  | (Retroknowledge.Register_peano_nat_double (_, c)
+    | Retroknowledge.Register_peano_nat_of_N (_, _, _, c)
+    | Retroknowledge.Register_peano_nat_add (_, c)
+    | Retroknowledge.Register_peano_nat_mul (_, c)
+    | Retroknowledge.Register_peano_nat_pow (_, c)
+    | Retroknowledge.Register_peano_nat_beq (_, c, _, _)
+    | Retroknowledge.Register_peano_nat_ble (_, c, _, _)
+    | Retroknowledge.Register_peano_nat_sub (_, c)
+    | Retroknowledge.Register_peano_nat_div_go (_, c)
+    | Retroknowledge.Register_peano_nat_mod_go (_, c)) as action ->
+    if Environ.mem_constant c env then
+      let env = apply_peano_actions env [action] in
+      (imap, cmap, extind, pinds, pcsts, env)
+    else
+      (imap, cmap, extind, pinds, add_const_action c action pcsts, env)
   in
-  let (imap, cmap, _) = List.fold_left fold (Mindmap_env.empty, Cmap_env.empty, Mindmap_env.empty) retro in
-  (imap, cmap)
+  let initial =
+    (Mindmap_env.empty, Cmap_env.empty, Mindmap_env.empty,
+     Mindmap_env.empty, Cmap_env.empty, env)
+  in
+  let imap, cmap, _, pinds, pcsts, env =
+    List.fold_left fold initial (List.rev retro)
+  in
+  env, (imap, cmap), pinds, pcsts
 
 let check_module env opac retro mp mb =
-  let retro = get_retroknowlege env retro in
-  let st = { st_opaques = opac; st_retro = retro } in
-  let { st_opaques = opac; st_retro = (imap, cmap) } = check_module env st mp mb empty_cset in
-  let () = match Mindmap_env.choose_opt imap, Cmap_env.choose_opt cmap with
-  | None, None -> ()
-  | Some (ind, _), (None | Some _) ->
+  let env, retro, pinds, pcsts = get_retroknowlege env retro in
+  let st = {
+    st_opaques = opac;
+    st_retro = retro;
+    st_peano_inds = pinds;
+    st_peano_consts = pcsts;
+  } in
+  let checked = check_module env st mp mb empty_cset in
+  let opac = checked.st_opaques in
+  let imap, cmap = checked.st_retro in
+  let () = match Mindmap_env.choose_opt imap, Cmap_env.choose_opt cmap,
+                 Mindmap_env.choose_opt checked.st_peano_inds,
+                 Cmap_env.choose_opt checked.st_peano_consts with
+  | None, None, None, None -> ()
+  | Some (ind, _), _, _, _ ->
     CErrors.user_err Pp.(str "Retroknowledge registration for unknown inductive " ++ MutInd.print ind ++ str ".")
-  | None, Some (cst, _) ->
+  | None, Some (cst, _), _, _ ->
     CErrors.user_err Pp.(str "Retroknowledge registration for unknown constant " ++ Constant.print cst ++ str ".")
+  | None, None, Some (ind, _), _ ->
+    CErrors.user_err Pp.(str "Peano registration for unknown inductive " ++
+      MutInd.print ind ++ str ".")
+  | None, None, None, Some (cst, _) ->
+    CErrors.user_err Pp.(str "Peano registration for unknown constant " ++
+      Constant.print cst ++ str ".")
   in
   opac
 
