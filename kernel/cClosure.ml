@@ -250,9 +250,16 @@ let rec stack_args_size = function
 
 let usubs_shft (n,(e,u)) = subs_shft (n, e), u
 
+module LiftMemo = Hashtbl.Make(struct
+  type t = fconstr * int
+  let equal (a, n) (b, m) = a == b && Int.equal n m
+  let hash (v, n) = Hashtbl.hash (fconstr_hash v, n)
+end)
+
 (* Lifting. Preserves sharing (useful only for cell with norm=Red).
    lft_fconstr always create a new cell, while lift_fconstr avoids it
-   when the lift is 0. *)
+   when the lift is 0. Constructor arguments are copied, so a shared DAG of
+   constructors is lifted once per cell. *)
 let rec lft_fconstr n ft =
   match ft.term with
     | (FInd _|FConstruct (_,[||])|FFlex(ConstKey _|VarKey _)|FInt _|FFloat _|FString _|FIrrelevant) -> ft
@@ -264,12 +271,28 @@ let rec lft_fconstr n ft =
     | FCoFix(cfx,e) ->
       make_fconstr Cstr (FCoFix (cfx, usubs_shft (n, e)))
     | FLIFT(k,m) -> lft_fconstr (n+k) m
-    | FConstruct (c,args) ->
-      make_fconstr Cstr (FConstruct (c, Array.Fun1.map lft_fconstr n args))
+    | FConstruct _ -> lft_construct n ft
     | FLOCKED -> assert false
     | FFlex (RelKey _) | FAtom _ | FApp _ | FProj _ | FCaseT _ | FCaseInvert _ | FProd _
     | FLetIn _ | FEvar _ | FCLOS _ | FArray _ ->
       make_fconstr (fconstr_mark ft) (FLIFT (n, ft))
+
+and lft_construct n ft =
+  let tbl = LiftMemo.create 17 in
+  let rec lift n ft =
+    match LiftMemo.find_opt tbl (ft, n) with
+    | Some v -> v
+    | None ->
+      Control.check_for_interrupt ();
+      let v = match [@ocaml.warning "-4"] ft.term with
+        | FConstruct (c, args) when not (Array.is_empty args) ->
+          make_fconstr Cstr (FConstruct (c, Array.map (lift n) args))
+        | FLIFT (k, m) -> lift (n + k) m
+        | _ -> lft_fconstr n ft in
+      LiftMemo.add tbl (ft, n) v;
+      v
+  in
+  lift n ft
 
 let lift_fconstr k f =
   if Int.equal k 0 then f else lft_fconstr k f
@@ -500,11 +523,16 @@ let mk_clos_vect env v = match v with
   [|mk_clos env v0; mk_clos env v1; mk_clos env v2; mk_clos env v3|]
 | v -> Array.Fun1.map mk_clos env v
 
-let rec subst_constr (subst,usubst as e) c =
+(* Substitution under a fixed root [e] visits a shared syntax DAG once. *)
+let subst_constr e c =
+  let tbl = lazy (Constr.Memo.create 17) in
+  let lift_ctx (depth, e) = depth + 1, usubs_lift e in
+  let rec subst_constr (depth, _ as ctx) c = Constr.Memo.visit tbl subst_rec depth ctx c
+  and subst_rec (_, (subst,usubst as e) as ctx) c =
   let c = Vars.map_constr_relevance (usubst_relevance e) c in
   match [@ocaml.warning "-4"] Constr.kind c with
 | App (f, args) ->
-  let args = Array.Fun1.map subst_constr e args in
+  let args = Array.Fun1.map subst_constr ctx args in
   begin match [@ocaml.warning "-4"] Constr.kind f with
   | Rel i ->
     begin match expand_rel i subst with
@@ -515,7 +543,7 @@ let rec subst_constr (subst,usubst as e) c =
       let head = Vars.substl (Array.rev_to_list subs') term in
       mkApp (head, args)
     end
-  | _ -> mkApp (subst_constr e f, args)
+  | _ -> mkApp (subst_constr ctx f, args)
   end
 | Rel i ->
   begin match expand_rel i subst with
@@ -527,13 +555,21 @@ let rec subst_constr (subst,usubst as e) c =
 | Case (ci, u, pms, p, iv, discr, br) ->
   let u' = usubst_instance e u in
   let c = if u == u' then c else mkCase (ci, u', pms, p, iv, discr, br) in
-  Constr.map_with_binders usubs_lift subst_constr e c
+  Constr.map_with_binders lift_ctx subst_constr ctx c
 | Array (u,elems,def,ty) ->
   let u' = usubst_instance e u in
   let c = if u == u' then c else mkArray (u',elems,def,ty) in
-  Constr.map_with_binders usubs_lift subst_constr e c
+  Constr.map_with_binders lift_ctx subst_constr ctx c
 | _ ->
-  Constr.map_with_binders usubs_lift subst_constr e c
+  Constr.map_with_binders lift_ctx subst_constr ctx c
+  in
+  subst_constr (0, e) c
+
+module QuotationMemo = Hashtbl.Make(struct
+  type t = fconstr * Esubst.lift
+  let equal (v1, l1) (v2, l2) = v1 == v2 && Esubst.eq_lift l1 l2
+  let hash (v, l) = Hashtbl.hash (fconstr_hash v, l)
+end)
 
 (** The inverse of mk_clos: move back to constr
     Assuming [Γ ⊢ lfts : Δ] and [Δ ⊢ v],
@@ -549,7 +585,26 @@ let rec subst_constr (subst,usubst as e) c =
     so we compute [Γ ⊢ comp_subs lfts σ : Ξ]
     where [comp_subs lfts σ] returns a constr substitution,
     that can be applied to [v] *)
-let rec to_constr lfts v =
+(* A shared cell is quoted once per lift. The table is local to this call,
+   since a later reduction may update the cells. *)
+let to_constr lfts v =
+  let tbl = lazy (QuotationMemo.create 31) in
+  let rec to_constr lfts v =
+    match [@ocaml.warning "-4"] v.term with
+    | FRel _ | FFlex _ | FInd _ | FAtom _ | FInt _ | FFloat _ | FString _
+    | FConstruct (_, [||]) -> to_constr_rec lfts v
+    | FCLOS (_, (s, u)) when is_subs_id s && is_lift_id lfts &&
+        UVars.Instance.is_empty u -> to_constr_rec lfts v
+    | _ ->
+      let tbl = Lazy.force tbl in
+      match QuotationMemo.find_opt tbl (v, lfts) with
+      | Some c -> c
+      | None ->
+        Control.check_for_interrupt ();
+        let c = to_constr_rec lfts v in
+        QuotationMemo.add tbl (v, lfts) c;
+        c
+  and to_constr_rec lfts v =
   match v.term with
     | FRel i -> mkRel (reloc_rel i lfts)
     | FFlex (RelKey p) -> mkRel (reloc_rel p lfts)
@@ -671,6 +726,8 @@ and lift_to_constr el = function
 
 and comp_subs el (s,u') =
   Esubst.lift_subst lift_to_constr el s, u'
+  in
+  to_constr lfts v
 
 (* This function defines the correspondence between constr and
    fconstr. When we find a closure whose substitution is the identity,
