@@ -25,6 +25,10 @@ type fconstr
 val fconstr_hash : fconstr -> int
 (** Unique identity of a cell, stable across reduction updates. *)
 
+val min_free_rel : fconstr -> int
+(** Minimum free de Bruijn index of the denoted term ([max_int] if closed);
+    bounded, 1 when unknown. *)
+
 type finvert
 
 type evar_repack

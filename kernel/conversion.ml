@@ -320,6 +320,16 @@ end)
    entries and are cleared together; 64 entries per key. Completed same-head
    applications are keyed like the failed congruences. *)
 module Memo = struct
+  (* Where two cells were compared, up to the binders neither references: the
+     ancestor context above them and each lift's action on the indices the
+     cell can use (see [memo_key]). *)
+  type key = { ancestor : int; left : (int * int) list; right : (int * int) list }
+
+  let same_key a b =
+    let segment (lo, d) (lo', d') = Int.equal lo lo' && Int.equal d d' in
+    Int.equal a.ancestor b.ancestor &&
+    List.equal segment a.left b.left && List.equal segment a.right b.right
+
   type entry = conv_pb * site
 
   type template = Term of constr | Lambda of (Name.t binder_annot * constr) list * constr
@@ -347,7 +357,7 @@ module Memo = struct
   end)
 
   type t = {
-    cells : entry list Cells.t;
+    cells : (conv_pb * key) list Cells.t;
     suspended : (entry * usubs * usubs) list Suspended.t;
     mutable size : int;
     applications : conv_pb list Applications.t;
@@ -367,14 +377,17 @@ module Memo = struct
     | Some entries -> t.size <- t.size - List.length entries; []
     | None -> []
 
-  let cached t cv_pb site c1 c2 =
+  (* the key is computed only for a known pair of cells *)
+  let cached t cv_pb key c1 c2 =
     match Cells.find_opt t.cells (c1, c2) with
-    | Some entries -> List.exists (fun (pb, s) -> pb = cv_pb && same_site s site) entries
+    | Some entries ->
+      let key = key () in
+      List.exists (fun (pb, k) -> pb = cv_pb && same_key k key) entries
     | None -> false
 
-  let remember t cv_pb site c1 c2 =
+  let remember t cv_pb key c1 c2 =
     reserve t;
-    Cells.replace t.cells (c1, c2) ((cv_pb, site) :: entries t (Cells.find_opt t.cells (c1, c2)));
+    Cells.replace t.cells (c1, c2) ((cv_pb, key) :: entries t (Cells.find_opt t.cells (c1, c2)));
     t.size <- t.size + 1
 
   (* The suspended syntax of two cells (their saved spines first): the body of
@@ -433,6 +446,7 @@ type 'e conv_tab = {
   cnv_rel_types : fconstr option Range.t;
   cnv_rel_type_lifts : lift Range.t;
   cnv_ctx : int;
+  cnv_ctx_chain : int Range.t; (* ancestors of [cnv_ctx], innermost first *)
   cnv_ctx_steps : int CtxSteps.t;
   cnv_strategy : strategy;
   cnv_steps : int ref option; (* remaining steps of a bounded attempt *)
@@ -961,18 +975,66 @@ let push_relevance ?typ ?(type_lift = el_id) infos r =
     cnv_rel_types = Range.cons typ infos.cnv_rel_types;
     cnv_rel_type_lifts = Range.cons type_lift infos.cnv_rel_type_lifts;
     cnv_ctx =
-      ctx_push infos.cnv_ctx_steps infos.cnv_ctx r.Context.binder_relevance typ_id type_lift }
+      ctx_push infos.cnv_ctx_steps infos.cnv_ctx r.Context.binder_relevance typ_id type_lift;
+    cnv_ctx_chain = Range.cons infos.cnv_ctx infos.cnv_ctx_chain }
 
 let push_relevances infos nas =
+  let ctx, chain = Array.fold_left (fun (ctx, chain) na ->
+      ctx_push infos.cnv_ctx_steps ctx na.Context.binder_relevance (-1) el_id,
+      Range.cons ctx chain)
+      (infos.cnv_ctx, infos.cnv_ctx_chain) nas in
   { infos with
     cnv_inf = CClosure.push_relevances infos.cnv_inf nas;
     cnv_rel_types =
       Array.fold_left (fun types _ -> Range.cons None types) infos.cnv_rel_types nas;
     cnv_rel_type_lifts =
       Array.fold_left (fun lifts _ -> Range.cons el_id lifts) infos.cnv_rel_type_lifts nas;
-    cnv_ctx = Array.fold_left (fun ctx na ->
-        ctx_push infos.cnv_ctx_steps ctx na.Context.binder_relevance (-1) el_id)
-        infos.cnv_ctx nas }
+    cnv_ctx = ctx; cnv_ctx_chain = chain }
+
+(* A lift is a monotone piecewise shift of de Bruijn indices: [(lo, d)] means
+   [reloc_rel i lft = i + d] from [lo] to the next segment (the last one is
+   unbounded). [segments_from m] keeps the description on the indices [>= m]. *)
+let rec segments_from m = function
+  | (_, _) :: ((lo', _) :: _ as rest) when lo' <= m -> segments_from m rest
+  | (_, d) :: rest -> (m, d) :: rest
+  | [] -> []
+
+let lift_segments (lft : lift) =
+  let rec segs = function
+    | Esubst.ELID -> [ (1, 0) ]
+    | Esubst.ELSHFT (l, k) ->
+      (* [reloc_rel i (ELSHFT (l, k)) = reloc_rel (i + k) l]: the boundaries of
+         [l] move down by [k], those below index 1 are unreachable *)
+      segments_from 1 (List.map (fun (lo, d) -> (lo - k, d + k)) (segs l))
+    | Esubst.ELLFT (k, l) ->
+      if k <= 0 then segs l
+      else (1, 0) :: List.map (fun (lo, d) -> (lo + k, d)) (segs l)
+  in
+  let rec merge = function
+    | (lo, d) :: (_, d') :: rest when Int.equal d d' -> merge ((lo, d) :: rest)
+    | x :: rest -> x :: merge rest
+    | [] -> []
+  in
+  merge (segs lft)
+
+(* Memo key of the comparison of [term1] and [term2] under [lft1], [lft2]:
+   side [i] references binders at depth [>= reloc_rel m_i lft_i] where [m_i]
+   is the minimum free index of its cell, so the innermost [u] binders below
+   both are referenced by neither side. The entry is keyed by the ancestor
+   context [u] binders up and by each lift's action on the indices [>= m_i]:
+   the same cells under lifts with the same actions, in any context with that
+   ancestor, denote the same terms of the ancestor context. *)
+let memo_key infos lft1 lft2 term1 term2 =
+  let m1 = CClosure.min_free_rel term1 and m2 = CClosure.min_free_rel term2 in
+  let reach m lft = if m = max_int then max_int else reloc_rel m lft in
+  let u = min (reach m1 lft1) (reach m2 lft2) - 1 in
+  let depth = Range.length infos.cnv_ctx_chain in
+  let ancestor =
+    if u <= 0 then infos.cnv_ctx
+    else if u >= depth then 0
+    else Range.get infos.cnv_ctx_chain (u - 1) in
+  let segs m lft = if m = max_int then [] else segments_from m (lift_segments lft) in
+  { Memo.ancestor; left = segs m1 lft1; right = segs m2 lft2 }
 
 let identity_of_ctx (ctx:Constr.rel_context) =
   Context.Rel.instance mkRel 0 ctx
@@ -2331,14 +2393,15 @@ let rec ccnv cv_pb l2r infos lft1 lft2 term1 term2 cuniv =
     (* the memo of cells before the syntactic test: it answers most repeated
        comparisons at once; the suspended syntax is captured before reduction
        overwrites the cells *)
-    let site = { left_lift = lft1; right_lift = lft2; ctx = infos.cnv_ctx } in
-    if Memo.cached memo cv_pb site term1 term2 || fast_test lft1 term1 lft2 term2 then cuniv
+    let key () = memo_key infos lft1 lft2 term1 term2 in
+    if Memo.cached memo cv_pb key term1 term2 || fast_test lft1 term1 lft2 term2 then cuniv
     else
+      let site = { left_lift = lft1; right_lift = lft2; ctx = infos.cnv_ctx } in
       let suspended = Memo.suspended_key term1 term2 in
       if Option.cata (suspended_cached memo cv_pb site) false suspended then cuniv
       else
         let cuniv = compare () in
-        Memo.remember memo cv_pb site term1 term2;
+        Memo.remember memo cv_pb (key ()) term1 term2;
         Option.iter (Memo.remember_suspended memo cv_pb site) suspended;
         cuniv
 
@@ -3308,6 +3371,7 @@ let clos_gen_conv (type err) ~typed ?(strategy = plain_strategy) trans cv_pb l2r
         cnv_rel_types = Range.empty;
         cnv_rel_type_lifts = Range.empty;
         cnv_ctx = 0;
+        cnv_ctx_chain = Range.empty;
         cnv_ctx_steps = CtxSteps.create 64;
         cnv_strategy = strategy;
         cnv_steps = Option.map ref strategy.steps;
@@ -3377,7 +3441,7 @@ let () =
       let infos = {
         cnv_inf = infos; cnv_typ = true; lft_tab = tab; rgt_tab = tab; err_ret = box;
         cnv_rel_types = Range.empty; cnv_rel_type_lifts = Range.empty;
-        cnv_ctx = 0; cnv_ctx_steps = CtxSteps.create 64;
+        cnv_ctx = 0; cnv_ctx_chain = Range.empty; cnv_ctx_steps = CtxSteps.create 64;
         cnv_strategy = plain_strategy; cnv_steps = None; cnv_probe = None;
         cnv_symbolic = None; cnv_symbolic_total = ref 16_384;
         cnv_symbolic_misses = Sites.create (); cnv_projections = Sites.create ();

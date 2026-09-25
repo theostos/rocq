@@ -181,6 +181,7 @@ type fconstr = {
   mutable state : int;
   mutable term: fterm;
   mutable symbolic : symbolic_view;
+  mutable free : int; (* memoised [min_free_rel]: 0 unknown, [max_int] closed *)
 }
 
 (* Sharing overwrites a reduced cell with its value: the cell keeps a copy of
@@ -238,7 +239,7 @@ let next_uid = Atomic.make 0
 
 let fresh_fconstr mark term =
   { state = Atomic.fetch_and_add next_uid 1 lsl 2 lor mark_code mark; term;
-    symbolic = NoSymbolicView }
+    symbolic = NoSymbolicView; free = 0 }
 
 (* Content-addressed cells: closures with the same constructor, syntax, child
    cells and (shallowly) the same substitution denote the same term and share
@@ -355,6 +356,66 @@ let with_cells tab f =
 let get_invert fiv = fiv
 
 let fterm_of v = v.term
+
+(* Minimum free de Bruijn index of the term a cell denotes, relative to its
+   frame; [max_int] when closed. Unknown shapes and an exhausted fuel answer
+   1, the conservative value. *)
+exception Min_free_exhausted
+exception Min_free_one
+let min_free_rel (v : fconstr) : int =
+  let fuel = ref 4096 in
+  let visit () = if !fuel <= 0 then raise Min_free_exhausted; decr fuel in
+  let rec cell v =
+    if v.free > 0 then v.free else begin
+      visit ();
+      let result = match v.term with
+        | FRel n -> n
+        | FAtom _ | FFlex (ConstKey _ | VarKey _ | RelKey _) | FInd _ | FInt _ | FFloat _
+        | FString _ | FPeanoNat _ | FIrrelevant -> max_int
+        | FConstruct (_, args) -> cells args
+        | FApp (h, args) -> min (cell h) (cells args)
+        | FProj (_, _, c) -> cell c
+        | FLIFT (k, t) -> let m = cell t in if m = max_int then m else m + k
+        | FCLOS (t, e) -> constr e 0 t
+        | FLambda (_, tys, body, e) ->
+          let rec domains depth acc = function
+            | [] -> min acc (constr e depth body)
+            | (_, ty) :: rest -> domains (depth + 1) (min acc (constr e depth ty)) rest
+          in domains 0 max_int tys
+        | FProd (_, ty, body, e) -> min (cell ty) (constr e 1 body)
+        | FLetIn (_, b, ty, body, e) -> min (min (cell b) (cell ty)) (constr e 1 body)
+        | FFix ((_, (names, tys, bodies)), e) | FCoFix ((_, (names, tys, bodies)), e) ->
+          let n = Array.length names in
+          let acc = Array.fold_left (fun acc ty -> min acc (constr e 0 ty)) max_int tys in
+          Array.fold_left (fun acc b -> min acc (constr e n b)) acc bodies
+        | FCaseT _ | FCaseInvert _ | FEvar _ | FArray _ | FLOCKED -> 1
+      in
+      (* reduction never frees a variable: the value stays a lower bound *)
+      v.free <- result; result
+    end
+  and cells args = Array.fold_left (fun acc c -> min acc (cell c)) max_int args
+  and constr (e, _) depth t =
+    let best = ref max_int in
+    let rec go depth t =
+      visit ();
+      match [@ocaml.warning "-4"] kind t with
+      | Rel i ->
+        if i > depth then begin
+          let j = i - depth in
+          (match expand_rel j e with
+          | Inl (k, Regular v) ->
+            let m = cell v in
+            if m <> max_int then best := min !best (m + k)
+          | Inl (_, HigherOrder _) -> best := 1
+          | Inr (k, None) -> best := min !best k
+          | Inr (_, Some _) -> ());
+          if !best <= 1 then raise Min_free_one
+        end
+      | _ -> Constr.iter_with_binders succ go depth t
+    in
+    (try go depth t with Min_free_one -> ()); !best
+  in
+  try cell v with Min_free_exhausted -> (if v.free = 0 then v.free <- 1); 1
 
 (* The former spine of a cell (or the cell itself) when its head, followed
    without reduction, is a flex. *)
