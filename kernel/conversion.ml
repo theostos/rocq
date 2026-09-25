@@ -595,13 +595,18 @@ let record_wrapper infos reference stack =
 (* Which side to unfold when both can be: a decisive oracle priority is only
    overridden by a direct occurrence of the other head (Lean exposes a
    projected field before consulting delta hints); on a tie, the dependency
-   graph, then a constructor argument, then the oracle's fallback. *)
+   graph, then a constructor argument, then the fallback: the side that is
+   not an elimination over a compact natural, else the oracle. *)
 type unfolding_action = Unfold_left | Unfold_right | Unfold_both
 
 let unfolding_side left = if left then Unfold_left else Unfold_right
 
-let choose_unfolding_action ~order ~l2r ~heuristic ~direct_dependency ~dependency ~constructor =
-  let fallback () = match order with
+let choose_unfolding_action ~order ~l2r ~heuristic ~compact:(compact1, compact2)
+    ~direct_dependency ~dependency ~constructor =
+  let fallback () =
+    (* an elimination over a compact natural stays closed *)
+    if compact1 <> compact2 then unfolding_side compact2 else
+    match order with
     | Conv_oracle.Left -> Unfold_left
     | Conv_oracle.Right -> Unfold_right
     | Conv_oracle.Same -> if heuristic then Unfold_both else unfolding_side l2r
@@ -1705,17 +1710,19 @@ let has_type_elimination_stack stack =
   inspect 4096 stack
 
 (* The inductive type of a flex under [stack], with the caller's transparency. *)
-let flex_has_inductive infos lft stack fl ind =
+let flex_inductive infos lft stack fl =
   let fl = match fl with
     | RelKey n -> RelKey (reloc_rel n (el_stack lft stack))
     | VarKey _ | ConstKey _ -> fl in
   let all = RedFlags.(red_add_transparent all (red_transparent (info_flags infos.cnv_inf))) in
-  let result = Option.bind (flex_type infos fl) (fun typ ->
+  Option.bind (flex_type infos fl) (fun typ ->
     try with_type_snapshot infos typ stack (fun infos typ stack _ ->
       type_after_stack ~classify:direct_inductive
         (infos_with_reds infos.cnv_inf all) (create_tab ()) typ stack)
-    with Not_found | Assert_failure _ -> None) in
-  Option.cata (Ind.UserOrd.equal ind) false result
+    with Not_found | Assert_failure _ -> None)
+
+let flex_has_inductive infos lft stack fl ind =
+  Option.cata (Ind.UserOrd.equal ind) false (flex_inductive infos lft stack fl)
 
 let flex_has_unit_like infos lft stack fl ind =
   Option.cata (Ind.UserOrd.equal ind) false (unit_like_of_flex infos lft stack fl)
@@ -1768,7 +1775,7 @@ let unfoldable infos = function
 
 let is_constructor_head infos tab argument =
   let head, _ = whd_stack (infos_with_reds infos.cnv_inf RedFlags.betazeta) tab argument [] in
-  match fterm_of head with FConstruct _ -> true | _ -> false
+  match fterm_of head with FConstruct _ | FPeanoNat _ -> true | _ -> false
 
 let has_constructor_argument infos tab stack =
   List.exists (function
@@ -1915,12 +1922,167 @@ let dependency_side infos ~transitive fl1 t1 v1 fl2 t2 v2 =
      | _ -> None)
   | (ConstKey _ | VarKey _ | RelKey _), _ -> None
 
+(* The registered compact Peano operations, which the reduction machine
+   evaluates on compact naturals. *)
+let compact_peano_operations env =
+  let open! Retroknowledge in
+  let retro = Environ.retroknowledge env in
+  List.concat_map (fun (s : peano_nat) ->
+    List.filter_map (fun c -> c)
+      [s.peano_double; s.peano_add; s.peano_mul; s.peano_pow; s.peano_sub]
+    @ s.peano_div_go @ s.peano_mod_go
+    @ List.map (fun d -> d.decoder_constant) s.peano_decoders) retro.retro_peano_nat
+  @ List.map (fun op -> op.bool_op_constant) (retro.retro_peano_nat_beq @ retro.retro_peano_nat_ble)
+
+let is_compact_peano_operation infos constant =
+  List.exists (Constant.UserOrd.equal constant) (compact_peano_operations (info_env infos.cnv_inf))
+
+(* [constant] is, or depends on, a compact operation; an exhausted search is
+   no evidence. *)
+let backed_by_compact_operation ~fuel env constant =
+  List.exists (fun operation ->
+    Constant.UserOrd.equal constant operation ||
+    Environ.constant_depends_on ~fuel env constant operation = Some true)
+    (compact_peano_operations env)
+
+(* An inductive with two constructors of one Peano argument each (integers). *)
+let is_compact_peano_wrapper env ind =
+  let retro = Environ.retroknowledge env in
+  let is_peano_type typ =
+    match Constr.kind (fst (Constr.decompose_app typ)) with
+    | Ind (candidate, _) ->
+      List.exists (fun s -> Ind.UserOrd.equal candidate s.Retroknowledge.peano_inductive)
+        retro.Retroknowledge.retro_peano_nat
+    | _ -> false
+  in
+  try
+    let mib, mip = Inductive.lookup_mind_specif env ind in
+    Int.equal (Array.length mib.mind_packets) 1 && Int.equal mib.mind_nparams 0 &&
+    Int.equal (Array.length mip.mind_consnames) 2 &&
+    Array.for_all (Int.equal 1) mip.mind_consnrealargs &&
+    Array.for_all (fun (context, _) -> match context with
+      | [declaration] -> is_peano_type (Context.Rel.Declaration.get_type declaration)
+      | _ -> false) mip.mind_nf_lc
+  with Not_found -> false
+
+(* The unfolded application is a fixpoint eliminating a compact natural. *)
+let compact_elimination infos tab term stack =
+  let head, stack = whd_stack (infos_with_reds infos.cnv_inf RedFlags.betazeta) tab term stack in
+  match fterm_of head, stack with
+  | FPeanoNat _, Zfix _ :: _ -> true
+  | _ -> false
+
+(* Whether the process [term] under [stack] is closed and mentions a constant
+   backed by a compact operation. Substitutions are inspected, nothing is
+   quoted, reduced or updated; an unsupported cell, an aliased update or an
+   exhausted budget declines. *)
+let closed_compact_process infos term stack =
+  let exception Unknown in
+  let remaining = ref 1024 in
+  let updates = ref [] in
+  let constants = ref [] in
+  let visit () = if Int.equal !remaining 0 then raise Unknown; decr remaining in
+  let binder depth = visit (); depth + 1 in
+  let rec syntax subst depth term =
+    visit ();
+    match Constr.kind term with
+    | Rel index when index > depth ->
+      (match Option.bind subst (fun subst -> inspect_substituted_rel subst (index - depth)) with
+       | Some term -> closure term
+       | None -> raise Unknown)
+    | Const (c, _) -> constants := c :: !constants
+    | Evar _ -> raise Unknown
+    | _ -> Constr.iter_with_binders binder (syntax subst) depth term
+  and closure term =
+    visit ();
+    if List.memq term !updates then raise Unknown;
+    match fterm_of term with
+    | FFlex (ConstKey (c, _)) -> constants := c :: !constants
+    | FFlex (VarKey _) | FInd _ | FInt _ | FFloat _ | FString _ | FPeanoNat _ -> ()
+    | FAtom term -> syntax None 0 term
+    | FConstruct (_, args) -> Array.iter closure args
+    | FApp (head, args) -> closure head; Array.iter closure args
+    | FProj (_, _, term) | FLIFT (_, term) -> closure term
+    | FCLOS (term, subst) -> syntax (Some subst) 0 term
+    | FLambda (len, domains, body, subst) ->
+      let rec inspect depth = function
+        | [] ->
+          if not (Int.equal depth len) then raise Unknown;
+          syntax (Some subst) len body
+        | (_, domain) :: rest ->
+          visit ();
+          syntax (Some subst) depth domain;
+          inspect (binder depth) rest
+      in
+      inspect 0 domains
+    | FRel _ | FFlex (RelKey _) | FFix _ | FCoFix _ | FCaseT _ | FCaseInvert _ | FProd _
+    | FLetIn _ | FEvar _ | FArray _ | FIrrelevant | FLOCKED -> raise Unknown
+  in
+  let rec collect_updates = function
+    | [] -> ()
+    | frame :: rest ->
+      visit ();
+      (match frame with
+       | Zapp _ | Zproj _ | Zshift _ -> ()
+       | Zupdate target ->
+         if List.memq target !updates then raise Unknown;
+         updates := target :: !updates
+       | Zfix _ | ZcaseT _ | Zprimitive _ -> raise Unknown);
+      collect_updates rest
+  in
+  let rec frames = function
+    | [] -> ()
+    | frame :: rest ->
+      visit ();
+      (match frame with
+       | Zapp args -> Array.iter closure args
+       | Zproj _ | Zshift _ | Zupdate _ -> ()
+       | Zfix _ | ZcaseT _ | Zprimitive _ -> raise Unknown);
+      frames rest
+  in
+  try
+    collect_updates stack;
+    closure term;
+    frames stack;
+    (* the dependency queries run once the process is known to be closed *)
+    let fuel = ref 16_384 in
+    List.exists (backed_by_compact_operation ~fuel (info_env infos.cnv_inf)) (List.rev !constants)
+  with Unknown | Assert_failure _ -> false
+
+(* Two closed applications of different constants that are compact operations,
+   or are backed by them and return the same wrapper of a Peano type (an
+   operation behind a projection), neither eliminating a compact natural nor
+   depending on the other: reduced independently to weak-head form instead of
+   being unfolded alternately (2 * 2^31 against 2^32). *)
+let independent_compact_applications infos ~compact:(compact1, compact2)
+    lft1 fl1 t1 s1 lft2 fl2 t2 s2 =
+  let env = info_env infos.cnv_inf in
+  dep_heuristic infos &&
+  match fl1, fl2 with
+  | ConstKey (c1, _), ConstKey (c2, _) when not (Constant.UserOrd.equal c1 c2) ->
+    let closed_wrapper_results () =
+      closed_compact_process infos t1 s1 && closed_compact_process infos t2 s2 &&
+      match flex_inductive infos lft1 s1 fl1, flex_inductive infos lft2 s2 fl2 with
+      | Some ind1, Some ind2 when Ind.UserOrd.equal ind1 ind2 -> is_compact_peano_wrapper env ind1
+      | _ -> false
+    in
+    ((is_compact_peano_operation infos c1 && is_compact_peano_operation infos c2) ||
+     closed_wrapper_results ()) &&
+    not (compact1 || compact2) &&
+    (let fuel = ref 16_384 in
+     match Environ.constant_depends_on ~fuel env c1 c2,
+           Environ.constant_depends_on ~fuel env c2 c1 with
+     | Some false, Some false -> true
+     | _ -> false)
+  | _ -> false
+
 (* Which side to unfold when both do, [t1] under [s1] and [t2] under [s2]
    being the unfolded applications and [eliminates] telling which original
    application eliminates a constructor: that side, unless the other is a
    direct alias of its head; then a projected record wrapper on one side
    only; then the oracle and the dependencies. *)
-let unfolding_action infos l2r ~eliminates:(constructor1, constructor2) fl1 (t1, s1) fl2 (t2, s2) =
+let unfolding_action infos l2r ~eliminates:(constructor1, constructor2) ~compact
+    fl1 (t1, s1) fl2 (t2, s2) =
   let env = info_env infos.cnv_inf in
   if constructor1 <> constructor2 then
     if constructor1 && direct_head_alias env fl2 fl1 then Unfold_right
@@ -1944,7 +2106,7 @@ let unfolding_action infos l2r ~eliminates:(constructor1, constructor2) fl1 (t1,
     | (ConstKey _ | VarKey _ | RelKey _), _ -> false
   in
   let global_constants = match fl1, fl2 with ConstKey _, ConstKey _ -> true | _ -> false in
-  choose_unfolding_action ~order ~l2r ~heuristic:(global_constants && dep_heuristic infos)
+  choose_unfolding_action ~order ~l2r ~heuristic:(global_constants && dep_heuristic infos) ~compact
     ~direct_dependency:(fun () -> dependency_side infos ~transitive:false fl1 t1 s1 fl2 t2 s2)
     ~dependency:(fun () -> dependency_side infos ~transitive:true fl1 t1 s1 fl2 t2 s2)
     ~constructor:(fun () -> constructor_argument_side infos ~same_reference s1 s2)
@@ -2676,12 +2838,31 @@ and eq_flex_flex cv_pb l2r infos (lft1, (hd1, v1)) (lft2, (hd2, v2)) fl1 fl2 cun
       eqwhnf cv_pb l2r infos appr1 (lft2, t2) cuniv
     | Some (t1, s1), Some (t2, s2) ->
       let ninfos = infos_with_reds infos.cnv_inf RedFlags.betaiotazeta in
+      let compact1 = compact_elimination infos infos.lft_tab t1 s1 in
+      let compact2 = compact_elimination infos infos.rgt_tab t2 s2 in
+      let prefix_congruence () =
+        if dep_heuristic infos && (compact1 || compact2)
+        then compact_prefix_congruence cv_pb l2r infos (lft1, hd1, s1) (lft2, hd2, s2) cuniv
+        else None
+      in
+      begin match prefix_congruence () with
+      | Some cuniv -> cuniv
+      | None ->
       let () = Control.check_for_interrupt () in
+      if independent_compact_applications infos ~compact:(compact1, compact2)
+          lft1 fl1 t1 s1 lft2 fl2 t2 s2
+      then
+        let appr1 = whd_stack (infos_with_reds infos.cnv_inf all) infos.lft_tab t1 s1 in
+        let appr2 = whd_stack (infos_with_reds infos.cnv_inf all) infos.rgt_tab t2 s2 in
+        eqwhnf cv_pb l2r infos (lft1, appr1) (lft2, appr2) cuniv
+      else
       (* the original applications: compact arithmetic may have consumed
          arguments of the unfolded ones *)
       let eliminates =
         eliminates_constructor infos fl1 v1, eliminates_constructor infos fl2 v2 in
-      begin match unfolding_action infos l2r ~eliminates fl1 (t1, s1) fl2 (t2, s2) with
+      let action = unfolding_action infos l2r ~eliminates ~compact:(compact1, compact2)
+          fl1 (t1, s1) fl2 (t2, s2) in
+      match action with
       | Unfold_left ->
         let t1, s1 = expose_selected infos.lft_tab fl1 v1 (t1, s1) in
         let appr1 = whd_stack ninfos infos.lft_tab t1 s1 in
@@ -2698,6 +2879,36 @@ and eq_flex_flex cv_pb l2r infos (lft1, (hd1, v1)) (lft2, (hd2, v2)) fl1 fl2 cun
         let appr2 = whd_stack ninfos infos.rgt_tab t2 s2 in
         eqwhnf cv_pb l2r infos (lft1, appr1) (lft2, appr2) cuniv
       end
+
+(* Before an elimination over a compact natural is forced, congruence on the
+   outermost application: the function prefixes may be convertible while
+   reducing either application would traverse a large recursion. The last
+   arguments and the prefixes are quoted (one budget for all four) into fresh
+   closures, so that the bounded probe cannot update shared cells. *)
+and compact_prefix_congruence cv_pb l2r infos (lft1, hd1, s1) (lft2, hd2, s2) cuniv =
+  let updates_only = List.for_all (function Zupdate _ -> true | _ -> false) in
+  match s1, s2 with
+  | Zapp args1 :: rest1, Zapp args2 :: rest2
+    when Int.equal (Array.length args1) (Array.length args2) &&
+         updates_only rest1 && updates_only rest2 &&
+         Array.length args1 > 0 && Array.length args1 <= 2047 ->
+    let last = Array.length args1 - 1 in
+    let subst = subs_id (Range.length (info_relevances infos.cnv_inf)), UVars.Instance.empty in
+    let remaining = ref 65_536 in
+    let fresh lift term =
+      if not (small_reification remaining term) then raise NotConvertible;
+      mk_clos subst (Vars.exliftn lift (term_of_fconstr term))
+    in
+    let prefix head args =
+      zip head (if Int.equal last 0 then [] else [Zapp (Array.sub args 0 last)]) in
+    (try
+       Some (bounded_congruence infos (fun infos ->
+         let cuniv = ccnv CONV l2r infos el_id el_id
+             (fresh lft1 args1.(last)) (fresh lft2 args2.(last)) cuniv in
+         ccnv cv_pb l2r infos el_id el_id
+           (fresh lft1 (prefix hd1 args1)) (fresh lft2 (prefix hd2 args2)) cuniv))
+     with NotConvertible | NotConvertibleTrace _ -> None)
+  | _ -> None
 
 (* [constructor_first] compares the arguments of the head that are a
    constructor on one side only before the others, so that a mismatch is
