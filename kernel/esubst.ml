@@ -357,6 +357,46 @@ let rec comp mk lft s1 = function
   Cons (h, t, rem)
 
 
+(* Shallow structural equality and a bounded hash of a substitution: values are
+   compared by [eq] (typically physical equality), so that structurally
+   identical substitutions can share closures without inspecting their terms. *)
+let eq_or_var eq a b = match a, b with
+  | Arg x, Arg y -> eq x y
+  | Var n, Var m -> Int.equal n m
+  | (Arg _ | Var _), _ -> false
+
+let rec eq_tree eq t1 t2 = t1 == t2 || match t1, t2 with
+  | Leaf (w1, x1), Leaf (w2, x2) -> Int.equal w1 w2 && eq_or_var eq x1 x2
+  | Node (w1, x1, l1, r1, _), Node (w2, x2, l2, r2, _) ->
+    Int.equal w1 w2 && eq_or_var eq x1 x2 && eq_tree eq l1 l2 && eq_tree eq r1 r2
+  | (Leaf _ | Node _), _ -> false
+
+let rec eq_subs eq s1 s2 = s1 == s2 || match s1, s2 with
+  | Nil (w1, n1), Nil (w2, n2) -> Int.equal w1 w2 && Int.equal n1 n2
+  | Cons (h1, t1, r1), Cons (h2, t2, r2) ->
+    Int.equal h1 h2 && eq_tree eq t1 t2 && eq_subs eq r1 r2
+  | (Nil _ | Cons _), _ -> false
+
+let hash_subs h s =
+  let combine = Hashset.Combine.combine in
+  let or_var = function Arg x -> h x | Var n -> n * 65599 + 1 in
+  let rec tree acc fuel t =
+    if fuel <= 0 then acc, 0 else match t with
+    | Leaf (w, x) -> combine (combine acc w) (or_var x), fuel - 1
+    | Node (w, x, l, r, _) ->
+      let acc = combine (combine acc w) (or_var x) in
+      let acc, fuel = tree acc (fuel - 1) l in
+      tree acc fuel r
+  in
+  let rec subs acc fuel s =
+    if fuel <= 0 then acc else match s with
+    | Nil (w, n) -> combine (combine acc w) n
+    | Cons (hh, t, r) ->
+      let acc, fuel = tree (combine acc hh) fuel t in
+      subs acc fuel r
+  in
+  subs 0 64 s
+
 module Internal =
 struct
 

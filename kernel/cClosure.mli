@@ -177,7 +177,12 @@ val create_clos_infos :
   ?univs:UGraph.t -> ?evars:evar_handler -> reds -> env -> clos_infos
 val oracle_of_infos : clos_infos -> Conv_oracle.oracle
 
-val create_tab : unit -> clos_tab
+val create_tab : ?shared:bool -> unit -> clos_tab
+(** With [shared], structurally identical cells built while reducing with the
+    table are one cell: for the tables of a conversion problem. *)
+
+val with_sharing : clos_infos -> clos_tab -> (unit -> 'a) -> 'a
+(** Run a closure construction with the sharing of [whd_stack] on this table. *)
 
 val info_env : clos_infos -> env
 val info_flags: clos_infos -> reds

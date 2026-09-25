@@ -459,6 +459,10 @@ let fail_check (infos : 'err conv_tab) (state, check) = match state with
 
 let dep_heuristic infos = (Environ.typing_flags (info_env infos.cnv_inf)).unfold_dep_heuristic
 
+(* The closures of a side are built with the cells of its table. *)
+let lft_cells infos f = with_sharing infos.cnv_inf infos.lft_tab f
+let rgt_cells infos f = with_sharing infos.cnv_inf infos.rgt_tab f
+
 exception Probe_budget_exhausted
 exception Strategy_budget_exhausted
 exception Symbolic_budget_exhausted
@@ -2692,8 +2696,8 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
            we throw them away *)
         if not (is_empty_stack v1 && is_empty_stack v2) then
           anomaly (Pp.str "conversion was given ill-typed terms (FLambda).");
-        let (x1,ty1,bd1) = destFLambda mk_clos hd1 in
-        let (_,ty2,bd2) = destFLambda mk_clos hd2 in
+        let (x1,ty1,bd1) = lft_cells infos (fun () -> destFLambda mk_clos hd1) in
+        let (_,ty2,bd2) = rgt_cells infos (fun () -> destFLambda mk_clos hd2) in
         let el1 = el_stack lft1 v1 in
         let el2 = el_stack lft2 v2 in
         let cuniv = ccnv CONV l2r infos el1 el2 ty1 ty2 cuniv in
@@ -2711,7 +2715,8 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
         let x1 = usubst_binder e x1 in
         ccnv cv_pb l2r (push_relevance ~typ:c1 ~type_lift:el1 infos x1)
           (el_lift el1) (el_lift el2)
-          (mk_clos (usubs_lift e) c2) (mk_clos (usubs_lift e') c'2) cuniv
+          (lft_cells infos (fun () -> mk_clos (usubs_lift e) c2))
+          (rgt_cells infos (fun () -> mk_clos (usubs_lift e') c'2)) cuniv
 
     (* Eta-expansion on the fly *)
     | (FLambda _, _) ->
@@ -2720,7 +2725,7 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
         | _ ->
           anomaly (Pp.str "conversion was given unreduced term (FLambda).")
         in
-        let (x1,ty1,bd1) = destFLambda mk_clos hd1 in
+        let (x1,ty1,bd1) = lft_cells infos (fun () -> destFLambda mk_clos hd1) in
         let infos = push_relevance ~typ:ty1 ~type_lift:lft1 infos x1 in
         eqappr CONV l2r infos
           (el_lift lft1, (bd1, [])) (el_lift lft2, (hd2, eta_expand_stack infos.cnv_inf x1 v2)) cuniv
@@ -2730,7 +2735,7 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
         | _ ->
           anomaly (Pp.str "conversion was given unreduced term (FLambda).")
         in
-        let (x2,ty2,bd2) = destFLambda mk_clos hd2 in
+        let (x2,ty2,bd2) = rgt_cells infos (fun () -> destFLambda mk_clos hd2) in
         let infos = push_relevance ~typ:ty2 ~type_lift:lft2 infos x2 in
         eqappr CONV l2r infos
           (el_lift lft1, (hd1, eta_expand_stack infos.cnv_inf x2 v1)) (el_lift lft2, (bd2, [])) cuniv
@@ -2860,10 +2865,10 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
         if Int.equal i1 i2 && Array.equal Int.equal op1 op2
         then
           let n = Array.length cl1 in
-          let fty1 = Array.map (mk_clos e1) tys1 in
-          let fty2 = Array.map (mk_clos e2) tys2 in
-          let fcl1 = Array.map (mk_clos (usubs_liftn n e1)) cl1 in
-          let fcl2 = Array.map (mk_clos (usubs_liftn n e2)) cl2 in
+          let fty1, fcl1 = lft_cells infos (fun () ->
+            Array.map (mk_clos e1) tys1, Array.map (mk_clos (usubs_liftn n e1)) cl1) in
+          let fty2, fcl2 = rgt_cells infos (fun () ->
+            Array.map (mk_clos e2) tys2, Array.map (mk_clos (usubs_liftn n e2)) cl2) in
           let el1 = el_stack lft1 v1 in
           let el2 = el_stack lft2 v2 in
           let cuniv = convert_vect l2r infos el1 el2 fty1 fty2 cuniv in
@@ -2880,10 +2885,10 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
         if Int.equal op1 op2
         then
           let n = Array.length cl1 in
-          let fty1 = Array.map (mk_clos e1) tys1 in
-          let fty2 = Array.map (mk_clos e2) tys2 in
-          let fcl1 = Array.map (mk_clos (usubs_liftn n e1)) cl1 in
-          let fcl2 = Array.map (mk_clos (usubs_liftn n e2)) cl2 in
+          let fty1, fcl1 = lft_cells infos (fun () ->
+            Array.map (mk_clos e1) tys1, Array.map (mk_clos (usubs_liftn n e1)) cl1) in
+          let fty2, fcl2 = rgt_cells infos (fun () ->
+            Array.map (mk_clos e2) tys2, Array.map (mk_clos (usubs_liftn n e2)) cl2) in
           let el1 = el_stack lft1 v1 in
           let el2 = el_stack lft2 v2 in
           let cuniv = convert_vect l2r infos el1 el2 fty1 fty2 cuniv in
@@ -2922,8 +2927,8 @@ and eqwhnf cv_pb l2r infos (lft1, (hd1, v1) as appr1) (lft2, (hd2, v2) as appr2)
         let u2 = CClosure.usubst_instance e2 u2 in
         fail_check infos @@ convert_inductives CONV ind nargs u1 u2 cuniv
       in
-      let pms1 = mk_clos_vect e1 pms1 in
-      let pms2 = mk_clos_vect e2 pms2 in
+      let pms1 = lft_cells infos (fun () -> mk_clos_vect e1 pms1) in
+      let pms2 = rgt_cells infos (fun () -> mk_clos_vect e2 pms2) in
       let cuniv = Array.fold_right2 fold pms1 pms2 cuniv in
       let cuniv = Array.fold_right2 fold (get_invert iv1) (get_invert iv2) cuniv in
       let cuniv = convert_return_clause mind mip l2r infos e1 e2 el1 el2 u1 u2 pms1 pms2 p1 p2 cuniv in
@@ -3186,8 +3191,8 @@ and convert_stacks ?(mask = [||]) ?(constructor_first = false)
                     | Some variances -> convert_instances_cumul CONV variances u1 u2 cu
                 in
                 let cu = fail_check infos cu in
-                let pms1 = mk_clos_vect e1 pms1 in
-                let pms2 = mk_clos_vect e2 pms2 in
+                let pms1 = lft_cells infos (fun () -> mk_clos_vect e1 pms1) in
+                let pms2 = rgt_cells infos (fun () -> mk_clos_vect e2 pms2) in
                 let fold_params c1 c2 accu = f (l1, c1) (l2, c2) accu in
                 let cu = Array.fold_right2 fold_params pms1 pms2 cu in
                 let cu = convert_return_clause mind mip l2r infos e1 e2 l1 l2 u1 u2 pms1 pms2 p1 p2 cu in
@@ -3249,7 +3254,8 @@ and convert_under_context l2r infos e1 e2 lft1 lft2 ctx (nas1, c1) (nas2, c2) cu
   let lft1 = el_liftn n lft1 in
   let lft2 = el_liftn n lft2 in
   let infos = push_relevances infos (Array.map (usubst_binder e1) nas1) in
-  ccnv CONV l2r infos lft1 lft2 (mk_clos e1 c1) (mk_clos e2 c2) cu
+  ccnv CONV l2r infos lft1 lft2
+    (lft_cells infos (fun () -> mk_clos e1 c1)) (rgt_cells infos (fun () -> mk_clos e2 c2)) cu
 
 and convert_return_clause mib mip l2r infos e1 e2 l1 l2 u1 u2 pms1 pms2 p1 p2 cu =
   let ctx =
@@ -3317,8 +3323,8 @@ let clos_gen_conv (type err) ~typed ?(strategy = plain_strategy) trans cv_pb l2r
           then Some (Memo.create ()) else None;
         cnv_masks = ConstructorMasks.create 17;
         cnv_major_misses = MajorProbes.create 16;
-        lft_tab = create_tab ();
-        rgt_tab = create_tab ();
+        lft_tab = create_tab ~shared:true ();
+        rgt_tab = create_tab ~shared:true ();
         err_ret = box;
       } in
       try Result.Ok (ccnv cv_pb l2r infos el_id el_id (inject t1) (inject t2) univs)

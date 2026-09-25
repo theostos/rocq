@@ -236,9 +236,121 @@ let set_fconstr_mark v mark = v.state <- v.state land lnot 3 lor mark_code mark
 
 let next_uid = Atomic.make 0
 
-let make_fconstr mark term =
+let fresh_fconstr mark term =
   { state = Atomic.fetch_and_add next_uid 1 lsl 2 lor mark_code mark; term;
     symbolic = NoSymbolicView }
+
+(* Content-addressed cells: closures with the same constructor, syntax, child
+   cells and (shallowly) the same substitution denote the same term and share
+   one cell, so that in-place reductions and the identity-keyed memos of a
+   conversion apply to every occurrence of a shared subterm. *)
+module CellTab = Hashtbl.Make (struct
+  type t = fterm
+
+  let eq_value a b = match a, b with
+    | Regular a, Regular b -> a == b
+    | HigherOrder (n, a), HigherOrder (m, b) -> Int.equal n m && a == b
+    | (Regular _ | HigherOrder _), _ -> false
+  let hash_value = function
+    | Regular v -> fconstr_hash v
+    | HigherOrder (n, v) -> Hashset.Combine.combine n (fconstr_hash v)
+  let eq_usubs (s1, u1) (s2, u2) =
+    (s1 == s2 || Esubst.eq_subs eq_value s1 s2) && (u1 == u2 || UVars.Instance.equal u1 u2)
+  let hash_usubs (s, u) =
+    Hashset.Combine.combine (Esubst.hash_subs hash_value s) (UVars.Instance.hash u)
+  let hash_constr c = Hashtbl.hash_param 5 24 c
+
+  let equal a b = match a, b with
+    | FRel n, FRel m -> Int.equal n m
+    | FAtom c, FAtom d -> c == d || Constr.equal c d
+    | FFlex k, FFlex l -> eq_table_key (eq_pair eq_constant_key UVars.Instance.equal) k l
+    | FInd (i, u), FInd (j, v) -> Ind.CanOrd.equal i j && UVars.Instance.equal u v
+    | FConstruct ((c, u), a), FConstruct ((d, v), b) ->
+      Construct.CanOrd.equal c d && UVars.Instance.equal u v && Array.equal (==) a b
+    | FApp (h, a), FApp (g, b) -> h == g && Array.equal (==) a b
+    | FProj (p, r, c), FProj (q, s, d) ->
+      Projection.CanOrd.equal p q && Sorts.relevance_equal r s && c == d
+    | FFix (((reci, i), rdcl), e), FFix (((reci', i'), rdcl'), e') ->
+      (* the outer tuple is rebuilt at each unfolding, the rest is the syntax's *)
+      Int.equal i i' && reci == reci' && rdcl == rdcl' && eq_usubs e e'
+    | FCoFix ((i, rdcl), e), FCoFix ((i', rdcl'), e') ->
+      Int.equal i i' && rdcl == rdcl' && eq_usubs e e'
+    | FLambda (n, tys, b, e), FLambda (m, tys', b', e') ->
+      (* [mk_lambda] allocates the domain list, its elements are the syntax's *)
+      Int.equal n m && b == b' &&
+      (tys == tys' ||
+       List.equal (fun (na, ty) (na', ty') ->
+           ty == ty' && Sorts.relevance_equal na.binder_relevance na'.binder_relevance) tys tys') &&
+      eq_usubs e e'
+    | FProd (na, ty, b, e), FProd (na', ty', b', e') ->
+      na == na' && ty == ty' && b == b' && eq_usubs e e'
+    | FLetIn (na, b, ty, c, e), FLetIn (na', b', ty', c', e') ->
+      na == na' && b == b' && ty == ty' && c == c' && eq_usubs e e'
+    | FLIFT (k, t), FLIFT (l, t') -> Int.equal k l && t == t'
+    | FCLOS (t, e), FCLOS (t', e') -> t == t' && eq_usubs e e'
+    | (FRel _ | FAtom _ | FFlex _ | FInd _ | FConstruct _ | FApp _ | FProj _ | FFix _
+      | FCoFix _ | FLambda _ | FProd _ | FLetIn _ | FLIFT _ | FCLOS _ | FCaseT _
+      | FCaseInvert _ | FEvar _ | FInt _ | FFloat _ | FString _ | FArray _ | FPeanoNat _
+      | FIrrelevant | FLOCKED), _ -> false
+
+  let hash term =
+    let open Hashset.Combine in
+    let cells a = Array.fold_left (fun acc c -> combine acc (fconstr_hash c)) 0 a in
+    match term with
+    | FRel n -> combinesmall 1 n
+    | FAtom c -> combinesmall 2 (hash_constr c)
+    | FFlex k -> combinesmall 3 (hash_table_key (fun (c, _) -> Constant.UserOrd.hash c) k)
+    | FInd (i, _) -> combinesmall 4 (Ind.CanOrd.hash i)
+    | FConstruct ((c, _), a) -> combinesmall 5 (combine (Construct.CanOrd.hash c) (cells a))
+    | FApp (h, a) -> combinesmall 6 (combine (fconstr_hash h) (cells a))
+    | FProj (p, _, c) -> combinesmall 7 (combine (Projection.CanOrd.hash p) (fconstr_hash c))
+    | FFix (((_, i), (_, _, bodies)), e) ->
+      combinesmall 8 (combine3 i (hash_constr bodies) (hash_usubs e))
+    | FCoFix ((i, (_, _, bodies)), e) ->
+      combinesmall 9 (combine3 i (hash_constr bodies) (hash_usubs e))
+    | FLambda (n, _, b, e) -> combinesmall 10 (combine3 n (hash_constr b) (hash_usubs e))
+    | FProd (_, ty, b, e) ->
+      combinesmall 11 (combine3 (fconstr_hash ty) (hash_constr b) (hash_usubs e))
+    | FLetIn (_, b, ty, c, e) ->
+      combinesmall 12 (combine4 (fconstr_hash b) (fconstr_hash ty) (hash_constr c) (hash_usubs e))
+    | FLIFT (k, t) -> combinesmall 13 (combine k (fconstr_hash t))
+    | FCLOS (t, e) -> combinesmall 14 (combine (hash_constr t) (hash_usubs e))
+    | FCaseT _ | FCaseInvert _ | FEvar _ | FInt _ | FFloat _ | FString _ | FArray _
+    | FPeanoNat _ | FIrrelevant | FLOCKED -> 0
+end)
+
+let shareable = function
+  | FRel _ | FAtom _ | FFlex _ | FInd _ | FConstruct _ | FApp _ | FProj _ | FFix _ | FCoFix _
+  | FLambda _ | FProd _ | FLetIn _ | FLIFT _ | FCLOS _ -> true
+  | FCaseT _ | FCaseInvert _ | FEvar _ | FInt _ | FFloat _ | FString _ | FArray _
+  | FPeanoNat _ | FIrrelevant | FLOCKED -> false
+
+(* The cells of the current sharing scope, see [with_cells]. *)
+let cells : fconstr CellTab.t option ref = ref None
+
+(* A cell under evaluation is never reused; a cell requested reducible accepts
+   any mark, a certified mark must agree. *)
+let make_fconstr mark term =
+  match !cells with
+  | Some cells when shareable term ->
+    begin match CellTab.find_opt cells term with
+    | Some v when v.term != FLOCKED && (mark == Red || mark_code mark == v.state land 3) -> v
+    | Some _ -> fresh_fconstr mark term
+    | None ->
+      let v = fresh_fconstr mark term in
+      (* a reset only loses sharing for later cells *)
+      if CellTab.length cells >= 2_000_000 then CellTab.reset cells;
+      CellTab.add cells term v; v
+    end
+  | _ -> fresh_fconstr mark term
+
+(* Run [f] with cells allocated in [tab] ([None]: fresh cells only). *)
+let with_cells tab f =
+  let saved = !cells in
+  cells := tab;
+  match f () with
+  | v -> cells := saved; v
+  | exception e -> cells := saved; raise e
 
 let get_invert fiv = fiv
 
@@ -469,8 +581,8 @@ and lft_construct n ft =
         | NoSymbolicView | SymbolicCopy -> v
         | SymbolicView view ->
           (* a lifted cell with a view is a fresh cell, its view is shifted *)
-          let v = if v == ft then make_fconstr (fconstr_mark ft) ft.term else v in
-          let shifted = make_fconstr (fconstr_mark view) (FLIFT (n, view)) in
+          let v = if v == ft then fresh_fconstr (fconstr_mark ft) ft.term else v in
+          let shifted = fresh_fconstr (fconstr_mark view) (FLIFT (n, view)) in
           shifted.symbolic <- SymbolicCopy;
           v.symbolic <- SymbolicView shifted;
           v in
@@ -521,7 +633,7 @@ let save_symbolic_view info m =
      (Environ.typing_flags info.i_cache.i_env).unfold_dep_heuristic
   then match [@ocaml.warning "-4"] m.symbolic, m.term with
     | NoSymbolicView, (FCLOS _ | FApp _ | FProj _) ->
-      let copy = make_fconstr (fconstr_mark m) m.term in
+      let copy = fresh_fconstr (fconstr_mark m) m.term in
       copy.symbolic <- SymbolicCopy;
       m.symbolic <- SymbolicView copy
     | _ -> ()
@@ -638,7 +750,8 @@ type table_val = (fconstr * bool array, Empty.t, UVars.Instance.t * bool * machi
 
 module Table : sig
   type t
-  val create : unit -> t
+  val create : ?shared:bool -> unit -> t
+  val cells : t -> int -> fconstr CellTab.t option
   val lookup : clos_infos -> t -> table_key -> table_val
 end = struct
   module Table = Hashtbl.Make(struct
@@ -647,9 +760,15 @@ end = struct
     let hash = hash_table_key (fun (c, _) -> Constant.UserOrd.hash c)
   end)
 
-  type t = table_val Table.t
+  (* The tables of a conversion problem share cells, one content table per
+     reduction class (see [reduction_class]); other tables allocate as usual. *)
+  type t = { table : table_val Table.t; cells : fconstr CellTab.t Lazy.t array }
 
-  let create () = Table.create 17
+  let create ?(shared = false) () =
+    { table = Table.create 17;
+      cells = if shared then Array.init 128 (fun _ -> lazy (CellTab.create 64)) else [||] }
+
+  let cells t cls = if Array.length t.cells = 0 then None else Some (Lazy.force t.cells.(cls))
 
   exception Irrelevant
 
@@ -729,9 +848,9 @@ end = struct
     | NotEvaluableConst _ (* Const *) -> Undef None
 
   let lookup info tab ref =
-    try Table.find tab ref with Not_found ->
+    try Table.find tab.table ref with Not_found ->
     let v = value_of info ref in
-    Table.add tab ref v; v
+    Table.add tab.table ref v; v
 end
 
 type clos_tab = Table.t
@@ -2299,7 +2418,8 @@ and knht info e t stk =
         (mk_irrelevant, skip_irrelevant_stack info stk)
       else
         let term = FCaseInvert (ci, u, pms, p, (Array.map (mk_clos e) indices), mk_clos e t, br, e) in
-        make_fconstr Red term, stk
+        (* a head returned without [knh] is fresh: a shared cell may be reduced *)
+        fresh_fconstr Red term, stk
     | Fix (((_, n), (lna, _, _)) as fx) ->
       inspect_fix_interface info fx stk;
       if is_irrelevant info (usubst_relevance e (lna.(n)).binder_relevance) then
@@ -2312,7 +2432,7 @@ and knht info e t stk =
       if is_irrelevant info r then
         (mk_irrelevant, skip_irrelevant_stack info stk)
       else begin match unfold_projection info p r with
-      | None -> (make_fconstr Red (FProj (p, r, mk_clos e c)), stk)
+      | None -> (fresh_fconstr Red (FProj (p, r, mk_clos e c)), stk)
       | Some s -> knht info e c (s :: stk)
       end
     | Construct _ -> knh info (mk_clos e t) stk
@@ -2551,7 +2671,7 @@ and match_elim : 'a. ('a, 'a depth) reduction -> _ -> _ -> pat_state:'a depth ->
   | ZcaseT (ci, u, pms, ((pctx, p), _ as pred), brs, e) :: s ->
       let t = FCaseT (ci, u, pms, pred, head, brs, e) in
       let mark = neutr (fconstr_mark head) in
-      let head = make_fconstr mark t in
+      let head = fresh_fconstr mark t in
       let prets, pbrss, elims, states = extract_or_kill4 (function [@ocaml.warning "-4"]
       | PECase (pind, pret, pbrs) :: es, subst ->
         if not @@ QInd.equal (info_env info) pind ci.ci_ind then None else
@@ -2592,7 +2712,7 @@ and match_elim : 'a. ('a, 'a depth) reduction -> _ -> _ -> pat_state:'a depth ->
   | Zproj (proj', r) :: s ->
       let mark = neutr (fconstr_mark head) in
       let head =
-        make_fconstr mark (FProj (Projection.make proj' true, r, head))
+        fresh_fconstr mark (FProj (Projection.make proj' true, r, head))
       in
       let elims, states = extract_or_kill2 (function [@ocaml.warning "-4"]
       | PEProj proj :: es, subst ->
@@ -2976,7 +3096,22 @@ and knred : 'a. ('a, 'a RedPattern.depth) reduction = {
 
 let kni info tab v stk = kni info tab ~pat_state:(RedPattern.Nil No) v stk
 let knit info tab v stk = knit info tab ~pat_state:(RedPattern.Nil No) v stk
-let kh info tab v stk = fapp_stack(kni info tab v stk)
+(* A cell reduced in place under one set of flags is no head for a reduction
+   under another: sharing is per reduction class. Private and inspection
+   reductions keep their copies distinct. *)
+let reduction_class info =
+  let bit kind i = if RedFlags.red_set info.i_flags kind then 1 lsl i else 0 in
+  bit RedFlags.fBETA 0 lor bit RedFlags.fDELTA 1 lor bit RedFlags.fMATCH 2 lor
+  bit RedFlags.fFIX 3 lor bit RedFlags.fCOFIX 4 lor bit RedFlags.fZETA 5 lor
+  (if info.i_symbolic then 64 else 0)
+
+let with_sharing info tab f =
+  let cells =
+    if Option.is_empty info.i_private && not (Inspection.active info)
+    then Table.cells tab (reduction_class info) else None in
+  with_cells cells f
+
+let kh info tab v stk = with_sharing info tab (fun () -> fapp_stack (kni info tab v stk))
 
 (************************************************************************)
 
@@ -3145,10 +3280,10 @@ and zip_term info tab m stk = match stk with
 let whd_val info tab v = term_of_fconstr (kh info tab v [])
 
 (* strong reduction *)
-let norm_val info tab v = kl info tab v
-let norm_term info tab e t = klt info tab e t
+let norm_val info tab v = with_sharing info tab (fun () -> kl info tab v)
+let norm_term info tab e t = with_sharing info tab (fun () -> klt info tab e t)
 
-let whd_stack infos tab m stk = match fconstr_mark m with
+let whd_stack infos tab m stk = with_sharing infos tab @@ fun () -> match fconstr_mark m with
 | Ntrl when not (symbolic_reduction infos) ->
   (** No need to perform [kni] nor to unlock updates because
       every head subterm of [m] is [Ntrl] *)
@@ -3203,7 +3338,7 @@ let private_view ?(mark = fconstr_mark) ?(visit = ignore) infos =
     match Cells.find_opt cells source with
     | Some owned -> owned
     | None ->
-      let owned = make_fconstr (mark source) source.term in
+      let owned = fresh_fconstr (mark source) source.term in
       Cells.add cells source owned;
       (* an owned cell visited again keeps its updated result *)
       Cells.add cells owned owned;
