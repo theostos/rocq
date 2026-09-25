@@ -18,14 +18,25 @@ module RelDecl = Context.Rel.Declaration
 
 exception LocalOccur
 
+(* Occurrence checks and substitutions visit a shared subterm once per depth. *)
+let shared_with_binders f depth c =
+  let tbl = lazy (Constr.Memo.create 17) in
+  let rec visit depth c = match Constr.kind c with
+    | Constr.Rel _ | Constr.Var _ | Constr.Meta _ | Constr.Sort _
+    | Constr.Const _ | Constr.Ind _ | Constr.Construct _
+    | Constr.Int _ | Constr.Float _ | Constr.String _ -> f visit depth c
+    | _ -> Constr.Memo.visit tbl step depth depth c
+  and step depth c = f visit depth c in
+  visit depth c
+
 (* (closedn n M) is true iff M is a (de Brujin) closed term under n binders *)
 
 let closedn n c =
-  let rec closed_rec n c = match Constr.kind c with
+  let closed_rec closed_rec n c = match Constr.kind c with
     | Constr.Rel m -> if m>n then raise_notrace LocalOccur
     | _ -> Constr.iter_with_binders succ closed_rec n c
   in
-  try closed_rec n c; true with LocalOccur -> false
+  try shared_with_binders closed_rec n c; true with LocalOccur -> false
 
 (* [closed0 M] is true iff [M] is a (de Bruijn) closed term *)
 
@@ -34,21 +45,21 @@ let closed0 c = closedn 0 c
 (* (noccurn n M) returns true iff (Rel n) does NOT occur in term M  *)
 
 let noccurn n term =
-  let rec occur_rec n c = match Constr.kind c with
+  let occur_rec occur_rec n c = match Constr.kind c with
     | Constr.Rel m -> if Int.equal m n then raise_notrace LocalOccur
     | _ -> Constr.iter_with_binders succ occur_rec n c
   in
-  try occur_rec n term; true with LocalOccur -> false
+  try shared_with_binders occur_rec n term; true with LocalOccur -> false
 
 (* (noccur_between n m M) returns true iff (Rel p) does NOT occur in term M
   for n <= p < n+m *)
 
 let noccur_between n m term =
-  let rec occur_rec n c = match Constr.kind c with
+  let occur_rec occur_rec n c = match Constr.kind c with
     | Constr.Rel p -> if n<=p && p<n+m then raise_notrace LocalOccur
     | _        -> Constr.iter_with_binders succ occur_rec n c
   in
-  try occur_rec n term; true with LocalOccur -> false
+  try shared_with_binders occur_rec n term; true with LocalOccur -> false
 
 (* Checking function for terms containing existential variables.
  The function [noccur_with_meta] considers the fact that
@@ -62,7 +73,7 @@ let isMeta c = match Constr.kind c with
 | _ -> false
 
 let noccur_with_meta n m term =
-  let rec occur_rec n c = match Constr.kind c with
+  let occur_rec occur_rec n c = match Constr.kind c with
     | Constr.Rel p -> if n<=p && p<n+m then raise_notrace LocalOccur
     | Constr.App(f,_cl) ->
         (match Constr.kind f with
@@ -72,7 +83,7 @@ let noccur_with_meta n m term =
     | Constr.Evar (_, _) -> ()
     | _ -> Constr.iter_with_binders succ occur_rec n c
   in
-  try (occur_rec n term; true) with LocalOccur -> false
+  try (shared_with_binders occur_rec n term; true) with LocalOccur -> false
 
 (*********************)
 (*      Lifting      *)
@@ -130,17 +141,62 @@ let lift_substituend depth s = if Int.equal depth 0 then s.sit else lift_substit
 
 let make_substituend c = { sinfo=Unknown; sit=c }
 
+(* Memo of [substn_many], keyed on the physical term, its binder depth and
+   its position, which spreads the shallow hash of long literal lists. *)
+module SubstMemo = Hashtbl.Make (struct
+  type t = int * int * Constr.t
+  let equal (n, p, c) (m, q, d) = Int.equal n m && Int.equal p q && c == d
+  let hash (n, p, c) = Hashtbl.hash (n, p, Hashtbl.hash_param 4 16 c)
+end)
+
 let substn_many lamv n c =
   let lv = Array.length lamv in
   if Int.equal lv 0 then c
   else
-    let rec substrec depth c = match Constr.kind c with
-      | Constr.Rel k     ->
-          if k<=depth then c
+    let tbl = lazy (SubstMemo.create 17) in
+    let remember depth path c c' =
+      SubstMemo.replace (Lazy.force tbl) (depth, path, c) c'; c' in
+    (* Application spines can be deeply nested constructor data: keep their
+       continuation on the heap. *)
+    let rec visit depth path c pending = match Constr.kind c with
+      | Constr.Rel k ->
+        let c =
+          if k <= depth then c
           else if k-depth <= lv then lift_substituend depth (Array.unsafe_get lamv (k-depth-1))
-          else Constr.mkRel (k-lv)
-      | _ -> Constr.map_with_binders succ substrec depth c in
-    substrec n c
+          else Constr.mkRel (k-lv) in
+        return c pending
+      | Constr.Var _ | Constr.Meta _ | Constr.Sort _ | Constr.Const _
+      | Constr.Ind _ | Constr.Construct _ | Constr.Int _ | Constr.Float _
+      | Constr.String _ -> return c pending
+      | _ ->
+        match SubstMemo.find_opt (Lazy.force tbl) (depth, path, c) with
+        | Some c' -> return c' pending
+        | None ->
+          Control.check_for_interrupt ();
+          match Constr.kind c with
+          | Constr.App (head, args) ->
+            visit depth (path+1) head (`Head (depth,path,c,head,args) :: pending)
+          | _ ->
+            let c' = Constr.map_with_binders succ
+              (fun depth c -> visit depth (path+1) c []) depth c in
+            return (remember depth path c c') pending
+    and return c' = function
+      | [] -> c'
+      | `Head (depth,path,c,head,args) :: pending ->
+        let args' = Array.make (Array.length args) c' in
+        visit depth (path+1) args.(0) (`Arg (depth,path,c,head,c',args,args',0) :: pending)
+      | `Arg (depth,path,c,head,head',args,args',i) :: pending ->
+        args'.(i) <- c';
+        let i = i + 1 in
+        if i < Array.length args then
+          visit depth (path+1) args.(i) (`Arg (depth,path,c,head,head',args,args',i) :: pending)
+        else
+          let c' =
+            if head == head' && CArray.equal (==) args args' then c
+            else Constr.mkApp (head',args') in
+          return (remember depth path c c') pending
+    in
+    visit n 0 c []
 
 let make_subst = function
 | [] -> [||]
@@ -238,7 +294,7 @@ let replace_vars var_alist x =
   match var_alist with
   | [] -> x
   | _ ->
-    let rec substrec n c = match Constr.kind c with
+    let substrec substrec n c = match Constr.kind c with
     | Constr.Var x ->
       begin match find_var x var_alist with
       | var -> lift_substituend n var
@@ -248,7 +304,7 @@ let replace_vars var_alist x =
       CErrors.anomaly (Pp.str "Substituting an evar in the kernel")
     | _ -> Constr.map_with_binders succ substrec n c
     in
-    substrec 0 x
+    shared_with_binders substrec 0 x
 
 (* (subst_var str t) substitute (Var str) by (Rel 1) in t *)
 let subst_var str t = replace_vars [(str, Constr.mkRel 1)] t
@@ -363,7 +419,9 @@ let subst_univs_level_constr subst c =
     let f = UVars.subst_sort_level_instance subst in
     (* XXX shouldn't Constr.map return the pointer equal term when unchanged instead? *)
     let changed = ref false in
-    let rec aux t =
+    let tbl = lazy (Constr.Memo.create 17) in
+    let rec aux t = Constr.Memo.visit tbl aux_rec 0 () t
+    and aux_rec () t =
       let t' = map_constr_relevance (UVars.subst_sort_level_relevance subst) t in
       let t = if t' == t then t else (changed := true; t') in
       match kind t with
@@ -421,7 +479,9 @@ let subst_instance_constr subst c =
   if UVars.Instance.is_empty subst then c
   else
     let f u = UVars.subst_instance_instance subst u in
-    let rec aux t =
+    let tbl = lazy (Constr.Memo.create 17) in
+    let rec aux t = Constr.Memo.visit tbl aux_rec 0 () t
+    and aux_rec () t =
       let t = if CArray.is_empty (fst (UVars.Instance.to_array subst)) then t
         else map_constr_relevance (UVars.subst_instance_relevance subst) t
       in
@@ -531,11 +591,22 @@ let visit_kind_univs visit acc c =
   | _ -> acc
 
 let sort_and_universes_of_constr ?(init=Sorts.Quality.Set.empty,Univ.Level.Set.empty) c =
-  let rec aux s c =
-    let s = visit_kind_univs univs_and_qvars_visitor s (kind c) in
-    Constr.fold aux s c
+  (* Worklist traversal that visits a shared compound subterm once. *)
+  let seen = Constr.Memo.create 251 in
+  let rec aux s = function
+    | [] -> s
+    | (depth, c) :: pending ->
+      match kind c with
+      | Rel _ | Meta _ | Var _ | Sort _ | Const _ | Ind _ | Construct _
+      | Int _ | Float _ | String _ ->
+        aux (visit_kind_univs univs_and_qvars_visitor s (kind c)) pending
+      | _ when Constr.Memo.mem seen (depth, c) -> aux s pending
+      | _ ->
+        Constr.Memo.replace seen (depth, c) ();
+        let s = visit_kind_univs univs_and_qvars_visitor s (kind c) in
+        aux s (Constr.fold (fun pending c -> (depth+1, c) :: pending) pending c)
   in
-  aux init c
+  aux init [(0, c)]
 
 let sort_and_universes_of_constr ?init c =
   NewProfile.profile "sort_and_universes_of_constr" (fun () ->

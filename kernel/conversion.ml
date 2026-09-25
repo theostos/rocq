@@ -1019,13 +1019,45 @@ let () =
   in
   CClosure.set_conv conv
 
+(* Bounded syntactic test before conversion; pairs already found equal are
+   memoised so that a shared DAG is not expanded. *)
+module AlphaPairs = Hashtbl.Make (struct
+  type t = conv_pb * int * constr * constr
+  let equal (p, n, a, b) (q, m, c, d) = p = q && Int.equal n m && a == c && b == d
+  let hash (p, n, a, b) =
+    Hashtbl.hash (p, n, Hashtbl.hash_param 8 32 a, Hashtbl.hash_param 8 32 b)
+end)
+
+let quick_constr_univs pb univs t1 t2 =
+  let budget = ref 1024 in
+  let seen = lazy (AlphaPairs.create 17) in
+  let eq_universes _ = UGraph.check_eq_instances Sorts.Quality.equal univs in
+  let eq_sorts s1 s2 = s1 == s2 || UGraph.check_eq_sort Sorts.Quality.equal univs s1 s2 in
+  let leq_sorts s1 s2 = s1 == s2 || UGraph.check_leq_sort Sorts.Quality.equal univs s1 s2 in
+  let rec compare pb nargs t1 t2 =
+    !budget > 0 && begin
+      decr budget;
+      t1 == t2 ||
+      (* casts are charged here, as compare_head would strip them for free *)
+      match kind t1, kind t2 with
+      | Cast (c, _, _), _ -> compare pb nargs c t2
+      | _, Cast (c, _, _) -> compare pb nargs t1 c
+      | (Evar _ | Meta _), _ | _, (Evar _ | Meta _) -> false
+      | _ ->
+        let key = pb, nargs, t1, t2 in
+        (Lazy.is_val seen && AlphaPairs.mem (Lazy.force seen) key) ||
+        let sorts = if pb = CONV then eq_sorts else leq_sorts in
+        let ok = Constr.compare_head_gen_leq eq_universes sorts
+          (fun _ _ -> false) (compare CONV) (compare pb) nargs t1 t2 in
+        if ok then AlphaPairs.replace (Lazy.force seen) key ();
+        ok
+    end
+  in compare pb 0 t1 t2
+
 let gen_conv ~typed cv_pb ?(l2r=false) ?(reds=TransparentState.full) env ?(evars=default_evar_handler env) t1 t2 =
   let univs = Environ.universes env in
   let state = univs in
-  let b =
-    if cv_pb = CUMUL then leq_constr_univs univs t1 t2
-    else eq_constr_univs univs t1 t2
-  in
+  let b = quick_constr_univs cv_pb univs t1 t2 in
     if b then Result.Ok ()
     else match clos_gen_conv ~typed reds cv_pb l2r evars env univs (state, checked_universes) t1 t2 with
     | Result.Ok (_ : 'a * ('a, Empty.t) universe_compare)-> Result.Ok ()

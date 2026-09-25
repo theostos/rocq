@@ -402,8 +402,12 @@ let subst_retro_action subst action =
     let c' = subst_constant subst c in
     if c == c' then action else Register_type(prim, c')
 
-let rec map_kn f f' c =
-  let func = map_kn f f' in
+let map_kn f f' c =
+  (* A module substitution is the same under binders: a shared subterm is
+     substituted once. *)
+  let tbl = lazy (Constr.Memo.create 17) in
+  let rec func c = Constr.Memo.visit tbl func_rec 0 () c
+  and func_rec () c =
     match kind c with
       | Const kn -> (try f' kn with No_subst -> c)
       | Proj (p,r,t) ->
@@ -477,7 +481,15 @@ let rec map_kn f f' c =
           let bl' = Array.Smart.map func bl in
             if (bl == bl'&& tl == tl') then c
             else mkCoFix (ln,(lna,tl',bl'))
+      | Array (u, elems, def, ty) ->
+          let elems' = Array.Smart.map func elems in
+          let def' = func def in
+          let ty' = func ty in
+            if (elems == elems' && def == def' && ty == ty') then c
+            else mkArray (u, elems', def', ty')
       | _ -> c
+  in
+  func c
 
 let subst_mps subst c =
   let subst_pcon_term subst (con,u) =

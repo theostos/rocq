@@ -435,6 +435,17 @@ type named_context = named_declaration list
 
 (** {6 Relocation and substitution } *)
 
+(** Memo tables for traversals that visit a shared DAG once: keyed on the
+    physical term and an integer (binder depth or position) that also spreads
+    the shallow structural hash of long literal lists. *)
+module Memo : sig
+  include Hashtbl.S with type key = int * constr
+  val visit : 'a t Lazy.t -> ('c -> constr -> 'a) -> int -> 'c -> constr -> 'a
+  (** [visit tbl f n ctx c] is [f ctx c], computed once per [(n, c)]. [tbl] is
+      allocated by the first compound term; atoms are memoised once it exists,
+      so that their transformed copies stay shared. *)
+end
+
 (** [exliftn el c] lifts [c] with lifting [el] *)
 val exliftn : Esubst.lift -> constr -> constr
 

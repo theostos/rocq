@@ -168,6 +168,15 @@ module Tbl = struct
 
 end
 
+(* Memo of reified subterms, keyed on the physical term, its binder context
+   and its application depth, which spreads the shallow hash of long literal
+   lists. *)
+module Memo = Hashtbl.Make (struct
+  type t = int * int * constr
+  let equal (n, i, a) (m, j, b) = Int.equal n m && Int.equal i j && a == b
+  let hash (n, i, a) = Hashtbl.hash (n, i, Hashtbl.hash_param 4 16 a)
+end)
+
 type henv = {
   (* only used for globals, rel context is not correct *)
   globals : Environ.env;
@@ -177,6 +186,9 @@ type henv = {
   steps : int ref;
   (* unique identifiers for each binder crossed *)
   rels : int Range.t;
+  (* interned binder contexts: (context, uid) -> (context, rels) *)
+  context : int;
+  contexts : (int * int, int * int Range.t) Hashtbl.t;
   (* counter to generate uids for binders *)
   binder_cnt : int ref;
   (* how many unknown_rel we have seen *)
@@ -184,6 +196,7 @@ type henv = {
   assum_uids : int Tbl.t;
   (* the surrounding table is for the body, the inner table for the type *)
   letin_uids : int Tbl.t Tbl.t;
+  memo : t Memo.t;
 }
 
 let empty_env env = {
@@ -191,17 +204,33 @@ let empty_env env = {
   tbl = Tbl.create ();
   steps = ref 0;
   rels = Range.empty;
+  context = 0;
+  contexts = Hashtbl.create 251;
   binder_cnt = ref 0;
   unknown_cnt = ref 0;
   assum_uids = Tbl.create ();
   letin_uids = Tbl.create ();
+  memo = Memo.create 251;
 }
+
+(* Contexts are interned so that a shared subterm revisited under the same
+   binders hits the memo. *)
+let push_binder_uid uid env =
+  let key = env.context, uid in
+  let context, rels = match Hashtbl.find_opt env.contexts key with
+    | Some ctx -> ctx
+    | None ->
+      let ctx = Hashtbl.length env.contexts + 1, Range.cons uid env.rels in
+      Hashtbl.add env.contexts key ctx;
+      ctx
+  in
+  { env with context; rels }
 
 (* still used in fixpoint *)
 let push_unknown_rel env =
   incr env.binder_cnt;
   incr env.unknown_cnt;
-  { env with rels = Range.cons !(env.binder_cnt) env.rels }
+  push_binder_uid !(env.binder_cnt) env
 
 let push_assum t env =
   let uid = match Tbl.find_opt env.assum_uids t with
@@ -212,7 +241,7 @@ let push_assum t env =
     Tbl.add env.assum_uids t uid;
     uid
   in
-  { env with rels = Range.cons uid env.rels }
+  push_binder_uid uid env
 
 let push_rec ts env =
   (* handling the lifting for mutual fixpoints doesn't seem worth the effort *)
@@ -240,7 +269,7 @@ let push_letin ~body ~typ env =
       Tbl.add env.letin_uids body tbl;
       uid
   in
-  { env with rels = Range.cons uid env.rels }
+  push_binder_uid uid env
 
 module RelDecl = Context.Rel.Declaration
 
@@ -342,11 +371,16 @@ let nonrel_leaf tbl c = match kind c with
   | _ -> None
 
 let rec of_constr henv c =
-  incr henv.steps;
-  match nonrel_leaf henv.tbl c with
-  | Some v -> v
-  | None ->
-    let kind = of_constr_aux henv c in
+  let compound c = match Constr.kind c with
+    | Rel _ | Meta _ | Var _ | Sort _ | Const _ | Ind _ | Construct _
+    | Int _ | Float _ | String _ -> false
+    | _ -> true
+  in
+  let remember depth c value =
+    if compound c then Memo.replace henv.memo (depth, henv.context, c) value;
+    value
+  in
+  let finish depth c kind =
     let hash = hash_kind kind in
     let isRel, hash = match kind with
       | Rel n ->
@@ -355,15 +389,47 @@ let rec of_constr henv c =
         uid, Hashset.Combine.combine uid hash
       | _ -> 0, hash
     in
-    match Tbl.raw_find henv.tbl hash (fun c' -> raw_equal c' ~isRel ~kind) with
-    | Some c' -> c'.refcount <- c'.refcount + 1; c'
-    | None ->
-      let c =
+    let value = match Tbl.raw_find henv.tbl hash (fun c' -> raw_equal c' ~isRel ~kind) with
+      | Some c' -> c'.refcount <- c'.refcount + 1; c'
+      | None ->
         let self = kind_to_constr kind in
         let self = if hasheq_kind (Constr.kind self) (Constr.kind c) then c else self in
-        { self; kind; hash; isRel; refcount = 1 }
-      in
-    Tbl.add henv.tbl c c; c
+        let value = { self; kind; hash; isRel; refcount = 1 } in
+        Tbl.add henv.tbl value value;
+        value
+    in
+    remember depth c value
+  in
+  (* Application spines can be deeply nested constructor data: keep their
+     continuation on the heap. *)
+  let rec visit depth c pending =
+    incr henv.steps;
+    match if compound c then Memo.find_opt henv.memo (depth, henv.context, c) else None with
+    | Some value ->
+      value.refcount <- value.refcount + 1;
+      return value pending
+    | None ->
+      match nonrel_leaf henv.tbl c with
+      | Some value ->
+        value.refcount <- value.refcount + 1;
+        return value pending
+      | None ->
+        match Constr.kind c with
+        | App (head, args) -> visit (depth+1) head (`Head (depth,c,args) :: pending)
+        | _ -> return (finish depth c (of_constr_aux henv c)) pending
+  and return value = function
+    | [] -> value
+    | `Head (depth,c,args) :: pending ->
+      let values = Array.make (Array.length args) value in
+      visit (depth+1) args.(0) (`Arg (depth,c,value,args,values,0) :: pending)
+    | `Arg (depth,c,head,args,values,i) :: pending ->
+      values.(i) <- value;
+      let i = i + 1 in
+      if i < Array.length args then
+        visit (depth+1) args.(i) (`Arg (depth,c,head,args,values,i) :: pending)
+      else return (finish depth c (App (head,values))) pending
+  in
+  visit 0 c []
 
 and of_constr_aux henv c =
   match kind c with

@@ -853,14 +853,50 @@ let map_with_binders g f l c0 = match kind c0 with
 (*      Lifting      *)
 (*********************)
 
+(* Memo tables for traversals that visit a shared DAG once: keyed on the
+   physical term and an integer (binder depth or position) that also spreads
+   the shallow structural hash of long literal lists. *)
+module Memo = struct
+  include Hashtbl.Make (struct
+    type nonrec t = int * t
+    let equal (n, c) (m, d) = Int.equal n m && c == d
+    let hash (n, c) = Hashtbl.hash (n, Hashtbl.hash_param 4 16 c)
+  end)
+
+  let is_atom c = match kind c with
+    | Rel _ | Var _ | Meta _ | Sort _ | Const _ | Ind _ | Construct _
+    | Int _ | Float _ | String _ -> true
+    | _ -> false
+
+  (* [visit tbl f n ctx c] is [f ctx c], computed once per [(n, c)]. [tbl] is
+     allocated by the first compound term; atoms are memoised once it exists,
+     so that their transformed copies stay shared. *)
+  let visit tbl f n ctx c =
+    if is_atom c && not (Lazy.is_val tbl) then f ctx c else
+    let tbl = Lazy.force tbl in
+    match find_opt tbl (n, c) with
+    | Some r -> r
+    | None ->
+      Control.check_for_interrupt ();
+      let r = f ctx c in
+      add tbl (n, c) r; r
+end
+
 (* The generic lifting function *)
-let rec exliftn el c =
+let exliftn el c =
   let open Esubst in
-  match kind c with
-  | Rel i ->
-    let j = reloc_rel i el in
-    if Int.equal i j then c else mkRel j
-  | _ -> map_with_binders el_lift exliftn el c
+  let tbl = lazy (Memo.create 17) in
+  let rec lift (depth, el as ctx) c = match kind c with
+    | Rel i ->
+      let j = reloc_rel i el in
+      if Int.equal i j then c else mkRel j
+    | Var _ | Meta _ | Sort _ | Const _ | Ind _ | Construct _
+    | Int _ | Float _ | String _ -> c
+    | _ -> Memo.visit tbl lift_rec depth ctx c
+  and lift_rec ctx c =
+    map_with_binders (fun (depth, el) -> depth + 1, el_lift el) lift ctx c
+  in
+  lift (0, el) c
 
 (* Lifting the binding depth across k bindings *)
 
@@ -1324,14 +1360,46 @@ and sh_rec_main t =
   (h, HashsetTerm.repr h (T y) term_table)
 
 and sh_rec t =
-  incr steps;
-  if refcount t = 1 then sh_rec_main t
-  else match Tbl.find_opt t with
-    | Some res -> res
+  let remember t result =
+    if refcount t <> 1 then Tbl.add t result;
+    result
+  in
+  (* Application spines can be deeply nested constructor data: keep their
+     continuation on the heap. *)
+  let rec visit t pending =
+    incr steps;
+    let cached = if refcount t = 1 then None else Tbl.find_opt t in
+    match cached with
+    | Some result -> return result pending
     | None ->
-      let res = sh_rec_main t in
-      Tbl.add t res;
-      res
+      match kind t with
+      | App (head,args) -> visit head (`Head (t,args) :: pending)
+      | _ -> return (remember t (sh_rec_main t)) pending
+  and return ((h,c) as result) = function
+    | [] -> result
+    | `Head (t,args) :: pending ->
+      let original = snd (destApp (self t)) in
+      visit args.(0) (`Arg (t,h,c,args,original,original,0,0) :: pending)
+    | `Arg (t,hhead,head,args,original,values,i,hargs) :: pending ->
+      let values =
+        if c == original.(i) then values
+        else begin
+          let values = if values == original then Array.copy original else values in
+          values.(i) <- c;
+          values
+        end
+      in
+      let hargs = combine h hargs in
+      let i = i + 1 in
+      if i < Array.length args then
+        visit args.(i) (`Arg (t,hhead,head,args,original,values,i,hargs) :: pending)
+      else
+        let values = HashsetTermArray.repr hargs values term_array_table in
+        let hash = combinesmall 7 (combine hargs hhead) in
+        let term = HashsetTerm.repr hash (T (App (head,values))) term_table in
+        return (remember t (hash,term)) pending
+  in
+  visit t []
 
 (* Note : During hash-cons of arrays, we modify them *in place* *)
 

@@ -128,47 +128,61 @@ type memory = {
   seen : value list LargeArray.t;
 }
 
-let rec val_gen v mem ctx o = match o with
+(* Field continuations are kept on the heap: a term can nest millions of
+   constructor applications. *)
+let rec val_gen v mem ctx o pending = match o with
   | Ptr p ->
     let seen = LargeArray.get mem.seen p in
-    if List.exists (fun v' -> Values.equal v' v) seen then ()
+    if List.exists (fun v' -> Values.equal v' v) seen then resume mem pending
     else begin
       (* Setting before we recurse means we allow recursive values.
          Do we care? *)
       LargeArray.set mem.seen p (v::seen);
-      val_gen_aux v mem ctx o
+      val_gen_aux v mem ctx o pending
     end
-  | Int _ | Atm _ | Fun _ -> val_gen_aux v mem ctx o
+  | Int _ | Atm _ | Fun _ -> val_gen_aux v mem ctx o pending
 
-and val_gen_aux v mem ctx o = match kind v with
-  | Tuple (name,vs) -> val_tuple ~name vs mem ctx o
-  | Sum (name,cc,vv) -> val_sum name cc vv mem ctx o
-  | Array v -> val_array v mem ctx o
-  | List v0 -> val_sum "list" 1 [|[|v0;v|]|] mem ctx o
-  | Opt v -> val_sum "option" 1 [|[|v|]|] mem ctx o
-  | Int -> if not (is_int mem o) then fail mem ctx o "expected an int"
+and resume mem = function
+  | [] -> ()
+  | `Tuple (vs,ctx,o,i) :: pending ->
+    if i = Array.length vs then resume mem pending
+    else val_gen vs.(i) mem (ctx/CtxField i) (field mem.mem o i)
+        (`Tuple (vs,ctx,o,i+1) :: pending)
+  | `Array (v,ctx,o,i,n) :: pending ->
+    if i = n then resume mem pending
+    else val_gen v mem ctx (field mem.mem o i)
+        (`Array (v,ctx,o,i+1,n) :: pending)
+
+and val_gen_aux v mem ctx o pending = match kind v with
+  | Tuple (name,vs) -> val_tuple ~name vs mem ctx o pending
+  | Sum (name,cc,vv) -> val_sum name cc vv mem ctx o pending
+  | Array v -> val_array v mem ctx o pending
+  | List v0 -> val_sum "list" 1 [|[|v0;v|]|] mem ctx o pending
+  | Opt v -> val_sum "option" 1 [|[|v|]|] mem ctx o pending
+  | Int ->
+    if not (is_int mem o) then fail mem ctx o "expected an int";
+    resume mem pending
   | String ->
     (try val_tag Obj.string_tag mem.mem ctx o
-     with Failure _ -> fail mem ctx o "expected a string")
-  | Any -> ()
+     with Failure _ -> fail mem ctx o "expected a string");
+    resume mem pending
+  | Any -> resume mem pending
   | Fail s -> fail mem ctx o ("unexpected object " ^ s)
-  | Annot (s,v) -> val_gen v mem (ctx/CtxAnnot s) o
-  | Int64 -> val_int64 mem ctx o
-  | Float64 -> val_float64 mem ctx o
+  | Annot (s,v) -> val_gen v mem (ctx/CtxAnnot s) o pending
+  | Int64 -> val_int64 mem ctx o; resume mem pending
+  | Float64 -> val_float64 mem ctx o; resume mem pending
 
 (* Check that an object is a tuple (or a record). vs is an array of
    value representation for each field. Its size corresponds to the
    expected size of the object. *)
-and val_tuple ?name vs mem ctx o =
+and val_tuple ?name vs mem ctx o pending =
   let ctx = match name with
     | Some n -> ctx/CtxType n
     | _ -> ctx
   in
   let n = Array.length vs in
-  let val_fld i v =
-    val_gen v mem (ctx/(CtxField i)) (field mem.mem o i) in
   val_block mem.mem ctx o;
-  if size mem.mem o = n then Array.iteri val_fld vs
+  if size mem.mem o = n then resume mem (`Tuple (vs,ctx,o,0) :: pending)
   else
     fail mem ctx o
       ("tuple size: found "^string_of_int (size mem.mem o)^
@@ -180,27 +194,26 @@ and val_tuple ?name vs mem ctx o =
    The size of vv corresponds to the number of non-constant
    constructors, and the size of vv.(i) is the expected arity of the
    i-th non-constant constructor. *)
-and val_sum name cc vv mem ctx o =
+and val_sum name cc vv mem ctx o pending =
   let ctx = ctx/CtxType name in
   if is_block mem o then
     (val_block mem.mem ctx o;
     let n = Array.length vv in
     let i = tag mem.mem o in
     let ctx' = if n=1 then ctx else ctx/CtxTag i in
-    if i < n then val_tuple vv.(i) mem ctx' o
+    if i < n then val_tuple vv.(i) mem ctx' o pending
     else fail mem ctx' o ("sum: unexpected tag"))
   else if is_int mem o then
     let (n:int) = get_int mem o in
     (if n<0 || n>=cc then
-      fail mem ctx o ("bad constant constructor "^string_of_int n))
+      fail mem ctx o ("bad constant constructor "^string_of_int n));
+    resume mem pending
   else fail mem ctx o "not a sum"
 
 (* Check the o is an array of values satisfying f. *)
-and val_array v mem ctx o =
+and val_array v mem ctx o pending =
   val_block mem.mem (ctx/CtxType "array") o;
-  for i = 0 to size mem.mem o - 1 do
-    val_gen v mem ctx (field mem.mem o i)
-  done
+  resume mem (`Array (v,ctx,o,0,size mem.mem o) :: pending)
 
 and val_int64 mem ctx o =
   if not (is_int64 mem.mem o) then
@@ -216,7 +229,7 @@ let val_gen v mem ctx o =
     seen = LargeArray.make (LargeArray.length mem) [];
   }
   in
-  val_gen v mem ctx o
+  val_gen v mem ctx o []
 
 let print_frame = function
 | CtxType t -> t
