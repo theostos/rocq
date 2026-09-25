@@ -52,6 +52,7 @@ type retroknowledge = {
     retro_peano_nat : peano_nat list;
     retro_peano_nat_beq : peano_nat_bool_op list;
     retro_peano_nat_ble : peano_nat_bool_op list;
+    retro_unit_like : inductive list;
     retro_carry : (constructor * constructor) option; (* C0, C1 *)
     retro_pair : constructor option;
     retro_cmp : (constructor * constructor * constructor) option;
@@ -77,6 +78,7 @@ let empty = {
     retro_peano_nat = [];
     retro_peano_nat_beq = [];
     retro_peano_nat_ble = [];
+    retro_unit_like = [];
     retro_carry = None;
     retro_pair = None;
     retro_cmp = None;
@@ -98,3 +100,4 @@ type action =
   | Register_peano_nat_div_go of inductive * Constant.t
   | Register_peano_nat_mod_go of inductive * Constant.t
   | Register_peano_nat_beq of inductive * Constant.t * constructor * constructor
+  | Register_unit_like of inductive

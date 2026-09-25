@@ -441,6 +441,9 @@ let subst_retro_action subst action =
     bool_op (fun ind c f t -> Register_peano_nat_beq (ind, c, f, t)) ind c f t
   | Register_peano_nat_ble (ind, c, f, t) ->
     bool_op (fun ind c f t -> Register_peano_nat_ble (ind, c, f, t)) ind c f t
+  | Register_unit_like ind ->
+    let ind' = subst_ind subst ind in
+    if ind == ind' then action else Register_unit_like ind'
 
 let map_kn f f' c =
   (* A module substitution is the same under binders: a shared subterm is

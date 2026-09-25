@@ -1931,6 +1931,40 @@ let mono_ctor c = UnsafeMonomorphic.mkConstruct c
 let apply1 f x = mkApp (f, [|x|])
 let apply2 f x y = mkApp (f, [|x; y|])
 
+(* A unit-like inductive: one constructor whose fields are all irrelevant
+   at every instance (a relevance variable may become relevant). *)
+let check_register_unit_like (mib, mip as spec) =
+  let fail message = CErrors.user_err Pp.(str message) in
+  if not (Int.equal (Array.length mib.mind_packets) 1) then
+    fail "A non-mutual inductive type is expected";
+  if Inductive.is_private spec then
+    fail "A non-private inductive type is expected";
+  if not (Int.equal mip.mind_nrealargs 0) then
+    fail "A unit-like type must have no indices";
+  if not (Int.equal (Array.length mip.mind_user_lc) 1) then
+    fail "A unit-like type must have exactly one constructor";
+  let constructor_context, _ = mip.mind_nf_lc.(0) in
+  let fields, _ =
+    List.chop mip.mind_consnrealdecls.(0) constructor_context
+  in
+  let runtime_irrelevant = function
+    | Context.Rel.Declaration.LocalAssum (annot, _) ->
+      Sorts.relevance_equal annot.Context.binder_relevance Sorts.Irrelevant
+    | Context.Rel.Declaration.LocalDef _ -> true
+  in
+  if not (List.for_all runtime_irrelevant fields) then
+    fail "The constructor of a unit-like type must have no runtime-relevant fields"
+
+let register_unit_like ind senv =
+  let spec = Inductive.lookup_mind_specif senv.env ind in
+  let () = check_register_unit_like spec in
+  let duplicate =
+    List.exists (Ind.UserOrd.equal ind)
+      (Environ.retroknowledge senv.env).Retroknowledge.retro_unit_like
+  in
+  if duplicate then senv
+  else add_retroknowledge (Retroknowledge.Register_unit_like ind) senv
+
 let find_peano_nat env ind =
   let schemes = (Environ.retroknowledge env).Retroknowledge.retro_peano_nat in
   match List.find_opt (fun s -> Ind.UserOrd.equal ind s.Retroknowledge.peano_inductive) schemes with
@@ -2749,6 +2783,8 @@ let check_peano_retroknowledge env = function
     check_register_peano_nat_bool PeanoBeq env ind c false_ctor true_ctor
   | Retroknowledge.Register_peano_nat_ble (ind, c, false_ctor, true_ctor) ->
     check_register_peano_nat_bool PeanoBle env ind c false_ctor true_ctor
+  | Retroknowledge.Register_unit_like ind ->
+    check_register_unit_like (Inductive.lookup_mind_specif env ind)
   | Retroknowledge.Register_ind _ | Retroknowledge.Register_type _ ->
     invalid_arg "Safe_typing.check_peano_retroknowledge"
 

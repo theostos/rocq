@@ -2431,7 +2431,8 @@ let vernac_register ~atts qid r =
       ] in
       match Id.to_string id, gr with
       | "ind_peano_nat", GlobRef.IndRef ind -> Global.register_peano_nat ind
-      | "ind_peano_nat", _ ->
+      | "unit_like", GlobRef.IndRef ind -> Global.register_unit_like ind
+      | ("ind_peano_nat" | "unit_like"), _ ->
         CErrors.user_err ?loc:qid.loc (Pp.str "Register in kernel: expecting an inductive type.")
       | kind, GlobRef.ConstRef c when List.mem_assoc kind peano_operations ->
         List.assoc kind peano_operations c

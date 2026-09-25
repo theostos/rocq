@@ -500,6 +500,7 @@ let v_retro_action =
     [|v_ind; v_cst|];
     [|v_ind; v_cst|];
     [|v_ind; v_cst; v_cons; v_cons|];
+    [|v_ind|];
   |]
 
 let v_retroknowledge =

@@ -194,6 +194,7 @@ val register_peano_nat_div_go : Constant.t -> unit
 val register_peano_nat_mod_go : Constant.t -> unit
 val register_peano_nat_beq : Constant.t -> unit
 val register_peano_nat_ble : Constant.t -> unit
+val register_unit_like : inductive -> unit
 
 (** {6 Oracle } *)
 

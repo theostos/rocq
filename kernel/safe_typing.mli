@@ -290,6 +290,7 @@ val register_peano_nat_div_go : Constant.t -> safe_transformer0
 val register_peano_nat_mod_go : Constant.t -> safe_transformer0
 val register_peano_nat_beq : Constant.t -> safe_transformer0
 val register_peano_nat_ble : Constant.t -> safe_transformer0
+val register_unit_like : inductive -> safe_transformer0
 val check_peano_retroknowledge : Environ.env -> Retroknowledge.action -> unit
 val check_register_ind : inductive -> 'a CPrimitives.prim_ind -> Declarations.mind_specif -> unit
 

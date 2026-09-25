@@ -253,6 +253,7 @@ let register_peano_nat_div_go c = globalize0 (Safe_typing.register_peano_nat_div
 let register_peano_nat_mod_go c = globalize0 (Safe_typing.register_peano_nat_mod_go c)
 let register_peano_nat_beq c = globalize0 (Safe_typing.register_peano_nat_beq c)
 let register_peano_nat_ble c = globalize0 (Safe_typing.register_peano_nat_ble c)
+let register_unit_like ind = globalize0 (Safe_typing.register_unit_like ind)
 
 let set_strategy k l =
   globalize0 (Safe_typing.set_strategy k l)

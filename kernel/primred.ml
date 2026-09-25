@@ -111,6 +111,9 @@ let add_retroknowledge retro action =
   | Register_peano_nat_ble (ind, c, false_ctor, true_ctor) ->
     { retro with retro_peano_nat_ble = add_peano_bool_operation "less-than-or-equal test"
         ind c false_ctor true_ctor retro.retro_peano_nat_ble }
+  | Register_unit_like ind ->
+    if List.exists (Ind.UserOrd.equal ind) retro.retro_unit_like then retro
+    else { retro with retro_unit_like = ind :: retro.retro_unit_like }
   | Register_type(typ,c) ->
     begin match typ with
       | PT_int63 ->

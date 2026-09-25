@@ -410,7 +410,8 @@ let get_retroknowlege env retro =
     let () = assert (not (Environ.mem_constant cst env)) in
     (imap, Cmap_env.add cst (CPrimitives.PTE prm) cmap, extind,
      pinds, pcsts, env)
-  | Retroknowledge.Register_peano_nat (mind, _) as action ->
+  | (Retroknowledge.Register_peano_nat (mind, _)
+    | Retroknowledge.Register_unit_like (mind, _)) as action ->
     if Environ.mem_mind mind env then
       let env = apply_peano_actions env [action] in
       (imap, cmap, extind, pinds, pcsts, env)
