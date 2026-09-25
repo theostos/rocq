@@ -10,7 +10,29 @@
 
 open Declarations
 
+let strict_checks = ref false
+let uip_allowed = ref false
+
+let enable_strict_checks () = strict_checks := true
+let allow_definitional_uip () = uip_allowed := true
+let strict_checks_enabled () = !strict_checks
+
+let validate_flags flags =
+  if !strict_checks then begin
+    let require enabled name =
+      if not enabled then CErrors.user_err
+        Pp.(str "Strict checking refuses disabled " ++ str name ++ str " checking.")
+    in
+    require flags.check_guarded "guard";
+    require flags.check_positive "positivity";
+    require flags.check_universes "universe";
+    require flags.check_eliminations "elimination";
+    if flags.allow_uip && not !uip_allowed then CErrors.user_err
+      Pp.(str "Strict checking requires explicit -allow-uip for definitional UIP.")
+  end
+
 let set_local_flags flags env =
+  validate_flags flags;
   (* Explicitly ignored flags are set to not change *)
   let envflags = Environ.typing_flags env in
   let flags = {

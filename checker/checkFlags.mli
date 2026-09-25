@@ -8,5 +8,14 @@
 (*         *     (see LICENSE file for the text of the license)         *)
 (************************************************************************)
 
+val enable_strict_checks : unit -> unit
+(** Reject declarations that disable guard, positivity, universe or elimination
+    checking instead of silently re-enabling them. *)
+
+val allow_definitional_uip : unit -> unit
+(** Permit definitional UIP in strict mode. *)
+
+val strict_checks_enabled : unit -> bool
+
 val set_local_flags : Declarations.typing_flags -> Environ.env -> Environ.env
 (** Set flags except for those ignored by the checker (see .ml file for those). *)
