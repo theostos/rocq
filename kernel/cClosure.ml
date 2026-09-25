@@ -3346,9 +3346,11 @@ let norm_term info tab e t = with_sharing info tab (fun () -> klt info tab e t)
 
 let whd_stack infos tab m stk = with_sharing infos tab @@ fun () -> match fconstr_mark m with
 | Ntrl when not (symbolic_reduction infos) ->
-  (** No need to perform [kni] nor to unlock updates because
-      every head subterm of [m] is [Ntrl] *)
-  knh infos m stk
+  (* every head subterm of [m] is [Ntrl], so [kni] is not needed; but [knh] may
+     still push update frames on cells reached through a substitution: unlock them *)
+  let (m', stk') as k = knh infos m stk in
+  let () = if infos.i_cache.i_share && not (m == m' && stk == stk') then ignore (zip m' stk') in
+  k
 | Ntrl | Red | Cstr ->
   (* a neutral mark certifies the value; a saved spine may still be a redex *)
   let k = kni infos tab m stk in
