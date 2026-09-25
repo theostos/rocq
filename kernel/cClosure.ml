@@ -75,6 +75,108 @@ type table_key = Constant.t UVars.puniverses tableKey
 
 type evar_repack = Evar.t * constr list -> constr
 
+module PeanoNatValue = struct
+  (* little-endian bits without trailing zero: arbitrary precision, linear in
+     the size of imported numerals *)
+  type t = bool list
+
+  let zero = []
+  let one = [true]
+  let is_zero = List.is_empty
+  let equal = List.equal Bool.equal
+
+  let norm bits =
+    let rec drop = function false :: bits -> drop bits | bits -> bits in
+    List.rev (drop (List.rev bits))
+
+  let rec succ = function
+    | [] -> [true]
+    | false :: bits -> true :: bits
+    | true :: bits -> false :: succ bits
+
+  let pred = function
+    | [] -> None
+    | bits ->
+      let rec go = function
+        | [true] -> []
+        | true :: bits -> false :: bits
+        | false :: bits -> true :: go bits
+        | [] -> assert false
+      in
+      Some (go bits)
+
+  let double = function
+    | [] -> []
+    | bits -> false :: bits
+
+  let rec add_carry carry a b = match a, b with
+    | [], [] -> if carry then [true] else []
+    | [], bits | bits, [] -> if carry then succ bits else bits
+    | x :: a, y :: b ->
+      (x <> y <> carry) :: add_carry ((x && y) || (carry && (x || y))) a b
+
+  let add a b = add_carry false a b
+
+  let rec mul a = function
+    | [] -> zero
+    | bit :: bits ->
+      let higher = double (mul a bits) in
+      if bit then add a higher else higher
+
+  let compare a b =
+    let c = Int.compare (List.length a) (List.length b) in
+    if not (Int.equal c 0) then c
+    else List.compare Bool.compare (List.rev a) (List.rev b)
+
+  let le a b = compare a b <= 0
+
+  (* [pow] gives up on results above a million bits *)
+  let pow base exponent =
+    let mul a b = let v = mul a b in if List.length v <= 1_000_000 then Some v else None in
+    let rec loop result factor = function
+      | [] -> Some result
+      | bit :: bits ->
+        let result = if bit then mul result factor else Some result in
+        Option.bind result (fun result ->
+          if List.is_empty bits then Some result
+          else Option.bind (mul factor factor) (fun factor -> loop result factor bits))
+    in
+    loop one base exponent
+
+  (* truncated subtraction *)
+  let sub a b =
+    if compare a b < 0 then zero else
+    let rec borrow c a b = match a, b with
+      | [], [] -> assert (not c); []
+      | x :: a, [] -> (x <> c) :: borrow ((not x) && c) a []
+      | x :: a, y :: b ->
+        (x <> y <> c) :: borrow (((not x) && (y || c)) || (y && c)) a b
+      | [], _ :: _ -> assert false
+    in
+    norm (borrow false a b)
+
+  (* [div_mod a 0] is [0, 0] *)
+  let div_mod dividend divisor =
+    if is_zero divisor then zero, zero
+    else
+      let step (remainder, quotient) bit =
+        let remainder = double remainder in
+        let remainder = if bit then succ remainder else remainder in
+        if compare remainder divisor < 0 then remainder, false :: quotient
+        else sub remainder divisor, true :: quotient
+      in
+      let remainder, quotient = List.fold_left step (zero, []) (List.rev dividend) in
+      norm quotient, remainder
+end
+
+type compact_peano = {
+  peano_ind : inductive;
+  peano_zero : constructor;
+  peano_succ : constructor;
+  peano_double : Constant.t;
+  peano_value : PeanoNatValue.t;
+}
+
 type fconstr = {
   mutable state : int;
   mutable term: fterm;
@@ -100,6 +202,7 @@ and fterm =
   | FFloat of Float64.t
   | FString of Pstring.t
   | FArray of UVars.Instance.t * fconstr Parray.t * fconstr
+  | FPeanoNat of compact_peano
   | FLIFT of int * fconstr
   | FCLOS of constr * usubs
   | FIrrelevant
@@ -133,6 +236,14 @@ let get_invert fiv = fiv
 let fterm_of v = v.term
 
 let set_ntrl v = set_fconstr_mark v Ntrl
+
+let peano_constructor_view n =
+  let empty = UVars.Instance.empty in
+  match PeanoNatValue.pred n.peano_value with
+  | None -> make_fconstr Cstr (FConstruct ((n.peano_zero, empty), [||]))
+  | Some pred ->
+    let pred = make_fconstr Cstr (FPeanoNat { n with peano_value = pred }) in
+    make_fconstr Cstr (FConstruct ((n.peano_succ, empty), [|pred|]))
 
 (* Could issue a warning if no is still Red, pointing out that we loose
    sharing. *)
@@ -262,7 +373,7 @@ end)
    constructors is lifted once per cell. *)
 let rec lft_fconstr n ft =
   match ft.term with
-    | (FInd _|FConstruct (_,[||])|FFlex(ConstKey _|VarKey _)|FInt _|FFloat _|FString _|FIrrelevant) -> ft
+    | (FInd _|FConstruct (_,[||])|FFlex(ConstKey _|VarKey _)|FInt _|FFloat _|FString _|FPeanoNat _|FIrrelevant) -> ft
     | FRel i -> make_fconstr (fconstr_mark ft) (FRel (i + n))
     | FLambda(k,tys,f,e) ->
       make_fconstr Cstr (FLambda (k, tys, f, usubs_shft (n, e)))
@@ -691,6 +802,21 @@ let to_constr lfts v =
       let ty = to_constr lfts ty in
       mkArray(u, t, def,ty)
 
+    | FPeanoNat n ->
+      let rec quote value =
+        match value with
+        | [] ->
+          Constr.UnsafeMonomorphic.mkConstruct n.peano_zero
+        | bit :: higher ->
+          let doubled = mkApp
+              (Constr.UnsafeMonomorphic.mkConst n.peano_double,
+               [|quote higher|]) in
+          if not bit then doubled
+          else mkApp
+              (Constr.UnsafeMonomorphic.mkConstruct n.peano_succ, [|doubled|])
+      in
+      quote n.peano_value
+
     | FCLOS (t,env) ->
       if is_subs_id (fst env) && is_lift_id lfts then
         subst_instance_constr (snd env) t
@@ -806,7 +932,7 @@ let rec resubst subs v =
     make_fconstr (fconstr_mark v) (FCLOS (t, env))
 
   | FFlex (RelKey _) -> v (* outside the substitution *)
-  | FFlex (ConstKey _ | VarKey _) | FInd _ | FConstruct _ | FAtom _ | FInt _ | FFloat _ | FString _ -> v
+  | FFlex (ConstKey _ | VarKey _) | FInd _ | FConstruct _ | FAtom _ | FInt _ | FFloat _ | FString _ | FPeanoNat _ -> v
 
   | FIrrelevant -> v (* Stable under substitution and lifts *)
   | FLOCKED -> assert (!Flags.in_debugger); v
@@ -1496,6 +1622,374 @@ module FNativeEntries =
 
 module FredNative = RedNative(FNativeEntries)
 
+(** Compact Peano naturals: a registered operation applied to compact values
+    computes on the values instead of unfolding. *)
+
+let peano_schemes info =
+  (Environ.retroknowledge (info_env info)).Retroknowledge.retro_peano_nat
+
+let compact_peano_of_scheme scheme peano_value =
+  Option.map (fun peano_double ->
+      { peano_ind = scheme.Retroknowledge.peano_inductive;
+        peano_zero = scheme.peano_zero; peano_succ = scheme.peano_succ;
+        peano_double; peano_value }) scheme.peano_double
+
+let same_peano_scheme a b = Ind.UserOrd.equal a.peano_ind b.peano_ind
+let peano_set_value n peano_value = { n with peano_value }
+let peano_value n = make_fconstr Cstr (FPeanoNat n)
+
+let compact_peano_zero info c =
+  List.find_map (fun scheme ->
+      if Construct.UserOrd.equal c scheme.Retroknowledge.peano_zero
+      then compact_peano_of_scheme scheme PeanoNatValue.zero else None)
+    (peano_schemes info)
+
+type compact_peano_binary_operation = PeanoAdd | PeanoMul | PeanoPow | PeanoSub
+
+let compact_peano_binary_operation info c =
+  let is = function Some c' -> Constant.UserOrd.equal c c' | None -> false in
+  List.find_map (fun scheme ->
+      if is scheme.Retroknowledge.peano_add then Some (scheme, PeanoAdd)
+      else if is scheme.peano_mul then Some (scheme, PeanoMul)
+      else if is scheme.peano_pow then Some (scheme, PeanoPow)
+      else if is scheme.peano_sub then Some (scheme, PeanoSub)
+      else None)
+    (peano_schemes info)
+
+type compact_peano_fueled_operation = PeanoDivGo | PeanoModGo
+
+let compact_peano_fueled_operation info c =
+  let mem = List.exists (Constant.UserOrd.equal c) in
+  List.find_map (fun scheme ->
+      if mem scheme.Retroknowledge.peano_div_go then Some (scheme, PeanoDivGo)
+      else if mem scheme.peano_mod_go then Some (scheme, PeanoModGo)
+      else None)
+    (peano_schemes info)
+
+let compact_peano_bool_operation info c =
+  let retro = Environ.retroknowledge (info_env info) in
+  let find entries compare =
+    Option.map (fun op ->
+        op.Retroknowledge.bool_op_inductive, op.bool_op_false, op.bool_op_true, compare)
+      (List.find_opt (fun op -> Constant.UserOrd.equal c op.Retroknowledge.bool_op_constant)
+        entries)
+  in
+  match find retro.Retroknowledge.retro_peano_nat_beq PeanoNatValue.equal with
+  | Some _ as operation -> operation
+  | None -> find retro.Retroknowledge.retro_peano_nat_ble PeanoNatValue.le
+
+(* [t] as an applied constructor of [ind] at the empty instance, looking
+   through closures and lifts *)
+let rec constructor_app ind t =
+  match [@ocaml.warning "-4"] t.term with
+  | FCLOS (t, e) -> constructor_app_constr ind e t
+  | FLIFT (_, t) -> constructor_app ind t
+  | FConstruct (((ind', i), u), args)
+    when Ind.UserOrd.equal ind ind' && UVars.Instance.is_empty u -> Some (i, args)
+  | FApp (head, args) ->
+    begin match [@ocaml.warning "-4"] head.term with
+    | FConstruct (c, [||]) -> constructor_app ind (make_fconstr Red (FConstruct (c, args)))
+    | _ -> None
+    end
+  | _ -> None
+
+and constructor_app_constr ind e t =
+  match [@ocaml.warning "-4"] kind t with
+  | Rel n ->
+    begin match clos_rel (fst e) n with
+    | Regular v -> constructor_app ind v
+    | HigherOrder _ -> None
+    end
+  | Cast (t, _, _) -> constructor_app_constr ind e t
+  | Construct (c, u) ->
+    constructor_app ind (make_fconstr Cstr (FConstruct ((c, usubst_instance e u), [||])))
+  | App (head, args) ->
+    constructor_app ind (make_fconstr Red (FApp (mk_clos e head, mk_clos_vect e args)))
+  | _ -> None
+
+(* binary numerals [positive = xI p | xO p | xH] and [N = N0 | Npos p] *)
+let rec compact_positive pos_ind t = match constructor_app pos_ind t with
+  | Some (1, [|p|]) -> Option.map (fun v -> true :: v) (compact_positive pos_ind p)
+  | Some (2, [|p|]) -> Option.map (fun v -> false :: v) (compact_positive pos_ind p)
+  | Some (3, [||]) -> Some PeanoNatValue.one
+  | _ -> None
+
+let compact_N n_ind pos_ind t = match constructor_app n_ind t with
+  | Some (1, [||]) -> Some PeanoNatValue.zero
+  | Some (2, [|p|]) -> compact_positive pos_ind p
+  | _ -> None
+
+let compact_peano_may_unfold info c =
+  TransparentState.is_transparent_constant (RedFlags.red_transparent info.i_flags) c &&
+  match info.i_cache.i_mode with
+  | Conversion -> true
+  | Reduction -> red_set info.i_flags fDELTA
+
+(* [c] is [fun x : D => match x with zero => zero | succ p => p] *)
+let compact_peano_is_predecessor info n c =
+  try
+    let body = Environ.constant_value_in (info_env info) (c, UVars.Instance.empty) in
+    match [@ocaml.warning "-4"] Constr.kind body with
+    | Lambda (_, domain, body) ->
+      begin match [@ocaml.warning "-4"] Constr.kind domain, Constr.kind body with
+      | Ind (ind, u),
+        Case (ci, case_u, [||], _, NoInvert, scrutinee,
+              [|zero_binders, zero_body; succ_binders, succ_body|])
+        when Ind.UserOrd.equal ind n.peano_ind && UVars.Instance.is_empty u &&
+             Ind.UserOrd.equal ci.ci_ind n.peano_ind && UVars.Instance.is_empty case_u &&
+             Int.equal ci.ci_npar 0 ->
+        begin match [@ocaml.warning "-4"] Constr.kind scrutinee,
+                    Constr.kind zero_body, Constr.kind succ_body with
+        | Rel 1, Construct (zero, zero_u), Rel 1 ->
+          Array.is_empty zero_binders && Int.equal (Array.length succ_binders) 1 &&
+          Construct.UserOrd.equal zero n.peano_zero && UVars.Instance.is_empty zero_u
+        | _ -> false
+        end
+      | _ -> false
+      end
+    | _ -> false
+  with Environ.NotEvaluableConst _ -> false
+
+let compact_peano_binary_values (scheme, operation) left right =
+  if not (Ind.UserOrd.equal left.peano_ind scheme.Retroknowledge.peano_inductive &&
+          same_peano_scheme left right)
+  then None
+  else
+    let value = match operation with
+      | PeanoAdd -> Some (PeanoNatValue.add left.peano_value right.peano_value)
+      | PeanoMul -> Some (PeanoNatValue.mul left.peano_value right.peano_value)
+      | PeanoPow -> PeanoNatValue.pow left.peano_value right.peano_value
+      | PeanoSub -> Some (PeanoNatValue.sub left.peano_value right.peano_value)
+    in
+    Option.map (peano_set_value left) value
+
+(* the workers are recognised only below their fuel *)
+let compact_peano_fueled_values (scheme, operation) divisor fuel dividend =
+  if not (Ind.UserOrd.equal divisor.peano_ind scheme.Retroknowledge.peano_inductive &&
+          same_peano_scheme divisor fuel && same_peano_scheme divisor dividend) ||
+     PeanoNatValue.is_zero divisor.peano_value ||
+     PeanoNatValue.compare dividend.peano_value fuel.peano_value >= 0
+  then None
+  else
+    let q, r = PeanoNatValue.div_mod dividend.peano_value divisor.peano_value in
+    Some (peano_set_value dividend (match operation with PeanoDivGo -> q | PeanoModGo -> r))
+
+let compact_peano_bool_values (ind, false_ctor, true_ctor, compare) left right =
+  if not (Ind.UserOrd.equal ind left.peano_ind && same_peano_scheme left right) then None
+  else
+    let ctor = if compare left.peano_value right.peano_value then true_ctor else false_ctor in
+    Some (make_fconstr Cstr (FConstruct ((ctor, UVars.Instance.empty), [||])))
+
+(* [t] as a compact value, when it is a numeral or a registered operation
+   applied to compact values *)
+let rec compact_peano_of_fconstr info t =
+  match [@ocaml.warning "-4"] t.term with
+  | FPeanoNat n -> Some n
+  | FCLOS (t, e) -> compact_peano_of_constr info e t
+  | FLIFT (_, t) -> compact_peano_of_fconstr info t
+  | FConstruct ((c, u), [||]) when UVars.Instance.is_empty u -> compact_peano_zero info c
+  | FConstruct ((c, u), [|arg|]) when UVars.Instance.is_empty u ->
+    begin match [@ocaml.warning "-4"] arg.term with
+    | FPeanoNat n when Construct.UserOrd.equal c n.peano_succ ->
+      Some (peano_set_value n (PeanoNatValue.succ n.peano_value))
+    | _ -> None
+    end
+  | FApp (head, args) ->
+    begin match [@ocaml.warning "-4"] head.term, args with
+    | FFlex (ConstKey (c, u)), [|divisor; _; fuel; dividend; _|]
+      when UVars.Instance.is_empty u && compact_peano_may_unfold info c ->
+      compact_peano_fueled info c divisor fuel dividend
+    | FFlex (ConstKey (c, u)), [|left; right|]
+      when UVars.Instance.is_empty u && compact_peano_may_unfold info c ->
+      compact_peano_binary info c left right
+    | FFlex (ConstKey (c, u)), [|arg|]
+      when UVars.Instance.is_empty u && compact_peano_may_unfold info c ->
+      compact_peano_unary info c arg
+    | FConstruct (c, [||]), [|_|] ->
+      compact_peano_of_fconstr info (make_fconstr Red (FConstruct (c, args)))
+    | _ -> None
+    end
+  | _ -> None
+
+and compact_peano_of_constr info e t =
+  match [@ocaml.warning "-4"] kind t with
+  | Rel n ->
+    begin match clos_rel (fst e) n with
+    | Regular v -> compact_peano_of_fconstr info v
+    | HigherOrder _ -> None
+    end
+  | Cast (t, _, _) -> compact_peano_of_constr info e t
+  | Construct (c, u) when UVars.Instance.is_empty (usubst_instance e u) ->
+    compact_peano_zero info c
+  | App (head, args) ->
+    begin match [@ocaml.warning "-4"] kind head, args with
+    | Const (c, u), [|divisor; _; fuel; dividend; _|]
+      when UVars.Instance.is_empty (usubst_instance e u) &&
+           Option.has_some (compact_peano_fueled_operation info c) &&
+           compact_peano_may_unfold info c ->
+      compact_peano_fueled info c (mk_clos e divisor) (mk_clos e fuel) (mk_clos e dividend)
+    | Const (c, u), [|left; right|]
+      when UVars.Instance.is_empty (usubst_instance e u) &&
+           Option.has_some (compact_peano_binary_operation info c) &&
+           compact_peano_may_unfold info c ->
+      compact_peano_binary info c (mk_clos e left) (mk_clos e right)
+    | Const (c, u), [|arg|]
+      when UVars.Instance.is_empty (usubst_instance e u) && compact_peano_may_unfold info c ->
+      compact_peano_unary info c (mk_clos e arg)
+    | Construct (c, u), [|arg|] when UVars.Instance.is_empty (usubst_instance e u) ->
+      List.find_map (fun scheme ->
+          if Construct.UserOrd.equal c scheme.Retroknowledge.peano_succ then
+            Option.map (fun n -> peano_set_value n (PeanoNatValue.succ n.peano_value))
+              (compact_peano_of_constr info e arg)
+          else None)
+        (peano_schemes info)
+    | _ -> None
+    end
+  | _ -> None
+
+(* doubling builder, predecessor or binary decoder *)
+and compact_peano_unary info c arg =
+  match compact_peano_of_fconstr info arg with
+  | Some n when Constant.UserOrd.equal c n.peano_double ->
+    Some (peano_set_value n (PeanoNatValue.double n.peano_value))
+  | Some n ->
+    if compact_peano_is_predecessor info n c then
+      Some (peano_set_value n
+        (Option.default PeanoNatValue.zero (PeanoNatValue.pred n.peano_value)))
+    else None
+  | None ->
+    List.find_map (fun scheme ->
+        List.find_map (fun d ->
+            if Constant.UserOrd.equal c d.Retroknowledge.decoder_constant then
+              Option.bind (compact_N d.binary_nat d.binary_positive arg)
+                (compact_peano_of_scheme scheme)
+            else None)
+          scheme.Retroknowledge.peano_decoders)
+      (peano_schemes info)
+
+and compact_peano_binary info c left right =
+  Option.bind (compact_peano_binary_operation info c) (fun op ->
+    Option.bind (compact_peano_of_fconstr info left) (fun left ->
+      Option.bind (compact_peano_of_fconstr info right) (fun right ->
+        compact_peano_binary_values op left right)))
+
+and compact_peano_fueled info c divisor fuel dividend =
+  Option.bind (compact_peano_fueled_operation info c) (fun op ->
+    Option.bind (compact_peano_of_fconstr info divisor) (fun divisor ->
+      Option.bind (compact_peano_of_fconstr info fuel) (fun fuel ->
+        Option.bind (compact_peano_of_fconstr info dividend) (fun dividend ->
+          compact_peano_fueled_values op divisor fuel dividend))))
+
+(* The registered Boolean test whose fixpoint is [fx]. Its syntax identifies
+   it: the closure may bind irrelevant arguments that cannot be quoted. *)
+let compact_peano_bool_fix info fx =
+  match [@ocaml.warning "-4"] fterm_of fx with
+  | FFix (fixpoint, _) ->
+    let env = info_env info in
+    let body = Constr.mkFix fixpoint in
+    let registered op =
+      try Constr.equal body (Environ.constant_value_in env
+            (op.Retroknowledge.bool_op_constant, UVars.Instance.empty))
+      with Environ.NotEvaluableConst _ -> false
+    in
+    let retro = Environ.retroknowledge env in
+    let find entries =
+      Option.map (fun op -> op.Retroknowledge.bool_op_constant) (List.find_opt registered entries)
+    in
+    let c = match find retro.Retroknowledge.retro_peano_nat_beq with
+      | Some _ as c -> c
+      | None -> find retro.Retroknowledge.retro_peano_nat_ble
+    in
+    Option.bind c (compact_peano_bool_operation info)
+  | _ -> None
+
+(* The arguments applied to a head on [stk], and how to rebuild the stack
+   around the arguments left. Only closed results commute with the shifts. An
+   update frame before the arguments belongs to the unapplied function and is
+   left to ordinary reduction. *)
+let rec compact_peano_application_stack = function
+  | (Zshift _ as frame) :: rest ->
+    Option.map (fun (args, rebuild) -> args, fun remaining -> frame :: rebuild remaining)
+      (compact_peano_application_stack rest)
+  | Zapp args :: rest -> Some (args, fun remaining -> append_stack remaining rest)
+  | (Zupdate _ | ZcaseT _ | Zproj _ | Zfix _ | Zprimitive _) :: _ | [] -> None
+
+(* The value of the registered operation [c] applied on [stk], with the rest
+   of the stack. An argument that is not compact is reduced with [whd], with
+   every constant transparent, and repackaged if it is a unary numeral. *)
+let compact_peano_unfold info ~whd c stk =
+  match compact_peano_application_stack stk with
+  | None -> None
+  | Some (args, rebuild) ->
+    let nargs = Array.length args in
+    let whd = lazy (whd { info with i_flags =
+      RedFlags.(red_add_transparent all (red_transparent info.i_flags)) }) in
+    let rec reduced arg =
+      Control.check_for_interrupt ();
+      let arg = Lazy.force whd arg in
+      match compact_peano_of_fconstr info arg with
+      | Some n -> Some n
+      | None ->
+        match [@ocaml.warning "-4"] arg.term with
+        | FConstruct ((succ, u), [|pred|]) when UVars.Instance.is_empty u ->
+          Option.bind (reduced pred) (fun n ->
+            if Construct.UserOrd.equal succ n.peano_succ
+            then Some (peano_set_value n (PeanoNatValue.succ n.peano_value)) else None)
+        | _ -> None
+    in
+    let compact = compact_peano_of_fconstr info in
+    let both f a b = Option.bind (f a) (fun a -> Option.bind (f b) (fun b -> Some (a, b))) in
+    let nat = match compact_peano_fueled_operation info c with
+      | Some op ->
+        if nargs < 5 then None else
+        let compute d f x = Option.map (fun n -> peano_value n, 5)
+          (compact_peano_fueled_values op d f x) in
+        begin match compact args.(0), compact args.(2), compact args.(3) with
+        | Some d, Some f, Some x -> compute d f x
+        | _ ->
+          match reduced args.(0), reduced args.(2), reduced args.(3) with
+          | Some d, Some f, Some x -> compute d f x
+          | _ -> None
+        end
+      | None ->
+        match compact_peano_binary_operation info c with
+        | Some op when nargs >= 2 ->
+          let compute (l, r) = Option.map (fun n -> peano_value n, 2)
+            (compact_peano_binary_values op l r) in
+          begin match both compact args.(0) args.(1) with
+          | Some values -> compute values
+          | None ->
+            match snd op with
+            | PeanoSub ->
+              begin match reduced args.(1) with
+              | Some r when not (PeanoNatValue.is_zero r.peano_value) ->
+                Option.bind (reduced args.(0)) (fun l -> compute (l, r))
+              | _ -> None
+              end
+            | PeanoAdd | PeanoMul | PeanoPow ->
+              Option.bind (both reduced args.(0) args.(1)) compute
+          end
+        | _ -> None
+    in
+    let unary () =
+      if nargs < 1 then None
+      else Option.map (fun n -> peano_value n, 1) (compact_peano_unary info c args.(0))
+    in
+    let bool () = match compact_peano_bool_operation info c with
+      | Some op when nargs >= 2 ->
+        let compute (l, r) = Option.map (fun m -> m, 2) (compact_peano_bool_values op l r) in
+        begin match both compact args.(0) args.(1) with
+        | Some values -> compute values
+        | None -> Option.bind (both reduced args.(0) args.(1)) compute
+        end
+      | _ -> None
+    in
+    let result = match nat with
+      | Some _ -> nat
+      | None -> match unary () with Some _ as r -> r | None -> bool ()
+    in
+    Option.map (fun (m, k) -> m, rebuild (Array.sub args k (nargs - k))) result
+
 let rec skip_irrelevant_stack info stk = match stk with
 | [] -> []
 | (Zshift _ | Zapp _) :: s -> skip_irrelevant_stack info s
@@ -1546,7 +2040,10 @@ let rec knh info m stk =
       (match unfold_projection info p r with
        | None -> (m, stk)
        | Some s -> knh info c (s :: zupdate info m stk))
-    | FConstruct _ -> strip_update_shift_absorb_app m stk
+    | FPeanoNat n when not (Int.equal (stack_args_size stk) 0) ->
+      (* a compact value is saturated: expose a constructor to absorb the arguments *)
+      knh info (peano_constructor_view n) stk
+    | FConstruct _ | FPeanoNat _ -> strip_update_shift_absorb_app m stk
 
 (* cases where knh stops *)
     | (FFlex _|FLetIn _|FEvar _|FCaseInvert _|FIrrelevant|
@@ -1556,7 +2053,10 @@ let rec knh info m stk =
 
 (* The same for pure terms *)
 and knht info e t stk =
-  match kind t with
+  match compact_peano_of_constr info e t with
+  | Some n ->
+    knh info (make_fconstr Cstr (FPeanoNat n)) stk
+  | None -> match kind t with
   | Rel n ->
     begin match clos_rel (fst e) n with
     | Regular v -> knh info v stk
@@ -2060,7 +2560,8 @@ end
 type 'a depth = 'a RedPattern.depth
 
 (* Computes a weak head normal form from the result of knh. *)
-let rec knr info tab ~pat_state m stk =
+let rec knr : type a. _ -> _ -> pat_state:a depth -> _ -> _ -> a =
+  fun info tab ~pat_state m stk ->
   match m.term with
   | FLambda(n,tys,f,e) when red_set info.i_flags fBETA ->
       (match get_args n tys f e stk with
@@ -2068,7 +2569,16 @@ let rec knr info tab ~pat_state m stk =
         | Inr lam, s -> knr_ret info tab ~pat_state (lam,s))
   | FFlex fl when red_set info.i_flags fDELTA ->
       (match Table.lookup info tab fl with
-        | Def (v, _) -> kni info tab ~pat_state v stk
+        | Def (v, _) -> begin
+          match [@ocaml.warning "-4"] fl with
+          | ConstKey (c, _) ->
+            let whd info m = fapp_stack (kni info tab ~pat_state:(RedPattern.Nil No) m []) in
+            begin match compact_peano_unfold info ~whd c stk with
+            | Some (m, stk) -> kni info tab ~pat_state m stk
+            | None -> kni info tab ~pat_state v stk
+            end
+          | _ -> kni info tab ~pat_state v stk
+          end
         | Primitive op ->
           if check_native_args op stk then
             let c = match fl with ConstKey c -> c | RelKey _ | VarKey _ -> assert false in
@@ -2102,6 +2612,24 @@ let rec knr info tab ~pat_state m stk =
         knr_ret info tab ~pat_state (mk_irrelevant, skip_irrelevant_stack info stk)
       else
         knr_ret info tab ~pat_state (m, stk)
+    end
+  | FPeanoNat n ->
+    let expose () = kni info tab ~pat_state (peano_constructor_view n) stk in
+    begin match [@ocaml.warning "-4"] stk with
+    | ZcaseT _ :: _ when red_set info.i_flags fMATCH -> expose ()
+    | Zfix (fx, []) :: Zapp args :: s when red_set info.i_flags fFIX && not (Array.is_empty args) ->
+      (* a registered Boolean test applied through its fixpoint *)
+      begin match compact_peano_bool_fix info fx, compact_peano_of_fconstr info args.(0) with
+      | Some op, Some other ->
+        begin match compact_peano_bool_values op n other with
+        | Some m ->
+          kni info tab ~pat_state m (append_stack (Array.sub args 1 (Array.length args - 1)) s)
+        | None -> expose ()
+        end
+      | _ -> expose ()
+      end
+    | Zfix _ :: _ when red_set info.i_flags fFIX -> expose ()
+    | _ -> knr_ret info tab ~pat_state (m, stk)
     end
   | FCoFix ((i, (lna, _, _)), e) ->
     if is_irrelevant info (usubst_relevance e (lna.(i)).binder_relevance) then
@@ -2166,10 +2694,12 @@ and knr_ret : type a. _ -> _ -> pat_state: a depth -> ?failed: _ -> _ -> a =
       match b with No -> i | Yes -> if failed then None else Some i
 
 (* Computes the weak head normal form of a term *)
-and kni info tab ~pat_state m stk =
+and kni : type a. _ -> _ -> pat_state:a depth -> _ -> _ -> a =
+  fun info tab ~pat_state m stk ->
   let (hm,s) = knh info m stk in
   knr info tab ~pat_state hm s
-and knit info tab ~pat_state e t stk =
+and knit : type a. _ -> _ -> pat_state:a depth -> _ -> _ -> _ -> a =
+  fun info tab ~pat_state e t stk ->
   let (ht,s) = knht info e t stk in
   knr info tab ~pat_state ht s
 
@@ -2220,7 +2750,7 @@ let kh info tab v stk = fapp_stack(kni info tab v stk)
       calls itself recursively. *)
 
 let is_val v = match v.term with
-| FAtom _ | FRel _   | FInd _ | FConstruct (_,[||]) | FInt _ | FFloat _ | FString _ -> true
+| FAtom _ | FRel _   | FInd _ | FConstruct (_,[||]) | FInt _ | FFloat _ | FString _ | FPeanoNat _ -> true
 | FFlex _ -> fconstr_mark v == Ntrl
 | FConstruct _ | FApp _ | FProj _ | FFix _ | FCoFix _ | FCaseT _ | FCaseInvert _ | FLambda _
 | FProd _ | FLetIn _ | FEvar _ | FArray _ | FLIFT _ | FCLOS _ -> false
@@ -2338,7 +2868,7 @@ and norm_head info tab m =
       | FConstruct (c,args) -> mkApp (mkConstructU c, Array.map (kl info tab) args)
       | FLOCKED | FRel _ | FAtom _ | FFlex _ | FInd _
       | FApp _ | FCaseT _ | FCaseInvert _ | FLIFT _ | FCLOS _ | FInt _
-      | FFloat _ | FString _ -> term_of_fconstr m
+      | FFloat _ | FString _ | FPeanoNat _ -> term_of_fconstr m
       | FIrrelevant -> assert false (* only introduced when converting *)
 
 and zip_term info tab m stk = match stk with
@@ -2414,7 +2944,15 @@ let infos_with_reds infos reds =
 
 let unfold_ref_with_args infos tab fl v =
   match Table.lookup infos tab fl with
-  | Def (def, _) -> Some (def, v)
+  | Def (def, _) -> begin
+    match [@ocaml.warning "-4"] fl with
+    | ConstKey (c, _) ->
+      begin match compact_peano_unfold infos ~whd:(fun infos m -> kh infos tab m []) c v with
+      | Some _ as result -> result
+      | None -> Some (def, v)
+      end
+    | _ -> Some (def, v)
+    end
   | Primitive op when check_native_args op v ->
     let c = match [@ocaml.warning "-4"] fl with ConstKey c -> c | _ -> assert false in
     let rargs, a, nargs, v = get_native_args1 op c v in

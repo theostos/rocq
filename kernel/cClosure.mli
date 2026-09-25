@@ -34,6 +34,20 @@ type usubs = subs_content subs UVars.puniverses
 
 type table_key = Constant.t UVars.puniverses tableKey
 
+(** Arbitrary-precision natural held by an [FPeanoNat] cell *)
+module PeanoNatValue : sig
+  type t
+  val equal : t -> t -> bool
+end
+
+type compact_peano = {
+  peano_ind : inductive;
+  peano_zero : constructor;
+  peano_succ : constructor;
+  peano_double : Constant.t;
+  peano_value : PeanoNatValue.t;
+}
+
 (** Relevances (eg in binder_annot or case_info) have NOT been substituted
     when there is a usubs field *)
 type fterm =
@@ -56,10 +70,14 @@ type fterm =
   | FFloat of Float64.t
   | FString of Pstring.t
   | FArray of UVars.Instance.t * fconstr Parray.t * fconstr
+  | FPeanoNat of compact_peano
   | FLIFT of int * fconstr
   | FCLOS of constr * usubs
   | FIrrelevant
   | FLOCKED
+
+(** The value as [zero] or [succ] of a compact value *)
+val peano_constructor_view : compact_peano -> fconstr
 
 (***********************************************************************
   s A [stack] is a context of arguments, arguments are pushed by
