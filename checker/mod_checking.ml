@@ -1,7 +1,6 @@
 open Pp
 open Util
 open Names
-open Conversion
 open Declarations
 open Mod_declarations
 open Environ
@@ -99,10 +98,8 @@ let check_constant_declaration env opac kn cb opacify =
     match body with
     | Some bd ->
       let j = Typeops.infer env bd in
-      begin match conv_leq env j.uj_type ty with
-      | Result.Ok () -> ()
-      | Result.Error () -> Type_errors.error_actual_type env j ty
-      end
+      (* the same comparison as the kernel, with its syntactic shortcut *)
+      Typeops.check_cast env j DEFAULTcast jty
     | None -> ()
   in
   let retro, opac = match Cmap_env.find_opt kn (snd opac.st_retro) with

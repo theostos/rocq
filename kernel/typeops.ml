@@ -28,7 +28,42 @@ module RelDecl = Context.Rel.Declaration
 exception NotConvertible
 exception NotConvertibleVect of int
 
-let conv_leq env x y = default_conv CUMUL env x y
+(* Exact syntax before conversion: the inferred and expected types of a cast
+   are often the same large term, whose unfolding would be expensive. A
+   bounded comparison, then the interning of both in one hash-consed term
+   (stricter than alpha-equality); a beta redex at the head of an expected
+   dependent type is contracted first. A miss converts as usual. *)
+exception Syntax_probe_exhausted
+
+let same_syntax env left right =
+  let fuel = ref 1024 in
+  let rec equal nargs left right =
+    if !fuel = 0 then raise_notrace Syntax_probe_exhausted;
+    decr fuel;
+    left == right ||
+    (* casts are charged here, compare_head would strip them for free *)
+    match kind left, kind right with
+    | (Cast _ | Evar _ | Meta _), _ | _, (Cast _ | Evar _ | Meta _) -> false
+    | _ -> Constr.compare_head (fun _ _ -> false) equal nargs left right
+  in
+  try equal 0 left right
+  with Syntax_probe_exhausted ->
+    match HConstr.kind (HConstr.of_constr env (mkCast (left, DEFAULTcast, right))) with
+    | Cast (left, _, right) -> left == right
+    | _ -> assert false
+
+let head_beta term = match kind term with
+  | App (head, args) when isLambda head -> Reduction.beta_appvect head args
+  | _ -> term
+
+let conv_leq env left right =
+  let same =
+    (Environ.typing_flags env).unfold_dep_heuristic &&
+    (same_syntax env left right ||
+     let left' = head_beta left and right' = head_beta right in
+     (left' != left || right' != right) && same_syntax env left' right')
+  in
+  if same then Result.Ok () else default_conv CUMUL env left right
 
 let conv_leq_vecti env v1 v2 =
   Array.fold_left2_i
@@ -336,7 +371,7 @@ let check_cast env c ct k expected_type =
     | VMcast ->
       Vconv.vm_conv CUMUL env ct expected_type
     | DEFAULTcast ->
-      default_conv CUMUL env ct expected_type
+      conv_leq env ct expected_type
     | NATIVEcast ->
       let sigma = Genlambda.empty_evars env in
       Nativeconv.native_conv CUMUL sigma env ct expected_type
